@@ -1,0 +1,10 @@
+.agents/
+.obsidian/
+backup/
+cache/
+logs/
+
+opensteamtool.toml
+
+*.log
+*.tmp

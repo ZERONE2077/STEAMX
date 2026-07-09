@@ -1,0 +1,42 @@
+{
+  "steamPath": "",
+  "luaPath": "",
+  "logRoot": "",
+  "backupRoot": "",
+  "network": {
+    "timeoutSeconds": 30
+  },
+  "manifestHub": {
+    "apiKey": ""
+  },
+  "manifest": {
+    "source": "wudrm"
+  },
+  "ost": {
+    "sourceType": "github-release",
+    "sourcePath": "./ost",
+    "githubRepo": "OpenSteam001/OpenSteamTool",
+    "assetPattern": "*Release.zip",
+    "cacheRoot": "./cache/opensteamtools",
+    "targetPath": "",
+    "files": [
+      "dwmapi.dll",
+      "xinput1_4.dll",
+      "OpenSteamTool.dll"
+    ],
+    "overwrite": true,
+    "backup": false,
+    "requireSteamClosed": true,
+    "autoCloseSteam": true,
+    "steamShutdownTimeoutSeconds": 15,
+    "restartSteamAfterDeploy": true
+  },
+  "lua": {
+    "urlTemplate": "",
+    "fileNameTemplate": "{appid}.lua",
+    "overwriteMode": "overwrite",
+    "requireSteamClosed": false,
+    "validateFileExtension": true,
+    "headers": {}
+  }
+}
