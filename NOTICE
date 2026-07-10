@@ -1,0 +1,21 @@
+Third-party notices
+
+This project does not package or redistribute third-party binaries by default.
+It may reference, download, or interoperate with the following upstream
+projects at runtime or through user configuration.
+
+OpenSteamTool
+Repository: https://github.com/OpenSteam001/OpenSteamTool
+License: GPL-3.0
+
+OpenSteamTool is not relicensed under this project's MIT License. If users
+download, build, install, or redistribute OpenSteamTool, the original
+OpenSteamTool license terms apply.
+
+CloudRedirect
+Repository: https://github.com/Selectively11/CloudRedirect
+License: not specified in this repository at the time this notice was written
+
+CloudRedirect is not relicensed under this project's MIT License. Do not
+redistribute CloudRedirect source code or binaries with this project unless
+its copyright holder provides an explicit license or permission.
