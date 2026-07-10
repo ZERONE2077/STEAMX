@@ -3,8 +3,7 @@
 backup/
 cache/
 logs/
-
-opensteamtool.toml
-
+docs/
+test/
 *.log
 *.tmp
