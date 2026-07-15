@@ -355,11 +355,23 @@ function Get-LatestOstRelease {
     }
 }
 
+function Test-SteamInstallPath {
+    param([AllowNull()][string]$PathValue)
+
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { return $false }
+    try {
+        $steamExe = [System.IO.Path]::Combine($PathValue, "steam.exe")
+        return [bool](Test-Path -LiteralPath $steamExe -PathType Leaf -ErrorAction SilentlyContinue)
+    } catch {
+        return $false
+    }
+}
+
 function Get-SteamPath {
     param([pscustomobject]$Config)
 
     $configuredPath = [string](Get-ConfigValue -Object $Config -Name "steamPath" -DefaultValue "")
-    if (-not [string]::IsNullOrWhiteSpace($configuredPath) -and (Test-Path -LiteralPath (Join-Path $configuredPath "steam.exe"))) {
+    if (Test-SteamInstallPath -PathValue $configuredPath) {
         return [System.IO.Path]::GetFullPath($configuredPath)
     }
 
@@ -369,7 +381,7 @@ function Get-SteamPath {
         "HKLM:\Software\WOW6432Node\Valve\Steam",
         "HKLM:\Software\Valve\Steam"
     )) {
-        if (Test-Path $registryPath) {
+        if (Test-Path $registryPath -ErrorAction SilentlyContinue) {
             $item = Get-ItemProperty -Path $registryPath -ErrorAction SilentlyContinue
             $steamPathValue = Get-ObjectPropertyValue -Object $item -Name "SteamPath"
             $installPathValue = Get-ObjectPropertyValue -Object $item -Name "InstallPath"
@@ -386,7 +398,7 @@ function Get-SteamPath {
     )
 
     foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
-        if (Test-Path -LiteralPath (Join-Path $candidate "steam.exe")) {
+        if (Test-SteamInstallPath -PathValue ([string]$candidate)) {
             return [System.IO.Path]::GetFullPath($candidate)
         }
     }
