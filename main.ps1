@@ -15,6 +15,7 @@ $utf8Encoding = New-Object System.Text.UTF8Encoding $false
 $OutputEncoding = $utf8Encoding
 Clear-Host
 $script:OstReleaseCache = @{}
+$script:SteamPathCache = ""
 
 function ConvertFrom-Utf8Base64 {
     param([Parameter(Mandatory = $true)][string]$Value)
@@ -370,12 +371,25 @@ function Test-SteamInstallPath {
 function Get-SteamPath {
     param([pscustomobject]$Config)
 
-    $configuredPath = [string](Get-ConfigValue -Object $Config -Name "steamPath" -DefaultValue "")
-    if (Test-SteamInstallPath -PathValue $configuredPath) {
-        return [System.IO.Path]::GetFullPath($configuredPath)
+    if (Test-SteamInstallPath -PathValue $script:SteamPathCache) {
+        return $script:SteamPathCache
     }
 
-    $candidates = @()
+    $candidates = @(
+        [string](Get-ConfigValue -Object $Config -Name "steamPath" -DefaultValue ""),
+        [string]$env:STEAM_PATH
+    )
+
+    foreach ($process in @(Get-Process -Name "steam" -ErrorAction SilentlyContinue)) {
+        try {
+            if (-not [string]::IsNullOrWhiteSpace([string]$process.Path)) {
+                $candidates += Split-Path -Parent ([string]$process.Path)
+            }
+        } catch {
+            continue
+        }
+    }
+
     foreach ($registryPath in @(
         "HKCU:\Software\Valve\Steam",
         "HKLM:\Software\WOW6432Node\Valve\Steam",
@@ -385,25 +399,59 @@ function Get-SteamPath {
             $item = Get-ItemProperty -Path $registryPath -ErrorAction SilentlyContinue
             $steamPathValue = Get-ObjectPropertyValue -Object $item -Name "SteamPath"
             $installPathValue = Get-ObjectPropertyValue -Object $item -Name "InstallPath"
+            $steamExeValue = Get-ObjectPropertyValue -Object $item -Name "SteamExe"
             if (-not [string]::IsNullOrWhiteSpace($steamPathValue)) { $candidates += $steamPathValue }
             if (-not [string]::IsNullOrWhiteSpace($installPathValue)) { $candidates += $installPathValue }
+            if (-not [string]::IsNullOrWhiteSpace($steamExeValue)) {
+                $candidates += Split-Path -Parent ([string]$steamExeValue)
+            }
         }
     }
 
-    $candidates += @(
-        "C:\Program Files (x86)\Steam",
-        "C:\Program Files\Steam",
-        "D:\Steam",
-        "E:\Steam"
-    )
+    foreach ($registryPath in @(
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\steam.exe",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\steam.exe",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\steam.exe"
+    )) {
+        if (-not (Test-Path $registryPath -ErrorAction SilentlyContinue)) { continue }
+        try {
+            $steamExe = [string](Get-Item -Path $registryPath -ErrorAction Stop).GetValue("")
+            if (-not [string]::IsNullOrWhiteSpace($steamExe)) {
+                $candidates += Split-Path -Parent $steamExe.Trim('"')
+            }
+        } catch {
+            continue
+        }
+    }
+
+    foreach ($drive in @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+        $root = [string]$drive.Root
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
+        $candidates += @(
+            [System.IO.Path]::Combine($root, "Steam"),
+            [System.IO.Path]::Combine($root, "Program Files (x86)", "Steam"),
+            [System.IO.Path]::Combine($root, "Program Files", "Steam")
+        )
+    }
 
     foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
-        if (Test-SteamInstallPath -PathValue ([string]$candidate)) {
-            return [System.IO.Path]::GetFullPath($candidate)
+        $candidatePath = ([string]$candidate).Trim().Trim('"')
+        if (Test-SteamInstallPath -PathValue $candidatePath) {
+            $script:SteamPathCache = [System.IO.Path]::GetFullPath($candidatePath)
+            return $script:SteamPathCache
         }
     }
 
-    throw "Steam path not found. Set steamPath in New-DefaultConfig inside main.ps1."
+    $enteredPath = (Read-UiInput -Prompt "Steam path not found. Enter the folder containing steam.exe, or press Enter to cancel").Trim().Trim('"')
+    if ($enteredPath.EndsWith("steam.exe", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $enteredPath = Split-Path -Parent $enteredPath
+    }
+    if (Test-SteamInstallPath -PathValue $enteredPath) {
+        $script:SteamPathCache = [System.IO.Path]::GetFullPath($enteredPath)
+        return $script:SteamPathCache
+    }
+
+    throw "Steam path not found. Set `$env:STEAM_PATH to the folder containing steam.exe before running STEAMX."
 }
 
 function Get-SteamVersionInfo {
