@@ -47,7 +47,18 @@ function Read-UiInput {
 
 function Get-ScriptRoot {
     if ($PSScriptRoot) { return $PSScriptRoot }
-    return (Split-Path -Parent $MyInvocation.MyCommand.Path)
+
+    $commandPath = [string](Get-Variable -Name PSCommandPath -ValueOnly -ErrorAction SilentlyContinue)
+    if ([string]::IsNullOrWhiteSpace($commandPath)) {
+        $pathProperty = $MyInvocation.MyCommand.PSObject.Properties["Path"]
+        if ($null -ne $pathProperty) {
+            $commandPath = [string]$pathProperty.Value
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($commandPath)) {
+        return (Split-Path -Parent $commandPath)
+    }
+    return (Get-Location).Path
 }
 
 function Resolve-LocalPath {
