@@ -114,7 +114,7 @@ function Ensure-Directory {
 
 function Get-ConfigValue {
     param(
-        [Parameter(Mandatory = $true)]$Object,
+        [AllowNull()]$Object,
         [Parameter(Mandatory = $true)][string]$Name,
         $DefaultValue = $null
     )
@@ -127,10 +127,11 @@ function Get-ConfigValue {
 
 function Get-ObjectPropertyValue {
     param(
-        [Parameter(Mandatory = $true)]$Object,
+        [AllowNull()]$Object,
         [Parameter(Mandatory = $true)][string]$Name
     )
 
+    if ($null -eq $Object) { return $null }
     $property = $Object.PSObject.Properties[$Name]
     if ($null -eq $property) { return $null }
     return $property.Value
@@ -278,7 +279,8 @@ function Get-HttpErrorDetail {
     param([Parameter(Mandatory = $true)]$ErrorRecord)
 
     $message = $ErrorRecord.Exception.Message
-    $response = $ErrorRecord.Exception.Response
+    $responseProperty = $ErrorRecord.Exception.PSObject.Properties["Response"]
+    $response = if ($null -ne $responseProperty) { $responseProperty.Value } else { $null }
     if ($null -eq $response) { return $message }
 
     try {
