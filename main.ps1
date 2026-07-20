@@ -25,6 +25,7 @@ $OutputEncoding = $utf8Encoding
 Clear-Host
 $script:OstReleaseCache = @{}
 $script:SteamPathCache = ""
+$script:NetworkRegionCache = ""
 
 function ConvertFrom-Utf8Base64 {
     param([Parameter(Mandatory = $true)][string]$Value)
@@ -1484,7 +1485,102 @@ function Get-OstDownloadUrls {
         if ($url -notin $urls) { $urls += $url }
     }
     if ($OfficialUrl -notin $urls) { $urls += $OfficialUrl }
+
+    $networkRegion = Get-NetworkRegion
+    if ($networkRegion -eq "CN") {
+        Write-UiNotice -Message "Network region: CN. Mirror download sources have priority." -Level INFO
+        return @(
+            @($urls | Where-Object { $_ -ne $OfficialUrl })
+            $OfficialUrl
+        )
+    }
+    if (-not [string]::IsNullOrWhiteSpace($networkRegion)) {
+        Write-UiNotice -Message ("Network region: {0}. GitHub official source has priority." -f $networkRegion) -Level INFO
+        return @(
+            $OfficialUrl
+            @($urls | Where-Object { $_ -ne $OfficialUrl })
+        )
+    }
+
+    $probes = @(
+        foreach ($url in $urls) {
+            Test-DownloadEndpoint -Url $url -TimeoutMilliseconds 3000
+        }
+    )
+    $reachableUrls = @($probes | Where-Object { $_.Reachable } | Sort-Object ElapsedMilliseconds | ForEach-Object { $_.Url })
+    if ($reachableUrls.Count -gt 0) {
+        Write-UiNotice -Message "Network region detection unavailable. Download sources ordered by connectivity." -Level WARN
+        return @(
+            $reachableUrls
+            @($urls | Where-Object { $_ -notin $reachableUrls })
+        )
+    }
+
+    Write-UiNotice -Message "Network region and endpoint probes were unavailable. Using configured source order." -Level WARN
     return $urls
+}
+
+function Get-NetworkRegion {
+    $regionOverride = ([string]$env:STEAMX_NETWORK_REGION).Trim().ToUpperInvariant()
+    if ($regionOverride -match '^[A-Z]{2}$') {
+        return $regionOverride
+    }
+
+    if ($script:NetworkRegionCache -eq "__UNKNOWN__") {
+        return ""
+    }
+    if (-not [string]::IsNullOrWhiteSpace($script:NetworkRegionCache)) {
+        return $script:NetworkRegionCache
+    }
+
+    try {
+        $trace = [string](Invoke-RestMethod `
+            -Uri "https://www.cloudflare.com/cdn-cgi/trace" `
+            -Headers @{ "User-Agent" = "STEAMX" } `
+            -TimeoutSec 5)
+        $locationMatch = [System.Text.RegularExpressions.Regex]::Match($trace, '(?m)^loc=([A-Za-z]{2})\s*$')
+        if ($locationMatch.Success) {
+            $script:NetworkRegionCache = $locationMatch.Groups[1].Value.ToUpperInvariant()
+            return $script:NetworkRegionCache
+        }
+    } catch {
+    }
+
+    $script:NetworkRegionCache = "__UNKNOWN__"
+    return ""
+}
+
+function Test-DownloadEndpoint {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [int]$TimeoutMilliseconds = 3000
+    )
+
+    $request = [System.Net.HttpWebRequest]::Create($Url)
+    $request.Method = "HEAD"
+    $request.UserAgent = "STEAMX"
+    $request.AllowAutoRedirect = $true
+    $request.Timeout = $TimeoutMilliseconds
+    $request.ReadWriteTimeout = $TimeoutMilliseconds
+    $response = $null
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $reachable = $false
+    try {
+        $response = $request.GetResponse()
+        $reachable = $true
+    } catch {
+        $statusCode = Get-HttpStatusCode -ErrorRecord $_
+        $reachable = ($statusCode -ge 200 -and $statusCode -lt 500)
+    } finally {
+        $stopwatch.Stop()
+        if ($null -ne $response) { $response.Dispose() }
+    }
+
+    return [pscustomobject]@{
+        Url                 = $Url
+        Reachable           = $reachable
+        ElapsedMilliseconds = [int]$stopwatch.ElapsedMilliseconds
+    }
 }
 
 function Get-Sha256FromAssetDigest {
