@@ -1,10 +1,19 @@
 # Keep this entry script UTF-8 without BOM for Windows PowerShell 5.1 web execution.
 [CmdletBinding()]
 param(
-    [ValidateSet("Menu", "Check", "EnableUnlockMode", "DeployOst", "SetManifestSource", "UninstallOst", "UninstallOstAndLua")]
+    [ValidateSet("Menu", "Check", "EnableUnlockMode", "AddGame", "DeployOst", "SetManifestSource", "UninstallOst", "UninstallOstAndLua")]
     [string]$Command = "Menu",
     [string]$ManifestSource,
-    [string]$ConfigPath = ""
+    [string]$ConfigPath = "",
+    [string]$AppId = "",
+    [ValidateSet("full", "basegame", "dlc")]
+    [string]$Variant = "full",
+    [string]$ApiKey = "",
+    [string]$CredentialPath = "",
+    [switch]$ResetApiKey,
+    [string]$LuaPath = "",
+    [string]$OutputName = "",
+    [int]$TimeoutSeconds = 0
 )
 
 Set-StrictMode -Version Latest
@@ -33,7 +42,7 @@ function Write-UiLine {
         Write-Host ""
         return
     }
-    if ($PSBoundParameters.ContainsKey("ForegroundColor")) {
+    if ($PSBoundParameters.ContainsKey("ForegroundColor") -and -not $env:NO_COLOR) {
         Write-Host $Text -ForegroundColor $ForegroundColor
     } else {
         Write-Host $Text
@@ -44,6 +53,218 @@ function Read-UiInput {
     param([Parameter(Mandatory = $true)][string]$Prompt)
 
     return Read-Host $Prompt
+}
+
+function Test-UiInteractive {
+    try {
+        if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) { return $false }
+        $null = $host.UI.RawUI.WindowSize
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Test-UiVirtualTerminal {
+    if ($env:NO_COLOR) { return $false }
+
+    try {
+        $property = $host.UI.PSObject.Properties["SupportsVirtualTerminal"]
+        if ($null -ne $property -and [bool]$property.Value) { return $true }
+    } catch {
+    }
+
+    return (-not [string]::IsNullOrWhiteSpace([string]$env:WT_SESSION) -or
+        -not [string]::IsNullOrWhiteSpace([string]$env:TERM_PROGRAM) -or
+        -not [string]::IsNullOrWhiteSpace([string]$env:ANSICON))
+}
+
+function Get-UiWidth {
+    try {
+        $width = [int]$host.UI.RawUI.WindowSize.Width
+    } catch {
+        $width = 80
+    }
+    return [Math]::Max(24, [Math]::Min(96, $width - 1))
+}
+
+function Limit-UiText {
+    param(
+        [AllowEmptyString()][string]$Text,
+        [int]$Width = (Get-UiWidth)
+    )
+
+    if ($null -eq $Text) { return "" }
+    if ($Text.Length -le $Width) { return $Text }
+    if ($Width -le 3) { return $Text.Substring(0, $Width) }
+    return $Text.Substring(0, $Width - 3) + "..."
+}
+
+function Write-UiRule {
+    param(
+        [string]$Title = "",
+        [System.ConsoleColor]$ForegroundColor = [System.ConsoleColor]::DarkGray
+    )
+
+    $width = Get-UiWidth
+    if ([string]::IsNullOrWhiteSpace($Title)) {
+        Write-UiLine -Text ("-" * $width) -ForegroundColor $ForegroundColor
+        return
+    }
+
+    $prefix = "-- {0} " -f $Title
+    $suffixLength = [Math]::Max(0, $width - $prefix.Length)
+    Write-UiLine -Text (Limit-UiText -Text ($prefix + ("-" * $suffixLength)) -Width $width) -ForegroundColor $ForegroundColor
+}
+
+function Write-UiField {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [AllowEmptyString()][string]$Value = "",
+        [System.ConsoleColor]$ValueColor = [System.ConsoleColor]::Gray
+    )
+
+    $labelWidth = 16
+    $prefix = "  {0,-$labelWidth}" -f $Label
+    $available = [Math]::Max(8, (Get-UiWidth) - $prefix.Length)
+    if ($env:NO_COLOR) {
+        Write-Host ($prefix + (Limit-UiText -Text $Value -Width $available))
+        return
+    }
+    Write-Host $prefix -NoNewline -ForegroundColor DarkGray
+    Write-Host (Limit-UiText -Text $Value -Width $available) -ForegroundColor $ValueColor
+}
+
+function Write-UiNotice {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [ValidateSet("INFO", "SUCCESS", "WARN", "ERROR")][string]$Level = "INFO"
+    )
+
+    $style = @{
+        INFO    = @{ Prefix = "[i]"; Color = [System.ConsoleColor]::Cyan }
+        SUCCESS = @{ Prefix = "[+]"; Color = [System.ConsoleColor]::Green }
+        WARN    = @{ Prefix = "[!]"; Color = [System.ConsoleColor]::Yellow }
+        ERROR   = @{ Prefix = "[x]"; Color = [System.ConsoleColor]::Red }
+    }[$Level]
+    Write-UiLine -Text ("  {0} {1}" -f $style.Prefix, $Message) -ForegroundColor $style.Color
+}
+
+function Wait-UiContinue {
+    Write-UiLine
+    [void](Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJIEVudGVyIOi/lOWbnuiPnOWNlQ=="))
+}
+
+function Read-UiMenu {
+    param(
+        [Parameter(Mandatory = $true)][array]$Items,
+        [string]$Title = "Actions"
+    )
+
+    Write-UiRule -Title $Title
+
+    if (-not (Test-UiInteractive)) {
+        foreach ($item in $Items) {
+            $color = if ($item.Enabled) { [System.ConsoleColor]::White } else { [System.ConsoleColor]::DarkGray }
+            Write-UiLine -Text ("  {0}. {1}" -f $item.Shortcut, $item.Label) -ForegroundColor $color
+        }
+        Write-UiLine
+        $choice = Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "6K+36YCJ5oup")
+        if ([string]::IsNullOrWhiteSpace($choice)) { return "0" }
+        $match = @($Items | Where-Object { $_.Enabled -and ([string]$_.Shortcut -eq $choice) } | Select-Object -First 1)
+        if ($match.Count -gt 0) { return [string]$match[0].Value }
+        return ""
+    }
+
+    $enabledIndexes = @()
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        if ([bool]$Items[$i].Enabled) { $enabledIndexes += $i }
+    }
+    if ($enabledIndexes.Count -eq 0) { return "" }
+
+    $selectedPosition = 0
+    $width = Get-UiWidth
+    $lineCount = $Items.Count + 1
+    $useVirtualTerminal = Test-UiVirtualTerminal
+    $escape = [string][char]27
+    $hasRendered = $false
+    try {
+        $menuTop = [Console]::CursorTop
+    } catch {
+        $menuTop = $host.UI.RawUI.CursorPosition.Y
+    }
+
+    while ($true) {
+        if ($hasRendered) {
+            if ($useVirtualTerminal) {
+                Write-Host ("{0}[{1}A" -f $escape, $lineCount) -NoNewline
+            } else {
+                try {
+                    [Console]::SetCursorPosition(0, $menuTop)
+                } catch {
+                    $host.UI.RawUI.CursorPosition = New-Object System.Management.Automation.Host.Coordinates 0, $menuTop
+                }
+            }
+        }
+
+        for ($i = 0; $i -lt $Items.Count; $i++) {
+            $item = $Items[$i]
+            $isSelected = ($i -eq $enabledIndexes[$selectedPosition])
+            $marker = if ($isSelected) { ">" } else { " " }
+            $line = "  {0} {1}. {2}" -f $marker, $item.Shortcut, $item.Label
+            $line = Limit-UiText -Text $line -Width $width
+            if ($useVirtualTerminal) {
+                $line = ("{0}[2K{0}[1G{1}" -f $escape, $line)
+            } else {
+                $line = $line.PadRight($width)
+            }
+            $color = if (-not $item.Enabled) {
+                [System.ConsoleColor]::DarkGray
+            } elseif ($isSelected) {
+                [System.ConsoleColor]::Cyan
+            } else {
+                [System.ConsoleColor]::White
+            }
+            Write-UiLine -Text $line -ForegroundColor $color
+        }
+        $hint = Limit-UiText -Text "  Up/Down select   Enter confirm   Number shortcut   Esc back" -Width $width
+        if ($useVirtualTerminal) {
+            $hint = ("{0}[2K{0}[1G{1}" -f $escape, $hint)
+        } else {
+            $hint = $hint.PadRight($width)
+        }
+        Write-UiLine -Text $hint -ForegroundColor DarkGray
+
+        if (-not $hasRendered -and -not $useVirtualTerminal) {
+            try {
+                $menuTop = [Math]::Max(0, [Console]::CursorTop - $lineCount)
+            } catch {
+            }
+        }
+        $hasRendered = $true
+
+        $key = [Console]::ReadKey($true)
+        if ($key.Key -eq [ConsoleKey]::UpArrow) {
+            $selectedPosition = ($selectedPosition - 1 + $enabledIndexes.Count) % $enabledIndexes.Count
+            continue
+        }
+        if ($key.Key -eq [ConsoleKey]::DownArrow) {
+            $selectedPosition = ($selectedPosition + 1) % $enabledIndexes.Count
+            continue
+        }
+        if ($key.Key -eq [ConsoleKey]::Enter) {
+            return [string]$Items[$enabledIndexes[$selectedPosition]].Value
+        }
+        if ($key.Key -eq [ConsoleKey]::Escape) {
+            return "0"
+        }
+
+        $shortcut = [string]$key.KeyChar
+        $match = @($Items | Where-Object { $_.Enabled -and ([string]$_.Shortcut -eq $shortcut) } | Select-Object -First 1)
+        if ($match.Count -gt 0) {
+            return [string]$match[0].Value
+        }
+    }
 }
 
 function Get-ScriptRoot {
@@ -214,18 +435,17 @@ function Write-Log {
     )
 
     $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-    if ($Level -eq "SUCCESS") {
-        Write-Host $line -ForegroundColor Green
-    } else {
-        Write-Host $line
-    }
+    Write-UiNotice -Message $Message -Level $Level
     if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
         Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
     }
 }
 
 function Write-SteampXLogo {
-    $host.UI.RawUI.WindowTitle = "STEAMX - OpenSteamTools Deploy"
+    try {
+        $host.UI.RawUI.WindowTitle = "STEAMX - OpenSteamTools Deploy"
+    } catch {
+    }
     Write-Host ""
 
     $lowerBlock = [string][char]0x2584
@@ -240,10 +460,24 @@ function Write-SteampXLogo {
         "RRRRRRRT    RRR    TRRRRRRR RRR  RRR RRR      RRR RRRT TRRR"
     )
 
+    $steamColumns = 49
     $blue = @(56, 189, 248)
     $green = @(34, 197, 94)
     $reset = "$([char]27)[0m"
-    $steamColumns = 49
+    $useTrueColor = Test-UiVirtualTerminal
+
+    if ((Get-UiWidth) -lt 70) {
+        if ($useTrueColor) {
+            Write-Host ("  $([char]27)[38;2;$($blue[0]);$($blue[1]);$($blue[2])mSTEAM$([char]27)[38;2;$($green[0]);$($green[1]);$($green[2])mX$reset")
+        } else {
+            Write-Host "  " -NoNewline
+            Write-Host "STEAM" -NoNewline -ForegroundColor Cyan
+            Write-Host "X" -ForegroundColor Green
+        }
+        Write-UiLine -Text "  OpenSteamTools deploy and Lua manifest helper" -ForegroundColor DarkGray
+        Write-Host ""
+        return
+    }
 
     foreach ($line in $logo) {
         $rendered = $line.Replace("D", $lowerBlock).Replace("R", $fullBlock).Replace("T", $upperBlock)
@@ -256,12 +490,19 @@ function Write-SteampXLogo {
             continue
         }
 
-        $lineBuilder = [System.Text.StringBuilder]::new()
-        [void]$lineBuilder.Append($logoIndent)
-        [void]$lineBuilder.Append("$([char]27)[38;2;$($blue[0]);$($blue[1]);$($blue[2])m$steamPart")
-        [void]$lineBuilder.Append("$([char]27)[38;2;$($green[0]);$($green[1]);$($green[2])m$xPart")
-        [void]$lineBuilder.Append($reset)
-        Write-Host $lineBuilder.ToString()
+        if ($useTrueColor) {
+            Write-Host ("{0}{1}{2}{3}{4}{5}" -f
+                $logoIndent,
+                "$([char]27)[38;2;$($blue[0]);$($blue[1]);$($blue[2])m",
+                $steamPart,
+                "$([char]27)[38;2;$($green[0]);$($green[1]);$($green[2])m",
+                $xPart,
+                $reset)
+        } else {
+            Write-Host $logoIndent -NoNewline
+            Write-Host $steamPart -NoNewline -ForegroundColor Cyan
+            Write-Host $xPart -ForegroundColor Green
+        }
     }
 
     Write-Host ""
@@ -452,6 +693,349 @@ function Get-SteamPath {
     }
 
     throw "Steam path not found. Set `$env:STEAM_PATH to the folder containing steam.exe before running STEAMX."
+}
+
+function Resolve-SteamAppId {
+    param([Parameter(Mandatory = $true)][string]$InputValue)
+
+    $trimmed = $InputValue.Trim()
+    if ($trimmed -match '^\d+$') {
+        return $trimmed
+    }
+
+    $appMatch = [System.Text.RegularExpressions.Regex]::Match($trimmed, '(?i)store\.steampowered\.com/app/(\d+)')
+    if ($appMatch.Success) {
+        return $appMatch.Groups[1].Value
+    }
+
+    $subMatch = [System.Text.RegularExpressions.Regex]::Match($trimmed, '(?i)store\.steampowered\.com/sub/(\d+)')
+    if ($subMatch.Success) {
+        return $subMatch.Groups[1].Value
+    }
+
+    throw "Invalid AppID or Steam store URL."
+}
+
+function Get-HubcapCredentialFile {
+    param([string]$CredentialOverride)
+
+    if (-not [string]::IsNullOrWhiteSpace($CredentialOverride)) {
+        return Resolve-LocalPath -PathValue $CredentialOverride -BasePath (Get-ScriptRoot)
+    }
+
+    return Join-Path (Join-Path $env:LOCALAPPDATA "STEAMX") "hubcap-api-key.dat"
+}
+
+function ConvertTo-PlainText {
+    param([Parameter(Mandatory = $true)][Security.SecureString]$SecureValue)
+
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureValue)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+    }
+}
+
+function Save-HubcapApiKey {
+    param(
+        [Parameter(Mandatory = $true)][Security.SecureString]$SecureApiKey,
+        [Parameter(Mandatory = $true)][string]$CredentialFile
+    )
+
+    Ensure-Directory -PathValue (Split-Path -Parent $CredentialFile)
+    $SecureApiKey |
+        ConvertFrom-SecureString |
+        Set-Content -LiteralPath $CredentialFile -Encoding ASCII -NoNewline
+}
+
+function Get-HubcapApiKey {
+    param(
+        [string]$ConfiguredApiKey,
+        [Parameter(Mandatory = $true)][string]$CredentialFile,
+        [switch]$ForcePrompt
+    )
+
+    if (-not $ForcePrompt) {
+        if (-not [string]::IsNullOrWhiteSpace($ConfiguredApiKey)) {
+            return $ConfiguredApiKey.Trim()
+        }
+        if (-not [string]::IsNullOrWhiteSpace($env:HUBCAP_API_KEY)) {
+            return $env:HUBCAP_API_KEY.Trim()
+        }
+        if (Test-Path -LiteralPath $CredentialFile -PathType Leaf) {
+            try {
+                $encryptedValue = (Get-Content -LiteralPath $CredentialFile -Raw -Encoding ASCII).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($encryptedValue)) {
+                    $secureApiKey = $encryptedValue | ConvertTo-SecureString
+                    return (ConvertTo-PlainText -SecureValue $secureApiKey).Trim()
+                }
+            } catch {
+                Write-UiNotice -Message "Saved Hubcap API Key could not be decrypted. Enter a new key." -Level WARN
+            }
+        }
+    }
+
+    $promptedApiKey = Read-Host "Hubcap API Key (input is hidden)" -AsSecureString
+    $plainApiKey = ConvertTo-PlainText -SecureValue $promptedApiKey
+    if ([string]::IsNullOrWhiteSpace($plainApiKey)) {
+        throw "Hubcap API Key is required."
+    }
+
+    Save-HubcapApiKey -SecureApiKey $promptedApiKey -CredentialFile $CredentialFile
+    Write-UiNotice -Message ("API Key encrypted for the current Windows user: {0}" -f (Get-DisplayPath -PathValue $CredentialFile)) -Level SUCCESS
+    return $plainApiKey.Trim()
+}
+
+function Get-HubcapHeaders {
+    param([Parameter(Mandatory = $true)][string]$ResolvedApiKey)
+
+    return @{
+        "Authorization" = "Bearer $ResolvedApiKey"
+        "User-Agent"    = "STEAMX"
+        "Accept"        = "*/*"
+    }
+}
+
+function Show-HubcapApiStatus {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Headers,
+        [Parameter(Mandatory = $true)][int]$RequestTimeoutSeconds
+    )
+
+    try {
+        $stats = Invoke-RestMethod `
+            -Uri "https://hubcapmanifest.com/api/v1/user/stats" `
+            -Headers $Headers `
+            -TimeoutSec $RequestTimeoutSeconds
+        $dailyUsage = [long](Get-ObjectPropertyValue -Object $stats -Name "daily_usage")
+        $dailyLimit = [long](Get-ObjectPropertyValue -Object $stats -Name "daily_limit")
+        $remaining = [Math]::Max(0, $dailyLimit - $dailyUsage)
+        $expiresValue = [string](Get-ObjectPropertyValue -Object $stats -Name "api_key_expires_at")
+        $expiresText = if ([string]::IsNullOrWhiteSpace($expiresValue)) {
+            "not reported"
+        } else {
+            ([DateTimeOffset]::Parse($expiresValue)).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz")
+        }
+
+        Write-UiField -Label "Hubcap User" -Value ([string](Get-ObjectPropertyValue -Object $stats -Name "username"))
+        Write-UiField -Label "API Expires" -Value $expiresText
+        Write-UiField -Label "Daily Quota" -Value ("{0}/{1} used, {2} remaining" -f $dailyUsage, $dailyLimit, $remaining)
+    } catch {
+        Write-UiNotice -Message ("Unable to query Hubcap API status: {0}" -f $_.Exception.Message) -Level WARN
+    }
+}
+
+function Get-HubcapLuaUrl {
+    param(
+        [Parameter(Mandatory = $true)][string]$ResolvedVariant,
+        [Parameter(Mandatory = $true)][string]$ResolvedAppId
+    )
+
+    switch ($ResolvedVariant) {
+        "full" { return "https://hubcapmanifest.com/api/v1/lua/$ResolvedAppId" }
+        "basegame" { return "https://hubcapmanifest.com/api/v1/lua/basegame/$ResolvedAppId" }
+        "dlc" { return "https://hubcapmanifest.com/api/v1/lua/dlc/$ResolvedAppId" }
+        default { throw "Unsupported Hubcap variant: $ResolvedVariant" }
+    }
+}
+
+function Test-ZipFile {
+    param([Parameter(Mandatory = $true)][string]$PathValue)
+
+    $stream = [System.IO.File]::OpenRead($PathValue)
+    try {
+        if ($stream.Length -lt 4) { return $false }
+        $buffer = New-Object byte[] 4
+        [void]$stream.Read($buffer, 0, 4)
+        return ($buffer[0] -eq 0x50 -and $buffer[1] -eq 0x4B -and $buffer[2] -eq 0x03 -and $buffer[3] -eq 0x04)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Invoke-HubcapDownloadWithProgress {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][hashtable]$Headers,
+        [Parameter(Mandatory = $true)][int]$RequestTimeoutSeconds
+    )
+
+    $request = [System.Net.HttpWebRequest]::Create($Url)
+    $request.UserAgent = [string]$Headers["User-Agent"]
+    $request.Accept = [string]$Headers["Accept"]
+    $request.Headers["Authorization"] = [string]$Headers["Authorization"]
+    $request.AllowAutoRedirect = $true
+    $request.Timeout = $RequestTimeoutSeconds * 1000
+    $request.ReadWriteTimeout = $RequestTimeoutSeconds * 1000
+    $response = $null
+    $responseStream = $null
+    $fileStream = $null
+    try {
+        $response = $request.GetResponse()
+        $totalBytes = [long]$response.ContentLength
+        $responseStream = $response.GetResponseStream()
+        $fileStream = [System.IO.File]::Open($Destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $buffer = New-Object byte[] 131072
+        $downloaded = 0L
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        while (($read = $responseStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $fileStream.Write($buffer, 0, $read)
+            $downloaded += $read
+            $speed = $downloaded / [Math]::Max(0.001, $stopwatch.Elapsed.TotalSeconds)
+            if ($totalBytes -gt 0) {
+                $percent = [Math]::Min(100, [int](($downloaded * 100) / $totalBytes))
+                $status = "{0} / {1} | {2}/s" -f (Format-FileSize $downloaded), (Format-FileSize $totalBytes), (Format-FileSize $speed)
+                Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Status $status -PercentComplete $percent
+            } else {
+                Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Status ("{0} downloaded" -f (Format-FileSize $downloaded))
+            }
+        }
+        Write-UiNotice -Message ("Downloaded {0}." -f (Format-FileSize $downloaded)) -Level SUCCESS
+    } finally {
+        if ($null -ne $fileStream) { $fileStream.Dispose() }
+        if ($null -ne $responseStream) { $responseStream.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+        Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Completed
+    }
+}
+
+function Install-HubcapLuaDownload {
+    param(
+        [Parameter(Mandatory = $true)][string]$DownloadPath,
+        [Parameter(Mandatory = $true)][string]$TargetDirectory,
+        [Parameter(Mandatory = $true)][string]$TargetFileName
+    )
+
+    Ensure-Directory -PathValue $TargetDirectory
+    if (-not (Test-ZipFile -PathValue $DownloadPath)) {
+        $targetFile = Join-Path $TargetDirectory ([System.IO.Path]::GetFileName($TargetFileName))
+        Copy-Item -LiteralPath $DownloadPath -Destination $targetFile -Force
+        Write-UiNotice -Message ("Installed Lua manifest: {0}" -f (Get-DisplayPath -PathValue $targetFile)) -Level SUCCESS
+        return
+    }
+
+    $extractDirectory = Join-Path (Split-Path -Parent $DownloadPath) "extract"
+    Ensure-Directory -PathValue $extractDirectory
+    Expand-Archive -LiteralPath $DownloadPath -DestinationPath $extractDirectory -Force
+    $luaFiles = @(Get-ChildItem -LiteralPath $extractDirectory -Recurse -File -Filter *.lua)
+    if ($luaFiles.Count -eq 0) {
+        throw "The Hubcap archive did not contain any Lua files."
+    }
+    foreach ($luaFile in $luaFiles) {
+        $targetFile = Join-Path $TargetDirectory $luaFile.Name
+        Copy-Item -LiteralPath $luaFile.FullName -Destination $targetFile -Force
+        Write-UiNotice -Message ("Installed Lua manifest: {0}" -f (Get-DisplayPath -PathValue $targetFile)) -Level SUCCESS
+    }
+}
+
+function Invoke-AddGame {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject]$Config,
+        [string]$InputAppId,
+        [ValidateSet("full", "basegame", "dlc")][string]$InputVariant = "full",
+        [string]$ConfiguredApiKey = "",
+        [string]$CredentialOverride = "",
+        [switch]$ForceApiKeyPrompt,
+        [string]$LuaOverride = "",
+        [string]$RequestedOutputName = "",
+        [int]$RequestTimeoutSeconds = 0
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InputAppId)) {
+        $InputAppId = Read-UiInput -Prompt "Game AppID or Steam store URL"
+    }
+    $resolvedAppId = Resolve-SteamAppId -InputValue $InputAppId
+    $steamPath = Get-SteamPath -Config $Config
+    $targetLuaPath = if ([string]::IsNullOrWhiteSpace($LuaOverride)) {
+        Join-Path $steamPath "config\lua"
+    } else {
+        Resolve-LocalPath -PathValue $LuaOverride -BasePath (Get-ScriptRoot)
+    }
+    $networkConfig = Get-ConfigValue -Object $Config -Name "network" -DefaultValue $null
+    if ($RequestTimeoutSeconds -le 0) {
+        $RequestTimeoutSeconds = [int](Get-ConfigValue -Object $networkConfig -Name "timeoutSeconds" -DefaultValue 60)
+    }
+    $credentialFile = Get-HubcapCredentialFile -CredentialOverride $CredentialOverride
+    $resolvedApiKey = Get-HubcapApiKey `
+        -ConfiguredApiKey $ConfiguredApiKey `
+        -CredentialFile $credentialFile `
+        -ForcePrompt:$ForceApiKeyPrompt
+    $headers = Get-HubcapHeaders -ResolvedApiKey $resolvedApiKey
+    $downloadUrl = Get-HubcapLuaUrl -ResolvedVariant $InputVariant -ResolvedAppId $resolvedAppId
+    $outputFileName = if ([string]::IsNullOrWhiteSpace($RequestedOutputName)) {
+        if ($InputVariant -eq "full") { "$resolvedAppId.lua" } else { "$resolvedAppId.$InputVariant.lua" }
+    } else {
+        [System.IO.Path]::GetFileName($RequestedOutputName)
+    }
+
+    Write-UiRule -Title "Game library"
+    Write-UiField -Label "AppID" -Value $resolvedAppId
+    Write-UiField -Label "Content" -Value $InputVariant
+    Write-UiField -Label "Lua Path" -Value (Get-DisplayPath -PathValue $targetLuaPath)
+    Show-HubcapApiStatus -Headers $headers -RequestTimeoutSeconds $RequestTimeoutSeconds
+
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("STEAMX\hubcap\{0}" -f [Guid]::NewGuid().ToString("N"))
+    $tempDownload = Join-Path $tempRoot "download.bin"
+    try {
+        Ensure-Directory -PathValue $tempRoot
+        Invoke-HubcapDownloadWithProgress `
+            -Url $downloadUrl `
+            -Destination $tempDownload `
+            -Headers $headers `
+            -RequestTimeoutSeconds $RequestTimeoutSeconds
+        Install-HubcapLuaDownload `
+            -DownloadPath $tempDownload `
+            -TargetDirectory $targetLuaPath `
+            -TargetFileName $outputFileName
+    } finally {
+        if (Test-Path -LiteralPath $tempRoot) {
+            Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Select-GameContentVariant {
+    $items = @(
+        [pscustomobject]@{ Shortcut = "1"; Value = "full"; Enabled = $true; Label = "Full game + DLC" }
+        [pscustomobject]@{ Shortcut = "2"; Value = "basegame"; Enabled = $true; Label = "Base game only" }
+        [pscustomobject]@{ Shortcut = "3"; Value = "dlc"; Enabled = $true; Label = "DLC only" }
+        [pscustomobject]@{ Shortcut = "0"; Value = "0"; Enabled = $true; Label = "Back" }
+    )
+    return Read-UiMenu -Items $items -Title "Content"
+}
+
+function Invoke-InteractiveAddGame {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Config)
+
+    while ($true) {
+        Write-UiLine
+        Write-UiRule -Title "Add game"
+        $gameInput = Read-UiInput -Prompt "Game AppID or Steam store URL (Q to return)"
+        if ($gameInput.Trim().ToUpperInvariant() -eq "Q") { return }
+        $selectedVariant = Select-GameContentVariant
+        if ($selectedVariant -eq "0") { return }
+
+        try {
+            Invoke-AddGame `
+                -Config $Config `
+                -InputAppId $gameInput `
+                -InputVariant $selectedVariant `
+                -ConfiguredApiKey $ApiKey `
+                -CredentialOverride $CredentialPath `
+                -ForceApiKeyPrompt:$ResetApiKey `
+                -LuaOverride $LuaPath `
+                -RequestedOutputName $OutputName `
+                -RequestTimeoutSeconds $TimeoutSeconds
+        } catch {
+            Write-UiNotice -Message $_.Exception.Message -Level ERROR
+        }
+
+        Write-UiLine
+        $continueInput = Read-UiInput -Prompt "Press Enter to add another game, or Q to return"
+        if ($continueInput.Trim().ToUpperInvariant() -eq "Q") { return }
+    }
 }
 
 function Get-SteamVersionInfo {
@@ -1183,12 +1767,12 @@ function Invoke-Check {
     }
 
     Write-UiLine
-    Write-UiLine -Text "STEAMX Environment Status" -ForegroundColor Cyan
-    Write-UiLine -Text ("{0,-14}{1}" -f "Steam Path", (Get-DisplayPath -PathValue $steamPath))
+    Write-UiRule -Title "Environment"
+    Write-UiField -Label "Steam Path" -Value (Get-DisplayPath -PathValue $steamPath)
     $steamVersion = Get-SteamVersionInfo -SteamPath $steamPath
     $steamBuildDisplay = Format-DateStamp -DateValue $steamVersion.BuildDate
     if ([string]::IsNullOrWhiteSpace($steamBuildDisplay)) { $steamBuildDisplay = "unknown" }
-    Write-UiLine -Text ("{0,-14}{1}" -f "Steam Build", $steamBuildDisplay)
+    Write-UiField -Label "Steam Build" -Value $steamBuildDisplay
     $localOstDisplay = if ([string]::IsNullOrWhiteSpace($kernelState.Version)) {
         Format-VersionWithDate -Version "" -DateValue $kernelState.FileDate
     } else {
@@ -1199,13 +1783,20 @@ function Invoke-Check {
     } else {
         Format-VersionWithDate -Version $remote.Version -DateValue $remote.PublishedDate
     }
-    Write-UiLine -Text ("{0,-14}{1} ({2})" -f "Local OST", $localOstDisplay, $kernelState.Status)
-    Write-UiLine -Text ("{0,-14}{1}" -f "Latest OST", $latestOstDisplay)
-    Write-UiLine -Text ("{0,-14}{1}" -f "Legacy Paths", $(if ($kernelState.LegacyPaths.Count -gt 0) { @($kernelState.LegacyPaths | ForEach-Object { Get-DisplayPath -PathValue $_ }) -join ", " } else { "none" }))
-    if ($cfgState -ne "None") {
-        Write-UiLine -Text ("{0,-14}{1}" -f "Steam.cfg", $cfgState)
+    $localOstColor = if ($kernelState.Status -in @("Ready", "ReadyByDate")) {
+        [System.ConsoleColor]::Green
+    } elseif ($kernelState.Status -eq "UpdateAvailable") {
+        [System.ConsoleColor]::Yellow
+    } else {
+        [System.ConsoleColor]::Gray
     }
-    Write-UiLine -Text ("{0,-14}{1}" -f "OST Config", (Get-DisplayPath -PathValue (Get-OstConfigPath -Config $Config -SteamPath $steamPath)))
+    Write-UiField -Label "Local OST" -Value ("{0} ({1})" -f $localOstDisplay, $kernelState.Status) -ValueColor $localOstColor
+    Write-UiField -Label "Latest OST" -Value $latestOstDisplay
+    Write-UiField -Label "Legacy Paths" -Value $(if ($kernelState.LegacyPaths.Count -gt 0) { @($kernelState.LegacyPaths | ForEach-Object { Get-DisplayPath -PathValue $_ }) -join ", " } else { "none" })
+    if ($cfgState -ne "None") {
+        Write-UiField -Label "Steam.cfg" -Value $cfgState -ValueColor Yellow
+    }
+    Write-UiField -Label "OST Config" -Value (Get-DisplayPath -PathValue (Get-OstConfigPath -Config $Config -SteamPath $steamPath))
 
     if (-not $remote.Available) {
         Write-Log -Message ("Remote OST status unavailable: {0}" -f $remote.Error) -Level "WARN" -LogFile $RunContext.LogFile
@@ -1532,69 +2123,71 @@ function Invoke-UninstallOst {
 function Invoke-Menu {
     param([pscustomobject]$Config)
 
+    $mainMenuItems = @(
+        [pscustomobject]@{ Shortcut = "1"; Value = "1"; Enabled = $true;  Label = ((ConvertFrom-Utf8Base64 "MS4g5byA5ZCvIC8g5pu05paw6Kej6ZSB5qih5byP") -replace '^\d+\.\s*', '') }
+        [pscustomobject]@{ Shortcut = "2"; Value = "2"; Enabled = $true;  Label = ((ConvertFrom-Utf8Base64 "Mi4g546v5aKD5qOA5rWL5LiO5L+u5aSN") -replace '^\d+\.\s*', '') }
+        [pscustomobject]@{ Shortcut = "3"; Value = "3"; Enabled = $true;  Label = (ConvertFrom-Utf8Base64 "5ri45oiP5YWl5bqT") }
+        [pscustomobject]@{ Shortcut = "4"; Value = "4"; Enabled = $false; Label = ((ConvertFrom-Utf8Base64 "NC4g57O757uf5LyY5YyW77yI5byA5Y+R5Lit77yJ") -replace '^\d+\.\s*', '') }
+        [pscustomobject]@{ Shortcut = "5"; Value = "5"; Enabled = $true;  Label = ((ConvertFrom-Utf8Base64 "NS4g5Y246L29") -replace '^\d+\.\s*', '') }
+        [pscustomobject]@{ Shortcut = "6"; Value = "6"; Enabled = $false; Label = ((ConvertFrom-Utf8Base64 "Ni4g6LWe6LWP77yI5byA5Y+R5Lit77yJ") -replace '^\d+\.\s*', '') }
+        [pscustomobject]@{ Shortcut = "0"; Value = "0"; Enabled = $true;  Label = ((ConvertFrom-Utf8Base64 "MC4g6YCA5Ye6") -replace '^\d+\.\s*', '') }
+    )
+    $uninstallMenuItems = @(
+        [pscustomobject]@{ Shortcut = "1"; Value = "1"; Enabled = $true; Label = ((ConvertFrom-Utf8Base64 "MS4g5LuF5Y246L29IE9TVA==") -replace '^\d+\.\s*', '') }
+        [pscustomobject]@{ Shortcut = "2"; Value = "2"; Enabled = $true; Label = ((ConvertFrom-Utf8Base64 "Mi4g5Y246L29IE9TVCDlubbmuIXnkIbmuLjmiI/muIXljZU=") -replace '^\d+\.\s*', '') }
+        [pscustomobject]@{ Shortcut = "0"; Value = "0"; Enabled = $true; Label = ((ConvertFrom-Utf8Base64 "MC4g6L+U5Zue") -replace '^\d+\.\s*', '') }
+    )
+
+    Clear-Host
     Write-SteampXLogo
     $initialContext = New-RunContext -Config $Config
     try {
         Invoke-Check -Config $Config -RunContext $initialContext
     } catch {
-        Write-UiLine -Text ("Environment check failed: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+        Write-UiNotice -Message ("Environment check failed: {0}" -f $_.Exception.Message) -Level WARN
     }
 
     while ($true) {
         Write-UiLine
-        Write-UiLine -Text "----------------------------------------" -ForegroundColor DarkGray
-        Write-UiLine -Text (ConvertFrom-Utf8Base64 "MS4g5byA5ZCvIC8g5pu05paw6Kej6ZSB5qih5byP") -ForegroundColor White
-        Write-UiLine -Text (ConvertFrom-Utf8Base64 "Mi4g546v5aKD5qOA5rWL5LiO5L+u5aSN") -ForegroundColor White
-        Write-UiLine -Text (ConvertFrom-Utf8Base64 "My4g5ri45oiP5YWl5bqT77yI5byA5Y+R5Lit77yJ") -ForegroundColor DarkGray
-        Write-UiLine -Text (ConvertFrom-Utf8Base64 "NC4g57O757uf5LyY5YyW77yI5byA5Y+R5Lit77yJ") -ForegroundColor DarkGray
-        Write-UiLine -Text (ConvertFrom-Utf8Base64 "NS4g5Y246L29") -ForegroundColor White
-        Write-UiLine -Text (ConvertFrom-Utf8Base64 "Ni4g6LWe6LWP77yI5byA5Y+R5Lit77yJ") -ForegroundColor DarkGray
-        Write-UiLine -Text (ConvertFrom-Utf8Base64 "MC4g6YCA5Ye6") -ForegroundColor White
-        Write-UiLine
-
-        $choice = Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "6K+36YCJ5oup")
+        $choice = Read-UiMenu -Items $mainMenuItems -Title "Actions"
         $runContext = New-RunContext -Config $Config
 
         if ($choice -eq "1") {
             Write-UiLine
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "U1RFQU1YIOWwhuS4i+i9veW5tuagoemqjCBPU1TjgIHlhbPpl60gU3RlYW3jgIHlpIfku73lubbpg6jnvbLmlofku7bvvIzlrozmiJDlkI7lj6rlkK/liqjkuIDmrKEgU3RlYW3jgII=") -ForegroundColor Yellow
+            Write-UiRule -Title "Unlock mode"
+            Write-UiNotice -Message (ConvertFrom-Utf8Base64 "U1RFQU1YIOWwhuS4i+i9veW5tuagoemqjCBPU1TjgIHlhbPpl60gU3RlYW3jgIHlpIfku73lubbpg6jnvbLmlofku7bvvIzlrozmiJDlkI7lj6rlkK/liqjkuIDmrKEgU3RlYW3jgII=") -Level WARN
             $answer = Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJIEVudGVyIOe7p+e7re+8jOi+k+WFpeWFtuS7luWGheWuueWPlua2iA==")
             if ([string]::IsNullOrWhiteSpace($answer)) {
                 Invoke-EnableUnlockMode -Config $Config -RunContext $runContext
             } else {
-                Write-UiLine -Text (ConvertFrom-Utf8Base64 "5pON5L2c5bey5Y+W5raI44CC") -ForegroundColor Yellow
+                Write-UiNotice -Message (ConvertFrom-Utf8Base64 "5pON5L2c5bey5Y+W5raI44CC") -Level WARN
             }
-            Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJIEVudGVyIOi/lOWbnuiPnOWNlQ==") | Out-Null
+            Wait-UiContinue
         } elseif ($choice -eq "2") {
             Invoke-Check -Config $Config -RunContext $runContext
-            Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJIEVudGVyIOi/lOWbnuiPnOWNlQ==") | Out-Null
+            Wait-UiContinue
         } elseif ($choice -eq "3") {
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "5ri45oiP5YWl5bqT5Yqf6IO95byA5Y+R5Lit44CC") -ForegroundColor Yellow
-            Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJIEVudGVyIOi/lOWbnuiPnOWNlQ==") | Out-Null
-        } elseif ($choice -eq "4") {
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "57O757uf5LyY5YyW5Yqf6IO95byA5Y+R5Lit44CC") -ForegroundColor Yellow
-            Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJIEVudGVyIOi/lOWbnuiPnOWNlQ==") | Out-Null
+            Invoke-InteractiveAddGame -Config $Config
         } elseif ($choice -eq "5") {
             Write-UiLine
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "MS4g5LuF5Y246L29IE9TVA==") -ForegroundColor White
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "Mi4g5Y246L29IE9TVCDlubbmuIXnkIbmuLjmiI/muIXljZU=") -ForegroundColor White
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "MC4g6L+U5Zue") -ForegroundColor White
-            $uninstallChoice = Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "6K+36YCJ5oup")
+            $uninstallChoice = Read-UiMenu -Items $uninstallMenuItems -Title "Uninstall"
             if ($uninstallChoice -eq "1") {
                 Invoke-UninstallOst -Config $Config -RunContext $runContext
             } elseif ($uninstallChoice -eq "2") {
                 Invoke-UninstallOst -Config $Config -RunContext $runContext -RemoveLua
             }
-            Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJIEVudGVyIOi/lOWbnuiPnOWNlQ==") | Out-Null
-        } elseif ($choice -eq "6") {
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "6LWe6LWP5Yqf6IO95byA5Y+R5Lit44CC") -ForegroundColor Yellow
-            Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJIEVudGVyIOi/lOWbnuiPnOWNlQ==") | Out-Null
+            if ($uninstallChoice -ne "0") {
+                Wait-UiContinue
+            }
         } elseif ($choice -eq "0") {
             return
         } else {
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "5peg5pWI6YCJ5oup44CC") -ForegroundColor Yellow
+            Write-UiNotice -Message (ConvertFrom-Utf8Base64 "5peg5pWI6YCJ5oup44CC") -Level WARN
             Start-Sleep -Seconds 1
         }
+
+        Clear-Host
+        Write-SteampXLogo
     }
 }
 
@@ -1608,6 +2201,18 @@ if ($MyInvocation.InvocationName -ne ".") {
             "Check" { Invoke-Check -Config $config -RunContext $runContext }
             "DeployOst" { Invoke-DeployOst -Config $config -RunContext $runContext }
             "EnableUnlockMode" { Invoke-EnableUnlockMode -Config $config -RunContext $runContext }
+            "AddGame" {
+                Invoke-AddGame `
+                    -Config $config `
+                    -InputAppId $AppId `
+                    -InputVariant $Variant `
+                    -ConfiguredApiKey $ApiKey `
+                    -CredentialOverride $CredentialPath `
+                    -ForceApiKeyPrompt:$ResetApiKey `
+                    -LuaOverride $LuaPath `
+                    -RequestedOutputName $OutputName `
+                    -RequestTimeoutSeconds $TimeoutSeconds
+            }
             "SetManifestSource" { Invoke-SetManifestSource -Config $config -RunContext $runContext -Source $ManifestSource }
             "UninstallOst" { Invoke-UninstallOst -Config $config -RunContext $runContext }
             "UninstallOstAndLua" { Invoke-UninstallOst -Config $config -RunContext $runContext -RemoveLua }
