@@ -378,8 +378,9 @@ function New-DefaultConfig {
             githubRepo                  = "OpenSteam001/OpenSteamTool"
             assetPattern                = "*Release.zip"
             assetNameTemplate           = "OpenSteamTool-{tag}-Release.zip"
-            # Try the GitHub mirror first. The official URL is always appended as fallback.
+            # Prefer the official asset and retain the mirror as a fallback.
             downloadUrlTemplates        = @(
+                "{official}",
                 "https://ghfast.top/{official}"
             )
             targetPath                  = ""
