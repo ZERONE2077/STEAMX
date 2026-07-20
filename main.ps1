@@ -540,6 +540,21 @@ function Get-HttpErrorDetail {
     }
 }
 
+function Get-HttpStatusCode {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $responseProperty = $ErrorRecord.Exception.PSObject.Properties["Response"]
+    if ($null -eq $responseProperty -or $null -eq $responseProperty.Value) {
+        return 0
+    }
+
+    try {
+        return [int]$responseProperty.Value.StatusCode
+    } catch {
+        return 0
+    }
+}
+
 function Get-LatestOstRelease {
     param([Parameter(Mandatory = $true)][pscustomobject]$Config)
 
@@ -821,8 +836,14 @@ function Show-HubcapApiStatus {
         Write-UiField -Label "Hubcap User" -Value ([string](Get-ObjectPropertyValue -Object $stats -Name "username"))
         Write-UiField -Label "API Expires" -Value $expiresText
         Write-UiField -Label "Daily Quota" -Value ("{0}/{1} used, {2} remaining" -f $dailyUsage, $dailyLimit, $remaining)
+        return "Ready"
     } catch {
+        if ((Get-HttpStatusCode -ErrorRecord $_) -eq 401) {
+            Write-UiNotice -Message "Hubcap API Key is invalid or expired." -Level WARN
+            return "Unauthorized"
+        }
         Write-UiNotice -Message ("Unable to query Hubcap API status: {0}" -f $_.Exception.Message) -Level WARN
+        return "Unavailable"
     }
 }
 
@@ -893,6 +914,11 @@ function Invoke-HubcapDownloadWithProgress {
             }
         }
         Write-UiNotice -Message ("Downloaded {0}." -f (Format-FileSize $downloaded)) -Level SUCCESS
+    } catch {
+        if ((Get-HttpStatusCode -ErrorRecord $_) -eq 401) {
+            throw "Hubcap rejected the API Key while downloading. Run the game import again to replace the saved key."
+        }
+        throw
     } finally {
         if ($null -ne $fileStream) { $fileStream.Dispose() }
         if ($null -ne $responseStream) { $responseStream.Dispose() }
@@ -938,6 +964,7 @@ function Invoke-AddGame {
         [string]$ConfiguredApiKey = "",
         [string]$CredentialOverride = "",
         [switch]$ForceApiKeyPrompt,
+        [switch]$RetryInvalidCredential,
         [string]$LuaOverride = "",
         [string]$RequestedOutputName = "",
         [int]$RequestTimeoutSeconds = 0
@@ -974,7 +1001,23 @@ function Invoke-AddGame {
     Write-UiField -Label "AppID" -Value $resolvedAppId
     Write-UiField -Label "Content" -Value $InputVariant
     Write-UiField -Label "Lua Path" -Value (Get-DisplayPath -PathValue $targetLuaPath)
-    Show-HubcapApiStatus -Headers $headers -RequestTimeoutSeconds $RequestTimeoutSeconds
+    $apiStatus = Show-HubcapApiStatus -Headers $headers -RequestTimeoutSeconds $RequestTimeoutSeconds
+    if ($apiStatus -eq "Unauthorized") {
+        if (-not $RetryInvalidCredential) {
+            throw "Hubcap API Key is invalid or expired. Run again with -ResetApiKey to replace it."
+        }
+
+        Write-UiNotice -Message "Enter a new Hubcap API Key to replace the saved credential." -Level INFO
+        $resolvedApiKey = Get-HubcapApiKey `
+            -ConfiguredApiKey "" `
+            -CredentialFile $credentialFile `
+            -ForcePrompt
+        $headers = Get-HubcapHeaders -ResolvedApiKey $resolvedApiKey
+        $apiStatus = Show-HubcapApiStatus -Headers $headers -RequestTimeoutSeconds $RequestTimeoutSeconds
+        if ($apiStatus -eq "Unauthorized") {
+            throw "The new Hubcap API Key was also rejected. Check the key and try again."
+        }
+    }
 
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("STEAMX\hubcap\{0}" -f [Guid]::NewGuid().ToString("N"))
     $tempDownload = Join-Path $tempRoot "download.bin"
@@ -1025,6 +1068,7 @@ function Invoke-InteractiveAddGame {
                 -ConfiguredApiKey $ApiKey `
                 -CredentialOverride $CredentialPath `
                 -ForceApiKeyPrompt:$ResetApiKey `
+                -RetryInvalidCredential `
                 -LuaOverride $LuaPath `
                 -RequestedOutputName $OutputName `
                 -RequestTimeoutSeconds $TimeoutSeconds
