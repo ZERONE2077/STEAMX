@@ -1,0 +1,19 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="第 1 页" id="JnZrYNCYDc0h_qrlio8F">
+    <mxGraphModel dx="1023" dy="555" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="CFJpiaGBNjG_WusuLr_m-1" parent="1" style="whiteSpace=wrap;html=1;" value="opensteamtool" vertex="1">
+          <mxGeometry height="60" width="120" x="200" y="390" as="geometry" />
+        </mxCell>
+        <mxCell id="CFJpiaGBNjG_WusuLr_m-4" parent="1" style="whiteSpace=wrap;html=1;" value="opensteamtool" vertex="1">
+          <mxGeometry height="60" width="120" x="200" y="580" as="geometry" />
+        </mxCell>
+        <mxCell id="CFJpiaGBNjG_WusuLr_m-6" parent="1" style="whiteSpace=wrap;html=1;" value="检测Steam安装路径" vertex="1">
+          <mxGeometry height="60" width="120" x="200" y="480" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
