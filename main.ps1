@@ -89,6 +89,46 @@ function Get-UiWidth {
     return [Math]::Max(24, [Math]::Min(96, $width - 1))
 }
 
+function Get-UiCharacterWidth {
+    param([Parameter(Mandatory = $true)][char]$Character)
+
+    $category = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($Character)
+    if ($category -in @(
+            [Globalization.UnicodeCategory]::NonSpacingMark,
+            [Globalization.UnicodeCategory]::EnclosingMark,
+            [Globalization.UnicodeCategory]::Format,
+            [Globalization.UnicodeCategory]::Control
+        )) {
+        return 0
+    }
+
+    $codePoint = [int]$Character
+    if (($codePoint -ge 0x1100 -and $codePoint -le 0x115F) -or
+        ($codePoint -ge 0x2329 -and $codePoint -le 0x232A) -or
+        ($codePoint -ge 0x2E80 -and $codePoint -le 0xA4CF) -or
+        ($codePoint -ge 0xAC00 -and $codePoint -le 0xD7A3) -or
+        ($codePoint -ge 0xF900 -and $codePoint -le 0xFAFF) -or
+        ($codePoint -ge 0xFE10 -and $codePoint -le 0xFE19) -or
+        ($codePoint -ge 0xFE30 -and $codePoint -le 0xFE6F) -or
+        ($codePoint -ge 0xFF00 -and $codePoint -le 0xFF60) -or
+        ($codePoint -ge 0xFFE0 -and $codePoint -le 0xFFE6)) {
+        return 2
+    }
+
+    return 1
+}
+
+function Get-UiTextWidth {
+    param([AllowEmptyString()][string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) { return 0 }
+    $width = 0
+    foreach ($character in $Text.ToCharArray()) {
+        $width += Get-UiCharacterWidth -Character $character
+    }
+    return $width
+}
+
 function Limit-UiText {
     param(
         [AllowEmptyString()][string]$Text,
@@ -96,9 +136,30 @@ function Limit-UiText {
     )
 
     if ($null -eq $Text) { return "" }
-    if ($Text.Length -le $Width) { return $Text }
-    if ($Width -le 3) { return $Text.Substring(0, $Width) }
-    return $Text.Substring(0, $Width - 3) + "..."
+    if ((Get-UiTextWidth -Text $Text) -le $Width) { return $Text }
+    if ($Width -le 3) { return "." * [Math]::Max(0, $Width) }
+
+    $builder = New-Object System.Text.StringBuilder
+    $usedWidth = 0
+    $contentWidth = $Width - 3
+    foreach ($character in $Text.ToCharArray()) {
+        $characterWidth = Get-UiCharacterWidth -Character $character
+        if (($usedWidth + $characterWidth) -gt $contentWidth) { break }
+        [void]$builder.Append($character)
+        $usedWidth += $characterWidth
+    }
+    return $builder.ToString() + "..."
+}
+
+function Pad-UiText {
+    param(
+        [AllowEmptyString()][string]$Text,
+        [int]$Width = (Get-UiWidth)
+    )
+
+    if ($null -eq $Text) { $Text = "" }
+    $padding = [Math]::Max(0, $Width - (Get-UiTextWidth -Text $Text))
+    return $Text + (" " * $padding)
 }
 
 function Write-UiRule {
@@ -186,8 +247,6 @@ function Read-UiMenu {
     $selectedPosition = 0
     $width = Get-UiWidth
     $lineCount = $Items.Count + 1
-    $useVirtualTerminal = Test-UiVirtualTerminal
-    $escape = [string][char]27
     $hasRendered = $false
     try {
         $menuTop = [Console]::CursorTop
@@ -197,14 +256,10 @@ function Read-UiMenu {
 
     while ($true) {
         if ($hasRendered) {
-            if ($useVirtualTerminal) {
-                Write-Host ("{0}[{1}A" -f $escape, $lineCount) -NoNewline
-            } else {
-                try {
-                    [Console]::SetCursorPosition(0, $menuTop)
-                } catch {
-                    $host.UI.RawUI.CursorPosition = New-Object System.Management.Automation.Host.Coordinates 0, $menuTop
-                }
+            try {
+                [Console]::SetCursorPosition(0, $menuTop)
+            } catch {
+                $host.UI.RawUI.CursorPosition = New-Object System.Management.Automation.Host.Coordinates 0, $menuTop
             }
         }
 
@@ -214,11 +269,7 @@ function Read-UiMenu {
             $marker = if ($isSelected) { ">" } else { " " }
             $line = "  {0} {1}. {2}" -f $marker, $item.Shortcut, $item.Label
             $line = Limit-UiText -Text $line -Width $width
-            if ($useVirtualTerminal) {
-                $line = ("{0}[2K{0}[1G{1}" -f $escape, $line)
-            } else {
-                $line = $line.PadRight($width)
-            }
+            $line = Pad-UiText -Text $line -Width $width
             $color = if (-not $item.Enabled) {
                 [System.ConsoleColor]::DarkGray
             } elseif ($isSelected) {
@@ -229,14 +280,10 @@ function Read-UiMenu {
             Write-UiLine -Text $line -ForegroundColor $color
         }
         $hint = Limit-UiText -Text "  Up/Down select   Enter confirm   Number shortcut   Esc back" -Width $width
-        if ($useVirtualTerminal) {
-            $hint = ("{0}[2K{0}[1G{1}" -f $escape, $hint)
-        } else {
-            $hint = $hint.PadRight($width)
-        }
+        $hint = Pad-UiText -Text $hint -Width $width
         Write-UiLine -Text $hint -ForegroundColor DarkGray
 
-        if (-not $hasRendered -and -not $useVirtualTerminal) {
+        if (-not $hasRendered) {
             try {
                 $menuTop = [Math]::Max(0, [Console]::CursorTop - $lineCount)
             } catch {
@@ -958,6 +1005,16 @@ function Install-HubcapLuaDownload {
     }
 }
 
+function Get-GameVariantLabel {
+    param([Parameter(Mandatory = $true)][ValidateSet("full", "basegame", "dlc")][string]$Variant)
+
+    switch ($Variant) {
+        "full" { return ConvertFrom-Utf8Base64 "5a6M5pW05YaF5a6577yI5pys5L2TICsgRExD77yJ" }
+        "basegame" { return ConvertFrom-Utf8Base64 "5LuF5pys5L2T" }
+        "dlc" { return ConvertFrom-Utf8Base64 "5LuFIERMQw==" }
+    }
+}
+
 function Invoke-AddGame {
     param(
         [Parameter(Mandatory = $true)][pscustomobject]$Config,
@@ -999,10 +1056,10 @@ function Invoke-AddGame {
         [System.IO.Path]::GetFileName($RequestedOutputName)
     }
 
-    Write-UiRule -Title "Game library"
+    Write-UiRule -Title (ConvertFrom-Utf8Base64 "5ri45oiP5YWl5bqT")
     Write-UiField -Label "AppID" -Value $resolvedAppId
-    Write-UiField -Label "Content" -Value $InputVariant
-    Write-UiField -Label "Lua Path" -Value (Get-DisplayPath -PathValue $targetLuaPath)
+    Write-UiField -Label (ConvertFrom-Utf8Base64 "5YaF5a65") -Value (Get-GameVariantLabel -Variant $InputVariant)
+    Write-UiField -Label (ConvertFrom-Utf8Base64 "THVhIOi3r+W+hA==") -Value (Get-DisplayPath -PathValue $targetLuaPath)
     $apiStatus = Show-HubcapApiStatus -Headers $headers -RequestTimeoutSeconds $RequestTimeoutSeconds
     if ($apiStatus -eq "Unauthorized") {
         if (-not $RetryInvalidCredential) {
@@ -1043,12 +1100,12 @@ function Invoke-AddGame {
 
 function Select-GameContentVariant {
     $items = @(
-        [pscustomobject]@{ Shortcut = "1"; Value = "full"; Enabled = $true; Label = "Full game + DLC" }
-        [pscustomobject]@{ Shortcut = "2"; Value = "basegame"; Enabled = $true; Label = "Base game only" }
-        [pscustomobject]@{ Shortcut = "3"; Value = "dlc"; Enabled = $true; Label = "DLC only" }
-        [pscustomobject]@{ Shortcut = "0"; Value = "0"; Enabled = $true; Label = "Back" }
+        [pscustomobject]@{ Shortcut = "1"; Value = "full"; Enabled = $true; Label = (Get-GameVariantLabel -Variant "full") }
+        [pscustomobject]@{ Shortcut = "2"; Value = "basegame"; Enabled = $true; Label = (Get-GameVariantLabel -Variant "basegame") }
+        [pscustomobject]@{ Shortcut = "3"; Value = "dlc"; Enabled = $true; Label = (Get-GameVariantLabel -Variant "dlc") }
+        [pscustomobject]@{ Shortcut = "0"; Value = "0"; Enabled = $true; Label = (ConvertFrom-Utf8Base64 "6L+U5Zue") }
     )
-    return Read-UiMenu -Items $items -Title "Content"
+    return Read-UiMenu -Items $items -Title (ConvertFrom-Utf8Base64 "5YaF5a6557G75Z6L")
 }
 
 function Invoke-InteractiveAddGame {
@@ -1077,10 +1134,6 @@ function Invoke-InteractiveAddGame {
         } catch {
             Write-UiNotice -Message $_.Exception.Message -Level ERROR
         }
-
-        Write-UiLine
-        $continueInput = Read-UiInput -Prompt "Press Enter to add another game, or Q to return"
-        if ($continueInput.Trim().ToUpperInvariant() -eq "Q") { return }
     }
 }
 
