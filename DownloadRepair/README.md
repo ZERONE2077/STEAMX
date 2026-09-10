@@ -4,10 +4,11 @@
 
 - 脚本：`DownloadRepair.ps1`（UTF-8 with BOM，Windows PowerShell 5.1 可直接运行）
 - 默认只解压 `.manifest` → `<Steam>\depotcache`，`.lua` 跳过（加 `-IncludeLua` 才写 `<Steam>\config\lua`）
-- 菜单显示 Steam 中文名，缓存文件 `manifest\appnames.json`，缺失时自动查 Steam 商店接口
+- 菜单显示 Steam 中文名，名单缓存 `manifest\appnames.json`；**默认只读缓存，不联网加载**，缺失的先显示 AppID（`-RefreshNames` 才联网补全）
 - 本地包源：项目根 `manifest\`，文件名为 `<AppID>.zip`
 - 远端包源：`ZERONE2077/STEAMX`，依次尝试 `manifest/`、`Lua/` 目录；GitHub API 直连失败时自动走 `gh-proxy.com` 镜像，再退 jsDelivr 索引
-- 默认静默：不写日志文件，只输出游戏列表 → 安装 → 结果；加 `-Log` 才输出日志
+- 输出为 CLI 日志风格：`HH:mm:ss INFO  scope  message`（scope: `repair` / `steam` / `net` / `names` / `install`）
+- 默认不写日志文件；加 `-Log` 才落 `logs\repair-<时间戳>.log`（DEBUG 行也只在这时出现）
 
 ---
 
@@ -76,8 +77,9 @@ irm -Uri 'https://ghfast.top/https://raw.githubusercontent.com/ZERONE2077/STEAMX
 | `-Game` | AppID / 中文名 / 关键词，唯一命中直接安装，多个命中仍出菜单 | 无（出菜单） |
 | `-Offline` | 不联网，只用本地 `manifest\`（中文名取缓存） | 关 |
 | `-NoBackup` | 覆盖已有文件时不备份 | 关（默认备份） |
-| `-Log` | 输出日志：控制台显示全部 `[i]`/`[+]` 行，并写入 `logs\repair-<时间戳>.log` | 关（静默，不写文件） |
-| `-ShowEnv` | 显示 Steam 路径、目标目录、仓库等环境信息 | 关（默认不显示） |
+| `-RefreshNames` | 逐个联网补全缺失的中文名并写回 `appnames.json` | 关（默认只读缓存，菜单秒开） |
+| `-Log` | 写 `logs\repair-<时间戳>.log`，并显示 DEBUG 行（`names` 的逐条结果） | 关（不写文件） |
+| `-ShowEnv` | 显示本地包源、仓库、日志路径 | 关（默认不显示） |
 | `-IncludeLua` | 连同 `.lua` 一起解压到 `<Steam>\config\lua` | 关（只装 manifest） |
 | `-LuaTarget` | `.lua` 解压目录（配合 `-IncludeLua`） | `<Steam>\config\lua` |
 | `-LocalDir` | 本地 zip 目录 | `<项目根>\manifest` 或 `$env:STEAMX_MANIFEST_DIR` |
@@ -118,8 +120,11 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
 # 想看 Steam 路径和目标目录时
 & $dr -Game 1091500 -ShowEnv
 
-# 需要排查问题时输出日志（控制台 + logs\repair-<时间戳>.log）
+# 需要排查问题时输出日志文件（控制台 + logs\repair-<时间戳>.log）
 & $dr -Game 1091500 -Log
+
+# 新加了包、菜单里显示的还是 AppID 时：联网补全中文名
+& $dr -RefreshNames
 
 # 指定别的 zip 目录
 & $dr -Game 1091500 -LocalDir D:\Packs
@@ -136,9 +141,8 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
 ## 6. 注意
 
 - 覆盖已有文件时，原文件会备份到 `backups\repair-<时间戳>\`（`-NoBackup` 关闭）。
-- 日志默认关闭：不写文件、不打印 `[i]`/`[+]` 行，只保留安装与结果两块；加 `-Log` 才输出并写 `logs\repair-<时间戳>.log`。`[!]` 警告和错误始终显示。
-- 中文名来自 `manifest\appnames.json` 缓存；首次运行会联网查 Steam 商店（每个 AppID 一次，约 0.15 秒），之后直接读缓存。离线（`-Offline`）只显示缓存里有的名字，其余显示 AppID。
+- 日志默认只在控制台输出，不写文件；加 `-Log` 才写 `logs\repair-<时间戳>.log`。`WARN` / `ERROR` 行始终显示。
+- 中文名来自 `manifest\appnames.json`：**默认只读本地名单，菜单立刻出现**，名字缺失的先显示 AppID，选中后会补一次。本地没有名单文件时，会从仓库拉一次 `manifest/appnames.json`（几百字节）。
 - 只有数字命名的 `<AppID>.zip` 才能查到中文名，旧的游戏名 zip 直接显示文件名。
 - 通过 `irm | iex` 运行时找不到项目根，日志和备份会落到 `%TEMP%\STEAMX\`，本地包源用 `-LocalDir` 或 `$env:STEAMX_MANIFEST_DIR` 指定。
 - 建议先退出 Steam，避免文件占用导致覆盖失败。
-- `manifest\` 未推送到远端前，远端命令只能拉到 `Lua\` 下的 7 个旧名包。
