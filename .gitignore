@@ -4,5 +4,7 @@ cache/
 logs/
 docs/
 test/
+.workbuddy/
+backups/
 *.log
 *.tmp
