@@ -18,7 +18,8 @@ param(
     [switch]$Offline,
     [switch]$ShowEnv,
     [switch]$IncludeLua,
-    [switch]$Log
+    [switch]$Log,
+    [switch]$RefreshNames
 )
 
 Set-StrictMode -Version Latest
@@ -30,49 +31,82 @@ try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 } catch { }
 
-# 日志默认关闭: 不写 logs\repair-*.log, 也不打印 [i]/[+] 行
-# 需要时用 -Log 开启(文件 + 控制台全量); WARN/ERR 始终显示
+# 日志文件默认不写, -Log 才落到 logs\repair-<时间戳>.log
 $script:LogFile = ""
 $script:LogEnabled = $false
 
-# ---------------------------------------------------------------- 基础工具
+# ---------------------------------------------------------------- 输出
 
-function Write-Log {
+# tail 风格日志: HH:mm:ss TAG scope message
+# TAG 宽 5 (INFO/OK/WARN/ERROR/DBUG), scope 宽 8
+# 整行拼成单个 Write-Host(ANSI SGR), 避免重定向时被拆行;
+# 非 VT 终端 / 输出被重定向 / 设了 NO_COLOR 时退化为纯文本
+
+function Test-VirtualTerminal {
+    if (-not [string]::IsNullOrEmpty($env:NO_COLOR)) { return $false }
+    if ([Console]::IsOutputRedirected) { return $false }
+    if (-not [string]::IsNullOrEmpty($env:WT_SESSION)) { return $true }
+    try {
+        $property = $Host.UI.PSObject.Properties["SupportsVirtualTerminal"]
+        if ($null -ne $property) { return [bool]$property.Value }
+    } catch { }
+    return $false
+}
+
+function Initialize-Ui {
+    $script:UseAnsi = Test-VirtualTerminal
+}
+
+$script:UseAnsi = $false
+
+function Write-UiLog {
     param(
-        [Parameter(Mandatory = $true)][string]$Message,
-        [ValidateSet("INFO", "OK", "WARN", "ERR")][string]$Level = "INFO"
+        [Parameter(Mandatory = $true)][string]$Scope,
+        [ValidateSet("DEBUG", "INFO", "SUCCESS", "WARN", "ERROR")][string]$Level = "INFO",
+        [AllowEmptyString()][string]$Message = ""
     )
 
-    $prefix = @{ INFO = "[i]"; OK = "[+]"; WARN = "[!]"; ERR = "[x]" }[$Level]
-    $color = @{ INFO = "Cyan"; OK = "Green"; WARN = "Yellow"; ERR = "Red" }[$Level]
-    if ($script:LogEnabled -or $Level -eq "WARN" -or $Level -eq "ERR") {
-        Write-Host ("  {0} {1}" -f $prefix, $Message) -ForegroundColor $color
+    if ($Level -eq "DEBUG" -and -not $script:LogEnabled) { return }
+
+    $tagMap = @{ DEBUG = "DBUG"; INFO = "INFO"; SUCCESS = "OK"; WARN = "WARN"; ERROR = "ERROR" }
+    $colorMap = @{ DEBUG = "90"; INFO = "36"; SUCCESS = "32"; WARN = "33"; ERROR = "31" }
+    $tag = $tagMap[$Level].PadRight(5)
+
+    $scopeKey = $Scope.ToLowerInvariant()
+    if ($scopeKey.Length -gt 8) { $scopeKey = $scopeKey.Substring(0, 8) }
+    $scopePad = $scopeKey.PadRight(8)
+
+    $stamp = Get-Date -Format "HH:mm:ss"
+
+    if ($script:UseAnsi) {
+        $esc = [char]27
+        $msgIn = ""
+        $msgOut = ""
+        if ($Level -eq "WARN" -or $Level -eq "ERROR") {
+            $msgIn = "${esc}[$($colorMap[$Level])m"
+            $msgOut = "${esc}[0m"
+        }
+        Write-Host ("${esc}[90m{0}${esc}[0m ${esc}[{1}m{2}${esc}[0m ${esc}[90m{3}${esc}[0m {4}{5}{6}" -f $stamp, $colorMap[$Level], $tag, $scopePad, $msgIn, $Message, $msgOut)
+    } else {
+        Write-Host ("{0} {1} {2} {3}" -f $stamp, $tag, $scopePad, $Message)
     }
+
     if (-not [string]::IsNullOrWhiteSpace($script:LogFile)) {
-        $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+        $line = "{0} [{1}] {2} {3}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $scopeKey, $Message
         Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8
     }
 }
 
+# 菜单专用分隔标题(不属于日志流)
 function Write-Rule {
     param([string]$Title = "")
-    $width = 78
+    $width = 62
     if ([string]::IsNullOrWhiteSpace($Title)) {
         Write-Host ("-" * $width) -ForegroundColor DarkGray
         return
     }
-    $prefix = "-- {0} " -f $Title
+    $prefix = "- {0} " -f $Title
     Write-Host ($prefix + ("-" * [Math]::Max(0, $width - $prefix.Length))) -ForegroundColor DarkGray
-}
-
-function Write-Field {
-    param(
-        [Parameter(Mandatory = $true)][string]$Label,
-        [AllowEmptyString()][string]$Value = "",
-        [string]$Color = "Gray"
-    )
-    Write-Host ("  {0,-14}" -f $Label) -NoNewline -ForegroundColor DarkGray
-    Write-Host $Value -ForegroundColor $Color
 }
 
 function Format-Size {
@@ -81,6 +115,19 @@ function Format-Size {
     if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
     if ($Bytes -ge 1KB) { return "{0:N2} KB" -f ($Bytes / 1KB) }
     return "{0} B" -f $Bytes
+}
+
+function Format-UrlShort {
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    try {
+        $uri = [Uri]$Url
+        $leaf = [System.IO.Path]::GetFileName($uri.AbsolutePath)
+        if ([string]::IsNullOrWhiteSpace($leaf)) { return $uri.Host }
+        return ("{0}/{1}" -f $uri.Host, $leaf)
+    } catch {
+        return $Url
+    }
 }
 
 function Format-PathCase {
@@ -404,10 +451,13 @@ function New-GameLabel {
     param([Parameter(Mandatory = $true)]$Item)
 
     $size = Format-Size -Bytes ([long]$Item.Size)
-    if (-not [string]::IsNullOrWhiteSpace([string]$Item.AppId)) {
-        return ("{0}  [{1}]  ({2})" -f $Item.DisplayName, $Item.AppId, $size)
+    $display = [string]$Item.DisplayName
+    $appId = [string]$Item.AppId
+    # 名字还没补上时 DisplayName 就是 AppID, 不重复显示两次
+    if ([string]::IsNullOrWhiteSpace($appId) -or $appId -eq $display) {
+        return ("{0}  ({1})" -f $display, $size)
     }
-    return ("{0}  ({1})" -f $Item.DisplayName, $size)
+    return ("{0}  [{1}]  ({2})" -f $display, $appId, $size)
 }
 
 function Get-AppIdFromZipName {
@@ -448,14 +498,13 @@ function Save-AppNameCache {
     } catch { }
 }
 
-function Get-SteamAppName {
+function Invoke-RemoteText {
     param(
-        [Parameter(Mandatory = $true)][string]$AppId,
+        [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][int]$Timeout
     )
 
-    $url = "https://store.steampowered.com/api/appdetails?appids={0}&cc=cn&l=schinese" -f $AppId
-    $request = [System.Net.HttpWebRequest]::Create($url)
+    $request = [System.Net.HttpWebRequest]::Create($Url)
     $request.UserAgent = "STEAMX"
     $request.Accept = "application/json"
     $request.AllowAutoRedirect = $true
@@ -467,56 +516,150 @@ function Get-SteamAppName {
         $response = $request.GetResponse()
         $stream = $response.GetResponseStream()
         $reader = New-Object System.IO.StreamReader $stream
-        $body = $reader.ReadToEnd()
-        $json = $body | ConvertFrom-Json
-        $node = $json.PSObject.Properties[$AppId]
-        if ($null -ne $node -and $node.Value.success) {
-            return [string]$node.Value.data.name
-        }
-        return ""
-    } catch {
-        return ""
+        return $reader.ReadToEnd()
     } finally {
         if ($null -ne $stream) { $stream.Dispose() }
         if ($null -ne $response) { $response.Dispose() }
     }
 }
 
+function Read-RemoteAppNameCache {
+    param([Parameter(Mandatory = $true)][int]$Timeout)
+
+    $urls = @(
+        ("https://cdn.jsdelivr.net/gh/{0}@{1}/manifest/appnames.json" -f $Repo, $Branch),
+        ("https://raw.githubusercontent.com/{0}/{1}/manifest/appnames.json" -f $Repo, $Branch),
+        ("https://ghfast.top/https://raw.githubusercontent.com/{0}/{1}/manifest/appnames.json" -f $Repo, $Branch)
+    )
+    foreach ($url in $urls) {
+        try {
+            $body = Invoke-RemoteText -Url $url -Timeout $Timeout
+            if ([string]::IsNullOrWhiteSpace($body)) { continue }
+            if ($body.TrimStart().StartsWith("<")) { continue }
+            $json = $body | ConvertFrom-Json
+            $cache = @{}
+            foreach ($property in $json.PSObject.Properties) {
+                $cache[[string]$property.Name] = [string]$property.Value
+            }
+            if ($cache.Count -gt 0) { return $cache }
+        } catch { }
+    }
+    return @{}
+}
+
+function Get-SteamAppName {
+    param(
+        [Parameter(Mandatory = $true)][string]$AppId,
+        [Parameter(Mandatory = $true)][int]$Timeout
+    )
+
+    $url = "https://store.steampowered.com/api/appdetails?appids={0}&cc=cn&l=schinese" -f $AppId
+    try {
+        $body = Invoke-RemoteText -Url $url -Timeout $Timeout
+        if ([string]::IsNullOrWhiteSpace($body)) { return "" }
+        $json = $body | ConvertFrom-Json
+        $node = $json.PSObject.Properties[$AppId]
+        if ($null -ne $node -and $node.Value.success) {
+            return [string]$node.Value.data.name
+        }
+    } catch { }
+    return ""
+}
+
+# 名单只走本地缓存(缺失时同步仓库里的 appnames.json), 不做逐个联网
+# 这样菜单立刻可见; 名字缺的先显示 AppID, 安装时或 -RefreshNames 再补
 function Add-GameDisplayNames {
     param(
         [Parameter(Mandatory = $true)][array]$Items,
         [Parameter(Mandatory = $true)][string]$CachePath,
         [Parameter(Mandatory = $true)][int]$Timeout,
-        [switch]$SkipNetwork
+        [switch]$SkipNetwork,
+        [switch]$Refresh
     )
 
     $cache = Read-AppNameCache -PathValue $CachePath
-    $changed = $false
-    $total = [Math]::Max(1, $Items.Count)
-    for ($i = 0; $i -lt $Items.Count; $i++) {
-        $item = $Items[$i]
+
+    if ($cache.Count -eq 0 -and -not $SkipNetwork) {
+        $remoteCache = Read-RemoteAppNameCache -Timeout $Timeout
+        if ($remoteCache.Count -gt 0) {
+            $cache = $remoteCache
+            Save-AppNameCache -Cache $cache -PathValue $CachePath
+            Write-UiLog -Scope "names" -Level "SUCCESS" -Message ("本地名单为空, 已同步仓库缓存 {0} 条" -f $cache.Count)
+        }
+    }
+
+    $pending = @()
+    foreach ($item in $Items) {
         $appId = Get-AppIdFromZipName -Name ([string]$item.Name)
         $item | Add-Member -NotePropertyName AppId -NotePropertyValue $appId -Force
 
         $display = ""
-        if (-not [string]::IsNullOrWhiteSpace($appId) -and $cache.ContainsKey($appId)) { $display = $cache[$appId] }
-        if ([string]::IsNullOrWhiteSpace($display) -and -not [string]::IsNullOrWhiteSpace($appId) -and -not $SkipNetwork) {
-            Write-Progress -Id 4 -Activity "获取游戏中文名" -Status $appId -PercentComplete ([int]((($i + 1) * 100) / $total))
-            $display = Get-SteamAppName -AppId $appId -Timeout $Timeout
-            if (-not [string]::IsNullOrWhiteSpace($display)) {
-                $cache[$appId] = $display
+        if (-not [string]::IsNullOrWhiteSpace($appId) -and $cache.ContainsKey($appId)) {
+            $display = [string]$cache[$appId]
+        }
+
+        $isPending = [string]::IsNullOrWhiteSpace($display)
+        if ($isPending) {
+            $display = if ([string]::IsNullOrWhiteSpace($appId)) {
+                [System.IO.Path]::GetFileNameWithoutExtension([string]$item.Name)
+            } else {
+                $appId
+            }
+            if (-not [string]::IsNullOrWhiteSpace($appId) -and -not $SkipNetwork) { $pending += $appId }
+        }
+
+        $item | Add-Member -NotePropertyName NamePending -NotePropertyValue $isPending -Force
+        $item | Add-Member -NotePropertyName DisplayName -NotePropertyValue $display -Force
+    }
+
+    if ($Refresh -and $pending.Count -gt 0) {
+        Write-UiLog -Scope "names" -Level "INFO" -Message ("补全游戏名 {0} 个 (Steam 商店)" -f $pending.Count)
+        $changed = $false
+        foreach ($appId in $pending) {
+            $name = Get-SteamAppName -AppId $appId -Timeout $Timeout
+            if (-not [string]::IsNullOrWhiteSpace($name)) {
+                $cache[$appId] = $name
                 $changed = $true
+                Write-UiLog -Scope "names" -Level "DEBUG" -Message ("{0} = {1}" -f $appId, $name)
             }
             Start-Sleep -Milliseconds 120
         }
-        if ([string]::IsNullOrWhiteSpace($display)) {
-            $display = [System.IO.Path]::GetFileNameWithoutExtension([string]$item.Name)
+        if ($changed) { Save-AppNameCache -Cache $cache -PathValue $CachePath }
+        foreach ($item in $Items) {
+            if (-not $item.NamePending) { continue }
+            $id = [string]$item.AppId
+            if (-not [string]::IsNullOrWhiteSpace($id) -and $cache.ContainsKey($id)) {
+                $item.DisplayName = [string]$cache[$id]
+                $item.NamePending = $false
+            }
         }
-        $item | Add-Member -NotePropertyName DisplayName -NotePropertyValue $display -Force
     }
-    Write-Progress -Id 4 -Activity "获取游戏中文名" -Completed
-    if ($changed) { Save-AppNameCache -Cache $cache -PathValue $CachePath }
+
     return @($Items)
+}
+
+# 选中的包没有中文名时补一次(单次请求, 顺带写回缓存)
+function Update-PendingDisplayName {
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)][string]$CachePath,
+        [Parameter(Mandatory = $true)][int]$Timeout
+    )
+
+    if (-not $Item.NamePending) { return $Item }
+    $appId = [string]$Item.AppId
+    if ([string]::IsNullOrWhiteSpace($appId)) { return $Item }
+
+    $name = Get-SteamAppName -AppId $appId -Timeout $Timeout
+    if ([string]::IsNullOrWhiteSpace($name)) { return $Item }
+
+    $cache = Read-AppNameCache -PathValue $CachePath
+    $cache[$appId] = $name
+    Save-AppNameCache -Cache $cache -PathValue $CachePath
+
+    $Item.DisplayName = $name
+    $Item.NamePending = $false
+    return $Item
 }
 
 # ---------------------------------------------------------------- 下载 / 解压
@@ -532,7 +675,7 @@ function Invoke-FileDownload {
         if ([string]::IsNullOrWhiteSpace($url)) { continue }
         if ($url -match '^[a-zA-Z]:\\' -or $url.StartsWith("\\\\")) {
             Copy-Item -LiteralPath $url -Destination $Destination -Force
-            Write-Log -Message ("使用本地文件: {0}" -f $url) -Level OK
+            Write-UiLog -Scope "net" -Level "DEBUG" -Message ("使用本地文件 {0}" -f $url)
             return $url
         }
 
@@ -546,7 +689,7 @@ function Invoke-FileDownload {
         $responseStream = $null
         $fileStream = $null
         try {
-            Write-Log -Message ("下载: {0}" -f $url) -Level INFO
+            Write-UiLog -Scope "net" -Level "INFO" -Message ("下载 {0}" -f (Format-UrlShort -Url $url))
             $response = $request.GetResponse()
             $responseStream = $response.GetResponseStream()
             $fileStream = [System.IO.File]::Open($Destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
@@ -564,7 +707,7 @@ function Invoke-FileDownload {
             }
             return $url
         } catch {
-            Write-Log -Message ("下载源失败: {0}" -f $_.Exception.Message) -Level WARN
+            Write-UiLog -Scope "net" -Level "WARN" -Message ("下载失败 ({0}): {1}" -f (Format-UrlShort -Url $url), $_.Exception.Message)
         } finally {
             if ($null -ne $fileStream) { $fileStream.Dispose() }
             if ($null -ne $responseStream) { $responseStream.Dispose() }
@@ -668,10 +811,9 @@ function Invoke-Repair {
         $script:LogFile = ""
     }
 
-    Write-Host ""
-    Write-Host "  STEAMX 清单修复" -ForegroundColor Cyan
-    Write-Host "  识别 Steam -> 选择游戏 -> 下载 zip -> 解压覆盖" -ForegroundColor DarkGray
-    Write-Host ""
+    Initialize-Ui
+
+    Write-UiLog -Scope "repair" -Level "INFO" -Message "STEAMX 清单修复"
 
     $steam = Format-PathCase -PathValue (Resolve-SteamPath)
     $luaDir = if ([string]::IsNullOrWhiteSpace($LuaTarget)) { Join-Path $steam "config\lua" } else { $LuaTarget }
@@ -680,27 +822,25 @@ function Invoke-Repair {
                    elseif (-not [string]::IsNullOrWhiteSpace($env:STEAMX_MANIFEST_DIR)) { $env:STEAMX_MANIFEST_DIR }
                    else { Join-Path $projectRoot "manifest" }
 
+    Write-UiLog -Scope "steam" -Level "SUCCESS" -Message ("Steam {0}" -f $steam)
+    Write-UiLog -Scope "install" -Level "INFO" -Message ("目标 {0}" -f $manifestDir)
+
     if ($ShowEnv) {
-        Write-Rule -Title "环境"
-        Write-Field -Label "Steam 路径" -Value $steam -Color "White"
-        if ($IncludeLua) { Write-Field -Label "Lua 目录" -Value $luaDir -Color "White" }
-        Write-Field -Label "清单目录" -Value $manifestDir -Color "White"
-        Write-Field -Label "本地缓存" -Value $localZipDir
-        Write-Field -Label "仓库" -Value ("{0}@{1}" -f $Repo, $Branch)
+        if ($IncludeLua) { Write-UiLog -Scope "install" -Level "INFO" -Message ("Lua 目录 {0}" -f $luaDir) }
+        Write-UiLog -Scope "repair" -Level "INFO" -Message ("本地包源 {0}" -f $localZipDir)
+        Write-UiLog -Scope "repair" -Level "INFO" -Message ("仓库 {0}@{1}" -f $Repo, $Branch)
         if (-not [string]::IsNullOrWhiteSpace($script:LogFile)) {
-            Write-Field -Label "日志" -Value $script:LogFile
+            Write-UiLog -Scope "repair" -Level "INFO" -Message ("日志 {0}" -f $script:LogFile)
         }
     }
 
     if (@(Get-Process -Name "steam" -ErrorAction SilentlyContinue).Count -gt 0) {
-        Write-Log -Message "Steam 正在运行,写入可能被占用。建议退出 Steam 后再执行。" -Level WARN
+        Write-UiLog -Scope "steam" -Level "WARN" -Message "Steam 正在运行, 写入可能被占用, 建议先退出"
     }
 
     # 1. 索引
-    if ($script:LogEnabled) { Write-Rule -Title "游戏列表" }
     $index = $null
     if (-not $Offline) {
-        if ($script:LogEnabled) { Write-Host "  正在获取远端列表..." -ForegroundColor DarkGray }
         $index = Get-RemoteZipIndex -AllowFailure
     }
     $items = @()
@@ -708,37 +848,41 @@ function Invoke-Repair {
     if ($null -ne $index -and @($index.Items).Count -gt 0) {
         $items = @($index.Items)
         $remoteCount = $items.Count
-        Write-Log -Message ("远端列表: {0} 个 zip ({1})" -f $remoteCount, $index.Source) -Level OK
+        Write-UiLog -Scope "net" -Level "SUCCESS" -Message ("远端列表 {0} 个包 ({1})" -f $remoteCount, $index.Source)
         if (-not [string]::IsNullOrWhiteSpace($index.Error)) {
-            Write-Log -Message ("GitHub API 不可用,已降级: {0}" -f $index.Error) -Level WARN
+            Write-UiLog -Scope "net" -Level "WARN" -Message ("GitHub API 不可用, 已降级: {0}" -f $index.Error)
         }
     } elseif ($null -ne $index -and -not [string]::IsNullOrWhiteSpace($index.Error)) {
-        Write-Log -Message ("远端不可用: {0}" -f $index.Error) -Level WARN
+        Write-UiLog -Scope "net" -Level "WARN" -Message ("远端不可用: {0}" -f $index.Error)
     }
 
     # 本地 manifest/ 作为补充:远端没有的包(尚未推送)也能装
     $localItems = @(Get-LocalZipIndex -Directory $localZipDir)
-    if ($localItems.Count -gt 0) {
+    if ($Offline) {
+        $items = $localItems
+        Write-UiLog -Scope "net" -Level "INFO" -Message ("本地目录 {0} 个包" -f $items.Count)
+    } elseif ($localItems.Count -gt 0) {
         $remoteNames = @($items | ForEach-Object { $_.Name })
         $extra = @($localItems | Where-Object { $remoteNames -notcontains $_.Name })
         if ($extra.Count -gt 0) {
             $items = @($items) + @($extra)
-            Write-Log -Message ("本地补充: {0} 个 zip (未推送到远端)" -f $extra.Count) -Level INFO
+            Write-UiLog -Scope "net" -Level "INFO" -Message ("本地补充 {0} 个包 (未推送)" -f $extra.Count)
         }
     }
 
     # 远端列表为空时,完全回退本地
     if ($items.Count -eq 0 -and $localItems.Count -gt 0) {
         $items = $localItems
-        Write-Log -Message ("回退本地目录: {0} 个 zip" -f $items.Count) -Level WARN
+        Write-UiLog -Scope "net" -Level "WARN" -Message ("回退本地目录 {0} 个包" -f $items.Count)
     }
     if ($items.Count -eq 0) {
         throw "没有可用的 zip 包(远端与本地均为空)。"
     }
 
-    # 1.5 游戏中文名(本地缓存 manifest\appnames.json,缺失时查 Steam 商店)
+    # 1.5 游戏中文名: 默认只读本地名单 manifest\appnames.json, 缺失先用 AppID 顶上
+    #      -RefreshNames 才逐个联网补全(带进度日志)
     $cachePath = Join-Path $localZipDir "appnames.json"
-    $items = Add-GameDisplayNames -Items $items -CachePath $cachePath -Timeout $TimeoutSeconds -SkipNetwork:$Offline
+    $items = Add-GameDisplayNames -Items $items -CachePath $cachePath -Timeout $TimeoutSeconds -SkipNetwork:$Offline -Refresh:$RefreshNames
 
     # 2. 选择
     $selected = $null
@@ -751,7 +895,7 @@ function Invoke-Repair {
         if ($matched.Count -eq 1) {
             $selected = $matched[0]
         } elseif ($matched.Count -gt 1) {
-            Write-Log -Message ("关键词命中 {0} 个,请从列表中选择。" -f $matched.Count) -Level INFO
+            Write-UiLog -Scope "repair" -Level "INFO" -Message ("关键词命中 {0} 个, 请从列表选择" -f $matched.Count)
             $menuItems = @(
                 foreach ($item in ($matched | Sort-Object DisplayName)) {
                     [pscustomobject]@{ Label = (New-GameLabel -Item $item); Value = $item }
@@ -774,12 +918,13 @@ function Invoke-Repair {
         $selected = $picked
     }
 
-    Write-Host ""
-    Write-Rule -Title "安装"
-    Write-Field -Label "游戏" -Value $selected.DisplayName -Color "White"
-    Write-Field -Label "目标" -Value $manifestDir -Color "White"
-    Write-Field -Label "大小" -Value (Format-Size $selected.Size)
-    Write-Field -Label "来源" -Value $selected.Source
+    # 选中的包名字缺失时补一次(单次请求, 不阻塞菜单)
+    if (-not $Offline) {
+        $selected = Update-PendingDisplayName -Item $selected -CachePath $cachePath -Timeout $TimeoutSeconds
+    }
+
+    Write-UiLog -Scope "install" -Level "INFO" -Message ("游戏 {0}" -f (New-GameLabel -Item $selected))
+    Write-UiLog -Scope "install" -Level "INFO" -Message ("来源 {0}" -f $selected.Source)
 
     # 3. 下载
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("STEAMX\repair\{0}" -f [Guid]::NewGuid().ToString("N"))
@@ -789,7 +934,7 @@ function Invoke-Repair {
         # 本地已有同名包则直接复用
         $localCandidate = Join-Path $localZipDir $selected.Name
         if (Test-Path -LiteralPath $localCandidate -PathType Leaf) {
-            Write-Log -Message ("本地缓存命中,直接使用: {0}" -f $localCandidate) -Level OK
+            Write-UiLog -Scope "net" -Level "SUCCESS" -Message ("本地命中 {0}" -f $localCandidate)
             Copy-Item -LiteralPath $localCandidate -Destination $zipPath -Force
         } else {
             [void](Invoke-FileDownload -Urls $selected.DownloadUrls -Destination $zipPath -Timeout $TimeoutSeconds)
@@ -801,7 +946,6 @@ function Invoke-Repair {
         if (-not (Test-ZipMagic -PathValue $zipPath)) {
             throw "下载到的文件不是有效的 zip(可能是 HTML 错误页)。"
         }
-        Write-Log -Message ("已就绪: {0}" -f (Format-Size (Get-Item -LiteralPath $zipPath).Length)) -Level OK
 
         # 4. 解压覆盖
         $backupDir = ""
@@ -810,17 +954,13 @@ function Invoke-Repair {
         }
         $result = Expand-GameZip -ZipPath $zipPath -LuaDir $luaDir -ManifestDir $manifestDir -BackupDir $backupDir -IncludeLua:$IncludeLua
 
-        Write-Host ""
-        Write-Rule -Title "结果"
-        Write-Field -Label "新增清单" -Value $result.Added -Color "Green"
-        Write-Field -Label "覆盖清单" -Value $result.Overwritten -Color "Yellow"
+        Write-UiLog -Scope "install" -Level "SUCCESS" -Message ("清单已安装 新增 {0} / 覆盖 {1}" -f $result.Added, $result.Overwritten)
         if ($result.Skipped -gt 0) {
-            Write-Field -Label "跳过" -Value ("{0} 个 .lua(默认不装,用 -IncludeLua 开启)" -f $result.Skipped)
+            Write-UiLog -Scope "install" -Level "WARN" -Message ("跳过 {0} 个 .lua (默认不装, 用 -IncludeLua 开启)" -f $result.Skipped)
         }
         if (-not [string]::IsNullOrWhiteSpace($backupDir) -and $result.Overwritten -gt 0) {
-            Write-Field -Label "备份位置" -Value $backupDir
+            Write-UiLog -Scope "install" -Level "INFO" -Message ("备份 {0}" -f $backupDir)
         }
-        Write-Log -Message ("完成: {0}" -f $selected.DisplayName) -Level OK
     } finally {
         if (Test-Path -LiteralPath $tempRoot) {
             Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -831,6 +971,6 @@ function Invoke-Repair {
 try {
     Invoke-Repair
 } catch {
-    Write-Log -Message $_.Exception.Message -Level ERR
+    Write-UiLog -Scope "repair" -Level "ERROR" -Message $_.Exception.Message
     exit 1
 }
