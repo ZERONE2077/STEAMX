@@ -25,6 +25,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
+# PS 5.1 默认不一定启用 TLS 1.2,GitHub API / jsDelivr 需要
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch { }
 
 # 日志默认关闭: 不写 logs\repair-*.log, 也不打印 [i]/[+] 行
 # 需要时用 -Log 开启(文件 + 控制台全量); WARN/ERR 始终显示
@@ -300,32 +304,46 @@ function Get-RemoteZipIndex {
     $errors = @()
     $headers = @{ "Accept" = "application/vnd.github+json"; "User-Agent" = "STEAMX" }
 
+    # 直连 api.github.com 在国内常被墙/超时,再试 gh-proxy 镜像转发同一 API
+    $apiPrefixes = @("", "https://gh-proxy.com/")
+
     foreach ($dir in $RemoteDir) {
         $dirTrimmed = $dir.Trim("/")
-        $api = "https://api.github.com/repos/{0}/contents/{1}?ref={2}" -f $Repo, ([Uri]::EscapeDataString($dirTrimmed)), ([Uri]::EscapeDataString($Branch))
-        try {
-            $entries = @(Invoke-RestMethod -Uri $api -Headers $headers -TimeoutSec $TimeoutSeconds)
-            $zips = @($entries | Where-Object { $_.type -eq "file" -and $_.name -like "*.zip" })
-            if ($zips.Count -gt 0) {
-                $items = @(
-                    foreach ($zip in $zips) {
-                        [pscustomobject]@{
-                            Name         = [string]$zip.name
-                            Size         = [long]$zip.size
-                            DownloadUrls = @(
-                                [string]$zip.download_url,
-                                ("https://cdn.jsdelivr.net/gh/{0}@{1}/{2}/{3}" -f $Repo, $Branch, $dirTrimmed, [Uri]::EscapeDataString([string]$zip.name)),
-                                ("https://ghfast.top/https://raw.githubusercontent.com/{0}/{1}/{2}/{3}" -f $Repo, $Branch, $dirTrimmed, [Uri]::EscapeDataString([string]$zip.name))
-                            )
-                            Source       = "github:{0}" -f $dirTrimmed
+        $apiPath = "repos/{0}/contents/{1}?ref={2}" -f $Repo, ([Uri]::EscapeDataString($dirTrimmed)), ([Uri]::EscapeDataString($Branch))
+        foreach ($prefix in $apiPrefixes) {
+            $api = "{0}https://api.github.com/{1}" -f $prefix, $apiPath
+            try {
+                # 注意: @(Invoke-RestMethod ...) 会把 JSON 数组当成单个元素,必须先赋值再包
+                $response = Invoke-RestMethod -Uri $api -Headers $headers -TimeoutSec $TimeoutSeconds
+                $entries = @($response)
+                $zips = @($entries | Where-Object { $_.type -eq "file" -and $_.name -like "*.zip" })
+                if ($zips.Count -gt 0) {
+                    $items = @(
+                        foreach ($zip in $zips) {
+                            $name = [string]$zip.name
+                            $escaped = [Uri]::EscapeDataString($name)
+                            [pscustomobject]@{
+                                Name         = $name
+                                Size         = [long]$zip.size
+                                # jsDelivr 文件级缓存刷新快,优先;镜像 raw 次之;直连 download_url 最后
+                                DownloadUrls = @(
+                                    ("https://cdn.jsdelivr.net/gh/{0}@{1}/{2}/{3}" -f $Repo, $Branch, $dirTrimmed, $escaped),
+                                    ("https://gh-proxy.com/https://raw.githubusercontent.com/{0}/{1}/{2}/{3}" -f $Repo, $Branch, $dirTrimmed, $escaped),
+                                    ("https://ghfast.top/https://raw.githubusercontent.com/{0}/{1}/{2}/{3}" -f $Repo, $Branch, $dirTrimmed, $escaped),
+                                    [string]$zip.download_url
+                                )
+                                Source       = "github:{0}" -f $dirTrimmed
+                            }
                         }
-                    }
-                )
-                return [pscustomobject]@{ Items = $items; Source = "github:{0}" -f $dirTrimmed; Error = "" }
+                    )
+                    return [pscustomobject]@{ Items = $items; Source = "github:{0}" -f $dirTrimmed; Error = "" }
+                }
+                # API 可达但目录里没有 zip,换下一个 RemoteDir
+                $errors += ("{0}: 目录为空" -f $dirTrimmed)
+                break
+            } catch {
+                $errors += ("{0}{1}: {2}" -f $prefix, $dirTrimmed, $_.Exception.Message)
             }
-            $errors += ("{0}: 目录为空" -f $dirTrimmed)
-        } catch {
-            $errors += ("{0}: {1}" -f $dirTrimmed, $_.Exception.Message)
         }
     }
 
@@ -350,7 +368,7 @@ function Get-RemoteZipIndex {
                     }
                 }
             )
-            return [pscustomobject]@{ Items = $items; Source = "jsdelivr"; Error = "" }
+            return [pscustomobject]@{ Items = $items; Source = "jsdelivr"; Error = ($errors -join " | ") }
         }
     } catch {
         $errors += ("jsdelivr: {0}" -f $_.Exception.Message)
@@ -691,6 +709,9 @@ function Invoke-Repair {
         $items = @($index.Items)
         $remoteCount = $items.Count
         Write-Log -Message ("远端列表: {0} 个 zip ({1})" -f $remoteCount, $index.Source) -Level OK
+        if (-not [string]::IsNullOrWhiteSpace($index.Error)) {
+            Write-Log -Message ("GitHub API 不可用,已降级: {0}" -f $index.Error) -Level WARN
+        }
     } elseif ($null -ne $index -and -not [string]::IsNullOrWhiteSpace($index.Error)) {
         Write-Log -Message ("远端不可用: {0}" -f $index.Error) -Level WARN
     }

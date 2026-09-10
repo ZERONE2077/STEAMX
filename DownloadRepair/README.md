@@ -6,7 +6,7 @@
 - 默认只解压 `.manifest` → `<Steam>\depotcache`，`.lua` 跳过（加 `-IncludeLua` 才写 `<Steam>\config\lua`）
 - 菜单显示 Steam 中文名，缓存文件 `manifest\appnames.json`，缺失时自动查 Steam 商店接口
 - 本地包源：项目根 `manifest\`，文件名为 `<AppID>.zip`
-- 远端包源：`ZERONE2077/STEAMX`，依次尝试 `manifest/`、`Lua/` 目录，GitHub API 不通时自动切 jsDelivr
+- 远端包源：`ZERONE2077/STEAMX`，依次尝试 `manifest/`、`Lua/` 目录；GitHub API 直连失败时自动走 `gh-proxy.com` 镜像，再退 jsDelivr 索引
 - 默认静默：不写日志文件，只输出游戏列表 → 安装 → 结果；加 `-Log` 才输出日志
 
 ---
