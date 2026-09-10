@@ -17,7 +17,8 @@ param(
     [switch]$NoBackup,
     [switch]$Offline,
     [switch]$ShowEnv,
-    [switch]$IncludeLua
+    [switch]$IncludeLua,
+    [switch]$Log
 )
 
 Set-StrictMode -Version Latest
@@ -25,7 +26,10 @@ $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
+# 日志默认关闭: 不写 logs\repair-*.log, 也不打印 [i]/[+] 行
+# 需要时用 -Log 开启(文件 + 控制台全量); WARN/ERR 始终显示
 $script:LogFile = ""
+$script:LogEnabled = $false
 
 # ---------------------------------------------------------------- 基础工具
 
@@ -37,7 +41,9 @@ function Write-Log {
 
     $prefix = @{ INFO = "[i]"; OK = "[+]"; WARN = "[!]"; ERR = "[x]" }[$Level]
     $color = @{ INFO = "Cyan"; OK = "Green"; WARN = "Yellow"; ERR = "Red" }[$Level]
-    Write-Host ("  {0} {1}" -f $prefix, $Message) -ForegroundColor $color
+    if ($script:LogEnabled -or $Level -eq "WARN" -or $Level -eq "ERR") {
+        Write-Host ("  {0} {1}" -f $prefix, $Message) -ForegroundColor $color
+    }
     if (-not [string]::IsNullOrWhiteSpace($script:LogFile)) {
         $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
         Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8
@@ -635,9 +641,14 @@ function Expand-GameZip {
 function Invoke-Repair {
     $projectRoot = Get-ProjectRoot
     $dataRoot = Get-DataRoot -ProjectRoot $projectRoot
-    $logDir = Join-Path $dataRoot "logs"
-    Ensure-Dir -PathValue $logDir
-    $script:LogFile = Join-Path $logDir ("repair-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+    $script:LogEnabled = [bool]$Log
+    if ($Log) {
+        $logDir = Join-Path $dataRoot "logs"
+        Ensure-Dir -PathValue $logDir
+        $script:LogFile = Join-Path $logDir ("repair-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+    } else {
+        $script:LogFile = ""
+    }
 
     Write-Host ""
     Write-Host "  STEAMX 清单修复" -ForegroundColor Cyan
@@ -658,7 +669,9 @@ function Invoke-Repair {
         Write-Field -Label "清单目录" -Value $manifestDir -Color "White"
         Write-Field -Label "本地缓存" -Value $localZipDir
         Write-Field -Label "仓库" -Value ("{0}@{1}" -f $Repo, $Branch)
-        Write-Field -Label "日志" -Value $script:LogFile
+        if (-not [string]::IsNullOrWhiteSpace($script:LogFile)) {
+            Write-Field -Label "日志" -Value $script:LogFile
+        }
     }
 
     if (@(Get-Process -Name "steam" -ErrorAction SilentlyContinue).Count -gt 0) {
@@ -666,10 +679,10 @@ function Invoke-Repair {
     }
 
     # 1. 索引
-    Write-Rule -Title "游戏列表"
+    if ($script:LogEnabled) { Write-Rule -Title "游戏列表" }
     $index = $null
     if (-not $Offline) {
-        Write-Host "  正在获取远端列表..." -ForegroundColor DarkGray
+        if ($script:LogEnabled) { Write-Host "  正在获取远端列表..." -ForegroundColor DarkGray }
         $index = Get-RemoteZipIndex -AllowFailure
     }
     $items = @()

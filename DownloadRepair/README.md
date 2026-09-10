@@ -7,6 +7,7 @@
 - 菜单显示 Steam 中文名，缓存文件 `manifest\appnames.json`，缺失时自动查 Steam 商店接口
 - 本地包源：项目根 `manifest\`，文件名为 `<AppID>.zip`
 - 远端包源：`ZERONE2077/STEAMX`，依次尝试 `manifest/`、`Lua/` 目录，GitHub API 不通时自动切 jsDelivr
+- 默认静默：不写日志文件，只输出游戏列表 → 安装 → 结果；加 `-Log` 才输出日志
 
 ---
 
@@ -75,6 +76,7 @@ irm -Uri 'https://ghfast.top/https://raw.githubusercontent.com/ZERONE2077/STEAMX
 | `-Game` | AppID / 中文名 / 关键词，唯一命中直接安装，多个命中仍出菜单 | 无（出菜单） |
 | `-Offline` | 不联网，只用本地 `manifest\`（中文名取缓存） | 关 |
 | `-NoBackup` | 覆盖已有文件时不备份 | 关（默认备份） |
+| `-Log` | 输出日志：控制台显示全部 `[i]`/`[+]` 行，并写入 `logs\repair-<时间戳>.log` | 关（静默，不写文件） |
 | `-ShowEnv` | 显示 Steam 路径、目标目录、仓库等环境信息 | 关（默认不显示） |
 | `-IncludeLua` | 连同 `.lua` 一起解压到 `<Steam>\config\lua` | 关（只装 manifest） |
 | `-LuaTarget` | `.lua` 解压目录（配合 `-IncludeLua`） | `<Steam>\config\lua` |
@@ -116,6 +118,9 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
 # 想看 Steam 路径和目标目录时
 & $dr -Game 1091500 -ShowEnv
 
+# 需要排查问题时输出日志（控制台 + logs\repair-<时间戳>.log）
+& $dr -Game 1091500 -Log
+
 # 指定别的 zip 目录
 & $dr -Game 1091500 -LocalDir D:\Packs
 
@@ -131,7 +136,7 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
 ## 6. 注意
 
 - 覆盖已有文件时，原文件会备份到 `backups\repair-<时间戳>\`（`-NoBackup` 关闭）。
-- 运行日志写入 `logs\repair-<时间戳>.log`。
+- 日志默认关闭：不写文件、不打印 `[i]`/`[+]` 行，只保留安装与结果两块；加 `-Log` 才输出并写 `logs\repair-<时间戳>.log`。`[!]` 警告和错误始终显示。
 - 中文名来自 `manifest\appnames.json` 缓存；首次运行会联网查 Steam 商店（每个 AppID 一次，约 0.15 秒），之后直接读缓存。离线（`-Offline`）只显示缓存里有的名字，其余显示 AppID。
 - 只有数字命名的 `<AppID>.zip` 才能查到中文名，旧的游戏名 zip 直接显示文件名。
 - 通过 `irm | iex` 运行时找不到项目根，日志和备份会落到 `%TEMP%\STEAMX\`，本地包源用 `-LocalDir` 或 `$env:STEAMX_MANIFEST_DIR` 指定。
