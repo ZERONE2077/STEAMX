@@ -28,47 +28,47 @@
 
 ---
 
-## 2. 从 GitHub 一键运行
+## 2. 一键运行（复制整行 → 粘贴到 PowerShell → 回车）
 
-> 前提：`DownloadRepair\` 已提交到 `ZERONE2077/STEAMX` 的 `main` 分支。
+> 推荐用**内存执行**版本：不落盘、不写临时文件，因此**不受 ExecutionPolicy 限制**（默认 Restricted 的机器也能直接跑）。
 
-下载后执行（中文不乱码，推荐）：
-
-```powershell
-irm -Uri 'https://raw.githubusercontent.com/ZERONE2077/STEAMX/main/DownloadRepair/DownloadRepair.ps1' -OutFile "$env:TEMP\DownloadRepair.ps1"; & "$env:TEMP\DownloadRepair.ps1" -Game 1091500
-```
-
-不落盘、内存中执行：
-
-```powershell
-$s=((irm -Uri 'https://raw.githubusercontent.com/ZERONE2077/STEAMX/main/DownloadRepair/DownloadRepair.ps1') -join "`n") -replace '^\uFEFF',''; & ([scriptblock]::Create($s)) -Game 1091500
-```
-
----
-
-## 3. 从 jsDelivr 一键运行（国内更快）
-
-下载后执行：
-
-```powershell
-irm -Uri 'https://cdn.jsdelivr.net/gh/ZERONE2077/STEAMX@main/DownloadRepair/DownloadRepair.ps1' -OutFile "$env:TEMP\DownloadRepair.ps1"; & "$env:TEMP\DownloadRepair.ps1" -Game 1091500
-```
-
-不落盘、内存中执行：
+jsDelivr（国内最快）：
 
 ```powershell
 $s=((irm -Uri 'https://cdn.jsdelivr.net/gh/ZERONE2077/STEAMX@main/DownloadRepair/DownloadRepair.ps1') -join "`n") -replace '^\uFEFF',''; & ([scriptblock]::Create($s)) -Game 1091500
 ```
 
-ghfast 镜像（raw 被墙时用）：
+GitHub raw：
 
 ```powershell
-irm -Uri 'https://ghfast.top/https://raw.githubusercontent.com/ZERONE2077/STEAMX/main/DownloadRepair/DownloadRepair.ps1' -OutFile "$env:TEMP\DownloadRepair.ps1"; & "$env:TEMP\DownloadRepair.ps1" -Game 1091500
+$s=((irm -Uri 'https://raw.githubusercontent.com/ZERONE2077/STEAMX/main/DownloadRepair/DownloadRepair.ps1') -join "`n") -replace '^\uFEFF',''; & ([scriptblock]::Create($s)) -Game 1091500
+```
+
+ghfast 镜像（raw / jsDelivr 都不通时用）：
+
+```powershell
+$s=((irm -Uri 'https://ghfast.top/https://raw.githubusercontent.com/ZERONE2077/STEAMX/main/DownloadRepair/DownloadRepair.ps1') -join "`n") -replace '^\uFEFF',''; & ([scriptblock]::Create($s)) -Game 1091500
 ```
 
 不带 `-Game` 就是菜单模式，把末尾的 ` -Game 1091500` 删掉即可。
 
----
+### 2.1 落盘执行（执行策略会拦）
+
+下面这种写法会先存成文件再运行，在默认策略下会报
+`无法加载文件 ... 因为在此系统上禁止运行脚本`（`UnauthorizedAccess`）：
+
+```powershell
+irm -Uri 'https://cdn.jsdelivr.net/gh/ZERONE2077/STEAMX@main/DownloadRepair/DownloadRepair.ps1' -OutFile "$env:TEMP\DownloadRepair.ps1"; & "$env:TEMP\DownloadRepair.ps1" -Game 1091500
+```
+
+要用这种写法，把当前会话的策略放开即可（只影响当前窗口，关掉就恢复，不写注册表）：
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; irm -Uri 'https://cdn.jsdelivr.net/gh/ZERONE2077/STEAMX@main/DownloadRepair/DownloadRepair.ps1' -OutFile "$env:TEMP\DownloadRepair.ps1"; & "$env:TEMP\DownloadRepair.ps1" -Game 1091500
+```
+
+> 不想改策略就用第 2 节的内存执行版本，效果完全一样。
+
 
 ## 4. 参数
 
@@ -141,6 +141,8 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
 ## 6. 注意
 
 - 覆盖已有文件时，原文件会备份到 `backups\repair-<时间戳>\`（`-NoBackup` 关闭）。
+- `无法加载文件 ... 因为在此系统上禁止运行脚本`：这是 ExecutionPolicy 拦的，用第 2 节的**内存执行**版本即可绕过，或 `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force`。
+- Steam 装在 `C:\Program Files (x86)\Steam` 时写入 `depotcache` 需要管理员权限；右键「以管理员身份运行」打开 PowerShell 再执行。
 - 日志默认只在控制台输出，不写文件；加 `-Log` 才写 `logs\repair-<时间戳>.log`。`WARN` / `ERROR` 行始终显示。
 - 中文名来自 `manifest\appnames.json`：**默认只读本地名单，菜单立刻出现**，名字缺失的先显示 AppID，选中后会补一次。本地没有名单文件时，会从仓库拉一次 `manifest/appnames.json`（几百字节）。
 - 只有数字命名的 `<AppID>.zip` 才能查到中文名，旧的游戏名 zip 直接显示文件名。
