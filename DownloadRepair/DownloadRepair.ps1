@@ -97,16 +97,90 @@ function Write-UiLog {
     }
 }
 
+# ---------------------------------------------------------------- 显示宽度
+
+# 单个字符占几列: 中日韩全角 2 列, 其余 1 列
+# 菜单重绘靠这个算真实宽度, 用 .Length 会让中文行错位 / 折行
+function Get-CharWidth {
+    param([char]$Ch)
+
+    $code = [int]$Ch
+    if ($code -lt 0x1100) { return 1 }
+    if (($code -ge 0x1100 -and $code -le 0x115F) -or
+        ($code -ge 0x2E80 -and $code -le 0x303E) -or
+        ($code -ge 0x3041 -and $code -le 0x33FF) -or
+        ($code -ge 0x3400 -and $code -le 0x4DBF) -or
+        ($code -ge 0x4E00 -and $code -le 0x9FFF) -or
+        ($code -ge 0xA000 -and $code -le 0xA4CF) -or
+        ($code -ge 0xAC00 -and $code -le 0xD7A3) -or
+        ($code -ge 0xF900 -and $code -le 0xFAFF) -or
+        ($code -ge 0xFE30 -and $code -le 0xFE6F) -or
+        ($code -ge 0xFF00 -and $code -le 0xFF60) -or
+        ($code -ge 0xFFE0 -and $code -le 0xFFE6)) { return 2 }
+    return 1
+}
+
+function Get-TextWidth {
+    param([AllowEmptyString()][string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) { return 0 }
+    $width = 0
+    foreach ($ch in $Text.ToCharArray()) { $width += (Get-CharWidth -Ch $ch) }
+    return $width
+}
+
+# 按显示宽度截断, 超出部分用 … 收尾
+function Limit-TextWidth {
+    param(
+        [AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][int]$MaxWidth
+    )
+
+    if ($MaxWidth -le 0) { return "" }
+    if ((Get-TextWidth -Text $Text) -le $MaxWidth) { return $Text }
+
+    $builder = New-Object System.Text.StringBuilder
+    $width = 0
+    foreach ($ch in $Text.ToCharArray()) {
+        $charWidth = Get-CharWidth -Ch $ch
+        if (($width + $charWidth) -gt ($MaxWidth - 2)) { break }
+        [void]$builder.Append($ch)
+        $width += $charWidth
+    }
+    return ($builder.ToString() + [char]0x2026)
+}
+
+function Get-ConsoleWidth {
+    try {
+        $width = [int]$host.UI.RawUI.WindowSize.Width
+        if ($width -ge 30) { return $width }
+    } catch { }
+    return 80
+}
+
+function Get-ConsoleHeight {
+    try {
+        $height = [int]$host.UI.RawUI.WindowSize.Height
+        if ($height -ge 8) { return $height }
+    } catch { }
+    return 40
+}
+
 # 菜单专用分隔标题(不属于日志流)
+function Format-RuleText {
+    param([string]$Title = "")
+
+    $width = [Math]::Min(62, (Get-ConsoleWidth) - 1)
+    if ($width -lt 12) { $width = 62 }
+    if ([string]::IsNullOrWhiteSpace($Title)) { return ("-" * $width) }
+
+    $prefix = "- {0} " -f $Title
+    return ($prefix + ("-" * [Math]::Max(0, $width - (Get-TextWidth -Text $prefix))))
+}
+
 function Write-Rule {
     param([string]$Title = "")
-    $width = 62
-    if ([string]::IsNullOrWhiteSpace($Title)) {
-        Write-Host ("-" * $width) -ForegroundColor DarkGray
-        return
-    }
-    $prefix = "- {0} " -f $Title
-    Write-Host ($prefix + ("-" * [Math]::Max(0, $width - $prefix.Length))) -ForegroundColor DarkGray
+    Write-Host (Format-RuleText -Title $Title) -ForegroundColor DarkGray
 }
 
 function Format-Size {
@@ -287,41 +361,79 @@ function Read-MenuSelection {
         [Parameter(Mandatory = $true)][string]$Title
     )
 
-    try { $windowHeight = [int]$host.UI.RawUI.WindowSize.Height } catch { $windowHeight = 40 }
-    $pageSize = [Math]::Max(5, [Math]::Min(20, $windowHeight - 12))
     $index = 0
     $hasRendered = $false
+    $lastLineCount = 0
+
+    # 页面大小按"光标到窗口底部还剩多少行"定, 尽量不把上面的日志滚掉
+    $windowHeight = Get-ConsoleHeight
+    $menuTop = 0
     try { $menuTop = [Console]::CursorTop } catch { $menuTop = 0 }
+    $avail = ($windowHeight - 1) - $menuTop
+    $pageSize = [Math]::Min(20, [Math]::Min($windowHeight - 12, $avail - 3))
+    if ($pageSize -lt 5) { $pageSize = 5 }
+    if (($menuTop + $pageSize + 3) -gt ($windowHeight - 1)) {
+        try { [Console]::Clear() } catch { }
+        $menuTop = 0
+        $pageSize = [Math]::Max(5, [Math]::Min(20, $windowHeight - 12))
+    }
 
     while ($true) {
-        if ($hasRendered) {
-            try { [Console]::SetCursorPosition(0, $menuTop) } catch { }
-        }
+        $windowHeight = Get-ConsoleHeight
+        $consoleWidth = Get-ConsoleWidth
 
         $page = [Math]::Floor($index / $pageSize)
         $start = $page * $pageSize
         $end = [Math]::Min($start + $pageSize, $Items.Count) - 1
-        $lineCount = 0
 
-        Write-Rule -Title $Title
-        $lineCount++
+        # 前缀 "  > " 占 4 列, 右侧留 1 列; 每项严格一行, 否则重绘会错位
+        $rowLimit = $consoleWidth - 1
+        $labelWidth = [Math]::Max(12, $consoleWidth - 5)
+        $rows = New-Object System.Collections.ArrayList
+        [void]$rows.Add(@{ Text = (Format-RuleText -Title $Title); Color = "DarkGray" })
         for ($i = $start; $i -le $end; $i++) {
             $isSelected = ($i -eq $index)
             $marker = if ($isSelected) { ">" } else { " " }
-            $line = "  {0} {1}" -f $marker, $Items[$i].Label
-            $color = if ($isSelected) { "Cyan" } else { "White" }
-            Write-Host $line -ForegroundColor $color
-            $lineCount++
+            $label = New-GameLabel -Item $Items[$i].Item -MaxWidth $labelWidth
+            $color = if ($isSelected) { "Cyan" } else { "Gray" }
+            [void]$rows.Add(@{ Text = ("  {0} {1}" -f $marker, $label); Color = $color })
         }
-        Write-Host ("  第 {0}/{1} 项  共 {2} 个" -f ($index + 1), $Items.Count, $Items.Count) -ForegroundColor DarkGray
-        $lineCount++
-        Write-Host "  Up/Down 选择   PgUp/PgDn 翻页   Home/End 首尾   Enter 确认   Esc 返回" -ForegroundColor DarkGray
-        $lineCount++
+        [void]$rows.Add(@{ Text = ("  第 {0}/{1} 项" -f ($index + 1), $Items.Count); Color = "DarkGray" })
+        [void]$rows.Add(@{
+                Text  = (Limit-TextWidth -MaxWidth $rowLimit -Text "  Up/Down 选择   PgUp/PgDn 翻页   Home/End 首尾   Enter 确认   Esc 返回")
+                Color = "DarkGray"
+            })
 
-        if (-not $hasRendered) {
-            try { $menuTop = [Math]::Max(0, [Console]::CursorTop - $lineCount) } catch { }
+        $lineCount = $rows.Count
+
+        if ($hasRendered) {
+            if (($menuTop + $lineCount) -gt ($windowHeight - 1)) {
+                # 窗口被缩小 / 本帧比上帧长, 整屏重绘避免残影
+                try { [Console]::Clear() } catch { }
+                $menuTop = 0
+                $pageSize = [Math]::Max(5, [Math]::Min(20, $windowHeight - 12))
+                continue
+            }
+        } else {
             $hasRendered = $true
         }
+
+        try {
+            [Console]::SetCursorPosition(0, $menuTop)
+        } catch {
+            try { [Console]::Clear() } catch { }
+            $menuTop = 0
+        }
+
+        foreach ($row in $rows) {
+            $pad = $consoleWidth - 1 - (Get-TextWidth -Text $row.Text)
+            if ($pad -lt 0) { $pad = 0 }
+            Write-Host ($row.Text + (" " * $pad)) -ForegroundColor $row.Color
+        }
+        for ($k = $lineCount; $k -lt $lastLineCount; $k++) {
+            Write-Host (" " * ($consoleWidth - 1))
+        }
+        $lastLineCount = $lineCount
 
         $key = [Console]::ReadKey($true)
         switch ($key.Key) {
@@ -448,16 +560,27 @@ function Get-LocalZipIndex {
 # ---------------------------------------------------------------- 游戏中文名
 
 function New-GameLabel {
-    param([Parameter(Mandatory = $true)]$Item)
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [int]$MaxWidth = 0
+    )
 
     $size = Format-Size -Bytes ([long]$Item.Size)
     $display = [string]$Item.DisplayName
     $appId = [string]$Item.AppId
     # 名字还没补上时 DisplayName 就是 AppID, 不重复显示两次
-    if ([string]::IsNullOrWhiteSpace($appId) -or $appId -eq $display) {
-        return ("{0}  ({1})" -f $display, $size)
+    $suffix = if ([string]::IsNullOrWhiteSpace($appId) -or $appId -eq $display) {
+        ("  ({0})" -f $size)
+    } else {
+        ("  [{0}]  ({1})" -f $appId, $size)
     }
-    return ("{0}  [{1}]  ({2})" -f $display, $appId, $size)
+
+    # 菜单里限宽: 先砍名字, [AppID] 和体积一定留在同一行
+    if ($MaxWidth -gt 0) {
+        $room = $MaxWidth - (Get-TextWidth -Text $suffix)
+        $display = Limit-TextWidth -Text $display -MaxWidth ([Math]::Max(8, $room - 1))
+    }
+    return ($display + $suffix)
 }
 
 function Get-AppIdFromZipName {
@@ -898,7 +1021,7 @@ function Invoke-Repair {
             Write-UiLog -Scope "repair" -Level "INFO" -Message ("关键词命中 {0} 个, 请从列表选择" -f $matched.Count)
             $menuItems = @(
                 foreach ($item in ($matched | Sort-Object DisplayName)) {
-                    [pscustomobject]@{ Label = (New-GameLabel -Item $item); Value = $item }
+                    [pscustomobject]@{ Item = $item; Value = $item }
                 }
             )
             $picked = Read-MenuSelection -Items $menuItems -Title ("匹配 [{0}]" -f $Game)
@@ -910,7 +1033,7 @@ function Invoke-Repair {
     } else {
         $menuItems = @(
             foreach ($item in ($items | Sort-Object DisplayName)) {
-                [pscustomobject]@{ Label = (New-GameLabel -Item $item); Value = $item }
+                [pscustomobject]@{ Item = $item; Value = $item }
             }
         )
         $picked = Read-MenuSelection -Items $menuItems -Title "选择游戏"
