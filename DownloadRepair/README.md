@@ -147,7 +147,7 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
 - Steam 装在 `C:\Program Files (x86)\Steam` 时写入 `depotcache` 需要管理员权限；右键「以管理员身份运行」打开 PowerShell 再执行。
 - 日志默认只在控制台输出，不写文件；加 `-Log` 才写 `logs\repair-<时间戳>.log`。`WARN` / `ERROR` 行始终显示。
 - 中文名来自 `manifest\appnames.json`：**默认只读本地名单，菜单立刻出现**，名字缺失的先显示 AppID，选中后会补一次。本地没有名单文件时，会从仓库拉一次 `manifest/appnames.json`。
-- 名单条目格式为 `"中文名"` 或 `"中文名 || 官方原名"`：显示只用前半段（`中文名  [AppID]  (体积)`），`-Game` 关键词**两段都能匹配**（`-Game Sekiro` 和 `-Game 只狼` 都能命中同一个包）。
+- 名单条目格式为 `"AppID": "中文名"`，仓库里带的就是纯中文（`-Game` 用中文名或 AppID 都能命中）；如需保留英文搜索，可在本地写成 `"中文名 || 官方原名"`，此时显示只用前半段，关键词两段都能匹配。
 - 只有数字命名的 `<AppID>.zip` 才能查到中文名，旧的游戏名 zip 直接显示文件名。
 - 通过 `irm | iex` 运行时找不到项目根，日志和备份会落到 `%TEMP%\STEAMX\`，本地包源用 `-LocalDir` 或 `$env:STEAMX_MANIFEST_DIR` 指定。
 - 建议先退出 Steam，避免文件占用导致覆盖失败。
