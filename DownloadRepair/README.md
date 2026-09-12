@@ -21,14 +21,25 @@
 
 两个都带「以管理员身份运行」标记（要写 `<Steam>\depotcache`）。
 
-远程版为什么不钉死某个 commit：钉 `@<sha>` 会一直卡在那个版本。它改成**每次启动现取最新**，依次尝试四个源，取到第一个能用的就走：
+远程版为什么不钉死某个 commit：钉 `@<sha>` 会一直卡在那个版本。它改成**每次启动现取最新**，按顺序试，取到第一个能用的就走：
 
-1. `api.github.com/repos/ZERONE2077/STEAMX/commits/main` 问出 `main` 当前 sha，再用 `cdn.jsdelivr.net/gh/...@<sha>/...` 取（最准，且 sha 形式永久缓存，秒回）
-2. `cdn.jsdelivr.net/gh/...@latest/...`（不依赖 GitHub API，jsDelivr 自己解析 HEAD）
-3. `raw.githubusercontent.com/.../main/...`
-4. `ghfast.top/https://raw.githubusercontent.com/.../main/...`（前三个都不通时）
+| # | 源 | 实测 |
+|---|---|---|
+| 1 | `api.github.com/repos/ZERONE2077/STEAMX/commits/main` 问出 `main` 当前 sha → `cdn.jsdelivr.net/gh/...@<sha>/...` | 推送后立刻可用（`Age: 0`），国内速度也好；sha 形式永久缓存 |
+| 2 | 同上，但 API 走 `gh-proxy.com` 转发（直连 GitHub 不通时） | 实测 0.6 s 返回同一个 sha |
+| 3 | `raw.githubusercontent.com/.../main/...` | ≤5 分钟缓存，实测推送后 30 s 内就是新版 |
+| 4 | `ghfast.top/https://raw.githubusercontent.com/.../main/...` | 国内镜像 |
+| 5 | `cdn.jsdelivr.net/gh/...@latest/...` | 兜底，见下 |
 
-四个源全失败才会报错并留窗。注意 **不要用 jsDelivr 的 `@main`**：分支缓存最长 12 小时，实测推送后 5 小时还能拿到旧版本（`Age: 18354`，文件大小对不上）；`@latest` 实测 `Age: 11`，是当前的 HEAD。
+全部失败才报错并留窗（会列出每个源的具体错误）。
+
+**别用 jsDelivr 的 `@main`，`@latest` 也别当主力**：两者都走 jsDelivr 的分支缓存（`s-maxage=43200`，最长 12 h）。实测推送后：
+
+- `@main` 5 小时后仍是旧版（`Age: 18354`，文件 62630 字节 vs 新版 74570）
+- `@latest` 是解析 HEAD，比 `@main` 好，但推送后仍滞后约 15 分钟（`Age: 443` 时还是旧版），之后才跟上
+- `@<sha>` 形式是 `Age: 0`，永远立刻可用 —— 所以正确姿势是**先用 API 拿 sha，再拿 sha 地址**
+
+加 `?ts=...` 之类的查询参数没用，jsDelivr 会把它规范化掉（实测带不带参数 `Age` 一样）。
 
 ---
 
@@ -54,7 +65,7 @@
 >
 > 必须显式按 UTF-8 解码：jsDelivr / raw 返回 `application/octet-stream`，PS 5.1 的 `irm` 会按 ISO-8859-1 解码，脚本里的中文会变成乱码（`æ«æ`），进而导致中文比较、菜单文案错乱。
 
-jsDelivr（国内最快，用 `@latest` 拿当前 HEAD；`@main` 分支缓存最长 12h，别用）：
+jsDelivr（国内最快）。`@latest` 是 jsDelivr 解析的 HEAD，刚推送后可能滞后十几分钟；要绝对最新就把 `@latest` 换成最新 commit 的 sha：
 
 ```powershell
 $u='https://cdn.jsdelivr.net/gh/ZERONE2077/STEAMX@latest/DownloadRepair/DownloadRepair.ps1';$r=Invoke-WebRequest -Uri $u -UseBasicParsing;$s=[Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()).TrimStart([char]0xFEFF);& ([scriptblock]::Create($s)) -Game 1091500
