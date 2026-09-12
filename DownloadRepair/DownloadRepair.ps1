@@ -14,6 +14,12 @@
 #   业务逻辑 -> 只发语义日志(Write-Log*), 不直接写屏幕
 #   渲染层   -> Show-* / Read-* 负责一切终端输出与输入
 #   能力探测 -> $script:Caps 一次性判定(交互能力 / ANSI / JSON)
+#
+# 常用开关:
+#   -Log           全过程写进 logs\repair-<时间戳>.log (本地版快捷方式用)
+#   -Pause         跑完留窗等 Enter(成功也留); -NoPause / STEAMX_NO_PAUSE=1 强制不留
+#   -IncludeLua    连 .lua 一起装; -NoBackup 不建备份; -ShowEnv 打印路径
+#   -Game <关键词> 跳过菜单直接装; -Offline 只用本地包; -RefreshNames 全量刷新中文名
 [CmdletBinding()]
 param(
     [string]$Repo = "ZERONE2077/STEAMX",
@@ -1513,7 +1519,8 @@ function Restore-Terminal {
 # 失败时该不该把窗口留住:
 #   双击 / 快捷方式启动 -> 进程一退窗口就没了, 必须留, 否则用户什么都看不到
 #   管道 / 自动化调用   -> 没人按键, 等了就是挂死, 不留
-# 显式开关: -Pause 强制留, -NoPause 或环境变量 STEAMX_NO_PAUSE=1 强制不留
+# 显式开关: -NoPause 或环境变量 STEAMX_NO_PAUSE=1 强制不留(优先级最高),
+#           -Pause 强制留; 但"-Pause 让成功时也留窗"由入口的 $stayOpen 判定负责
 function Test-ShouldPause {
     if ($NoPause) { return $false }
     if ($Pause) { return $true }
@@ -1803,12 +1810,28 @@ try {
 }
 
 # 双击启动的场景: exit 一执行窗口就关, 所以留窗口这件事必须发生在 exit 之前
-if ($script:Failed) {
-    if (-not [string]::IsNullOrWhiteSpace($script:CrashLogFile)) {
-        Write-Host ""
-        Write-Host ("  详细日志: " + $script:CrashLogFile) -ForegroundColor DarkGray
-    }
-    if (Test-ShouldPause) { Wait-WindowBeforeExit }
+# 开过日志就把路径回显出来, 否则窗口一关用户根本找不到那个 txt
+if (-not [string]::IsNullOrWhiteSpace($script:LogFile)) {
+    Write-Host ""
+    Write-Host ("  日志文件: " + $script:LogFile) -ForegroundColor DarkGray
 }
+if ($script:Failed -and -not [string]::IsNullOrWhiteSpace($script:CrashLogFile)) {
+    Write-Host ""
+    Write-Host ("  失败日志: " + $script:CrashLogFile) -ForegroundColor DarkGray
+}
+
+# 留窗判定:
+#   -Pause         -> 无论成功失败都留(本地版快捷方式用, 看完结果再按 Enter)
+#   失败 + 双击     -> 留(Test-ShouldPause 自动判定)
+#   失败 + 管道/CI  -> 不留(没人按键, 等了就是挂死)
+#   主动取消(Esc)   -> 不留(用户自己知道)
+#   -NoPause / STEAMX_NO_PAUSE=1 永远优先, 强制不留
+$stayOpen = $false
+if ($Pause -and -not $NoPause) {
+    $stayOpen = $true
+} elseif ($script:Failed -and (Test-ShouldPause)) {
+    $stayOpen = $true
+}
+if ($stayOpen) { Wait-WindowBeforeExit }
 
 exit $script:ExitCode

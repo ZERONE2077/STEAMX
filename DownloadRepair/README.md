@@ -12,6 +12,26 @@
 
 ---
 
+## 0. 两个快捷方式（双击即用）
+
+| 快捷方式 | 跑什么 | 日志 | 适用 |
+|---|---|---|---|
+| `修复下载-本地版.lnk` | 直接跑本机的 `DownloadRepair.ps1`（`-File`），带 `-Log -Pause` | **写** `logs\repair-<时间戳>.log` | 自己用。本机脚本永远是最新的那一份，跑完留窗能看结果和日志路径 |
+| `修复下载-远程版.lnk` | 从 CDN/仓库拉脚本再跑，**不写日志** | 不写 | 发出去给别人。不需要仓库、不需要更新，双击就拿仓库里当前的最新脚本 |
+
+两个都带「以管理员身份运行」标记（要写 `<Steam>\depotcache`）。
+
+远程版为什么不钉死某个 commit：钉 `@<sha>` 会一直卡在那个版本。它改成**每次启动现取最新**，依次尝试四个源，取到第一个能用的就走：
+
+1. `api.github.com/repos/ZERONE2077/STEAMX/commits/main` 问出 `main` 当前 sha，再用 `cdn.jsdelivr.net/gh/...@<sha>/...` 取（最准，且 sha 形式永久缓存，秒回）
+2. `cdn.jsdelivr.net/gh/...@latest/...`（不依赖 GitHub API，jsDelivr 自己解析 HEAD）
+3. `raw.githubusercontent.com/.../main/...`
+4. `ghfast.top/https://raw.githubusercontent.com/.../main/...`（前三个都不通时）
+
+四个源全失败才会报错并留窗。注意 **不要用 jsDelivr 的 `@main`**：分支缓存最长 12 小时，实测推送后 5 小时还能拿到旧版本（`Age: 18354`，文件大小对不上）；`@latest` 实测 `Age: 11`，是当前的 HEAD。
+
+---
+
 ## 1. 本地运行（复制整行 → 粘贴到 PowerShell → 回车）
 
 打开菜单：
@@ -34,10 +54,10 @@
 >
 > 必须显式按 UTF-8 解码：jsDelivr / raw 返回 `application/octet-stream`，PS 5.1 的 `irm` 会按 ISO-8859-1 解码，脚本里的中文会变成乱码（`æ«æ`），进而导致中文比较、菜单文案错乱。
 
-jsDelivr（国内最快）：
+jsDelivr（国内最快，用 `@latest` 拿当前 HEAD；`@main` 分支缓存最长 12h，别用）：
 
 ```powershell
-$u='https://cdn.jsdelivr.net/gh/ZERONE2077/STEAMX@main/DownloadRepair/DownloadRepair.ps1';$r=Invoke-WebRequest -Uri $u -UseBasicParsing;$s=[Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()).TrimStart([char]0xFEFF);& ([scriptblock]::Create($s)) -Game 1091500
+$u='https://cdn.jsdelivr.net/gh/ZERONE2077/STEAMX@latest/DownloadRepair/DownloadRepair.ps1';$r=Invoke-WebRequest -Uri $u -UseBasicParsing;$s=[Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()).TrimStart([char]0xFEFF);& ([scriptblock]::Create($s)) -Game 1091500
 ```
 
 GitHub raw：
@@ -157,7 +177,7 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
     icacls "C:\Program Files (x86)\Steam" /grant "*S-1-5-32-545:(OI)(CI)M" /T
     ```
     `*S-1-5-32-545` 即 `BUILTIN\Users`（用 SID 可避免中文系统组名匹配问题），`/T` 递归子目录。
-  - 脚本动手前会先试写一个探针文件做预检，不可写就直接报 `无权写入 <路径>` 并中止，不会留下半截文件；`DownloadRepair\修复下载-无互联网链接-国内版.lnk` 已带「以管理员身份运行」标记，双击会走 UAC。
+  - 脚本动手前会先试写一个探针文件做预检，不可写就直接报 `无权写入 <路径>` 并中止，不会留下半截文件；`DownloadRepair\` 下两个快捷方式（本地版 / 远程版）都带「以管理员身份运行」标记，双击会走 UAC。
 - 正常运行时日志只打控制台、不写文件；加 `-Log` 才写 `logs\repair-<时间戳>.log`。**失败时例外**：会自动写 `logs\repair-error-<时间戳>.log`（含失败前 200 行日志），见第 7 节。`WARN` / `ERROR` 行始终显示。
 - 中文名来自 `manifest\appnames.json`：**默认只读本地名单，菜单立刻出现**，名字缺失的先显示 AppID，选中后会补一次。本地没有名单文件时，会从仓库拉一次 `manifest/appnames.json`。
 - 名单条目格式为 `"AppID": "中文名"`，仓库里带的就是纯中文（`-Game` 用中文名或 AppID 都能命中）；如需保留英文搜索，可在本地写成 `"中文名 || 官方原名"`，此时显示只用前半段，关键词两段都能匹配。
@@ -189,6 +209,8 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
 3. 停住等一句 `按 Enter 关闭窗口 ...`。
 
 主动按 Esc 取消（退出码 4）不留窗口 —— 那是你自己要退的。
+
+加过 `-Log` 时，成功结束也会把 `日志文件: <路径>` 打在一行里（成败都回显，否则窗口一关就找不到那个 txt）。
 
 这几个文件会自动生成在项目根（远程双击时为 `%LOCALAPPDATA%\STEAMX`）：
 
