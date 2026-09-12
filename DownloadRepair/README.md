@@ -144,7 +144,16 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
 
 - 覆盖已有文件时，原文件会备份到 `backups\repair-<时间戳>\`（`-NoBackup` 关闭）。
 - `无法加载文件 ... 因为在此系统上禁止运行脚本`：这是 ExecutionPolicy 拦的，用第 2 节的**内存执行**版本即可绕过，或 `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force`。
-- Steam 装在 `C:\Program Files (x86)\Steam` 时写入 `depotcache` 需要管理员权限；右键「以管理员身份运行」打开 PowerShell 再执行。
+- **报「无权写入 / 拒绝访问」**：目标在系统盘（如 `C:\Program Files (x86)\Steam`）且当前账户写不进去。三种常见原因：
+    1. 账户是标准用户（非管理员）——没有任何写 `Program Files` 的令牌；
+    2. 该机 Steam 目录的 ACL 被重置过（手工搬移过 Steam、从旧机器整目录拷贝、重装系统后直接放回 `Program Files`）。正常由 Steam 安装程序初始化过的机器上，`icacls "C:\Program Files (x86)\Steam\depotcache"` 能看到 `BUILTIN\Users:(I)(F)`，这种机器普通权限就能写；看不到这条就是被继承了 `Program Files` 的只读 ACL；
+    3. 安全软件 / 系统策略（AppLocker、WDAC、受控文件夹访问）拦截对 `Program Files` 的写入。
+  - 处理：右键快捷方式 → **以管理员身份运行**；或在管理员 PowerShell 里放权一次（等效于 Steam 安装程序做的事）：
+    ```powershell
+    icacls "C:\Program Files (x86)\Steam" /grant "*S-1-5-32-545:(OI)(CI)M" /T
+    ```
+    `*S-1-5-32-545` 即 `BUILTIN\Users`（用 SID 可避免中文系统组名匹配问题），`/T` 递归子目录。
+  - 脚本动手前会先试写一个探针文件做预检，不可写就直接报 `无权写入 <路径>` 并中止，不会留下半截文件；`DownloadRepair\修复下载-无互联网链接-国内版.lnk` 已带「以管理员身份运行」标记，双击会走 UAC。
 - 日志默认只在控制台输出，不写文件；加 `-Log` 才写 `logs\repair-<时间戳>.log`。`WARN` / `ERROR` 行始终显示。
 - 中文名来自 `manifest\appnames.json`：**默认只读本地名单，菜单立刻出现**，名字缺失的先显示 AppID，选中后会补一次。本地没有名单文件时，会从仓库拉一次 `manifest/appnames.json`。
 - 名单条目格式为 `"AppID": "中文名"`，仓库里带的就是纯中文（`-Game` 用中文名或 AppID 都能命中）；如需保留英文搜索，可在本地写成 `"中文名 || 官方原名"`，此时显示只用前半段，关键词两段都能匹配。
