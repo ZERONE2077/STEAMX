@@ -559,6 +559,17 @@ function Get-LocalZipIndex {
 
 # ---------------------------------------------------------------- 游戏中文名
 
+# 名单条目支持 "中文名 || 官方原名": 前半段用于显示, 后半段只用于关键词搜索
+function Split-NameEntry {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return @("", "") }
+    $parts = @($Value -split '\s*\|\|\s*', 2)
+    $name = $parts[0].Trim()
+    $alias = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
+    return @($name, $alias)
+}
+
 function New-GameLabel {
     param(
         [Parameter(Mandatory = $true)]$Item,
@@ -631,6 +642,9 @@ function Invoke-RemoteText {
     $request.UserAgent = "STEAMX"
     $request.Accept = "application/json"
     $request.AllowAutoRedirect = $true
+    try {
+        $request.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    } catch { }
     $request.Timeout = $Timeout * 1000
     $request.ReadWriteTimeout = $Timeout * 1000
     $response = $null
@@ -717,8 +731,11 @@ function Add-GameDisplayNames {
         $item | Add-Member -NotePropertyName AppId -NotePropertyValue $appId -Force
 
         $display = ""
+        $alias = ""
         if (-not [string]::IsNullOrWhiteSpace($appId) -and $cache.ContainsKey($appId)) {
-            $display = [string]$cache[$appId]
+            $parts = Split-NameEntry -Value ([string]$cache[$appId])
+            $display = $parts[0]
+            $alias = $parts[1]
         }
 
         $isPending = [string]::IsNullOrWhiteSpace($display)
@@ -733,6 +750,7 @@ function Add-GameDisplayNames {
 
         $item | Add-Member -NotePropertyName NamePending -NotePropertyValue $isPending -Force
         $item | Add-Member -NotePropertyName DisplayName -NotePropertyValue $display -Force
+        $item | Add-Member -NotePropertyName Alias -NotePropertyValue $alias -Force
     }
 
     if ($Refresh -and $pending.Count -gt 0) {
@@ -752,7 +770,9 @@ function Add-GameDisplayNames {
             if (-not $item.NamePending) { continue }
             $id = [string]$item.AppId
             if (-not [string]::IsNullOrWhiteSpace($id) -and $cache.ContainsKey($id)) {
-                $item.DisplayName = [string]$cache[$id]
+                $parts = Split-NameEntry -Value ([string]$cache[$id])
+                $item.DisplayName = $parts[0]
+                $item.Alias = $parts[1]
                 $item.NamePending = $false
             }
         }
@@ -780,7 +800,9 @@ function Update-PendingDisplayName {
     $cache[$appId] = $name
     Save-AppNameCache -Cache $cache -PathValue $CachePath
 
-    $Item.DisplayName = $name
+    $parts = Split-NameEntry -Value $name
+    $Item.DisplayName = $parts[0]
+    $Item.Alias = $parts[1]
     $Item.NamePending = $false
     return $Item
 }
@@ -1013,6 +1035,7 @@ function Invoke-Repair {
         $matched = @($items | Where-Object {
             $_.Name -like ("*{0}*" -f $Game) -or
             $_.DisplayName -like ("*{0}*" -f $Game) -or
+            $_.Alias -like ("*{0}*" -f $Game) -or
             $_.AppId -eq $Game
         })
         if ($matched.Count -eq 1) {

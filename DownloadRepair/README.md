@@ -31,23 +31,25 @@
 ## 2. 一键运行（复制整行 → 粘贴到 PowerShell → 回车）
 
 > 推荐用**内存执行**版本：不落盘、不写临时文件，因此**不受 ExecutionPolicy 限制**（默认 Restricted 的机器也能直接跑）。
+>
+> 必须显式按 UTF-8 解码：jsDelivr / raw 返回 `application/octet-stream`，PS 5.1 的 `irm` 会按 ISO-8859-1 解码，脚本里的中文会变成乱码（`æ«æ`），进而导致中文比较、菜单文案错乱。
 
 jsDelivr（国内最快）：
 
 ```powershell
-$s=((irm -Uri 'https://cdn.jsdelivr.net/gh/ZERONE2077/STEAMX@main/DownloadRepair/DownloadRepair.ps1') -join "`n") -replace '^\uFEFF',''; & ([scriptblock]::Create($s)) -Game 1091500
+$u='https://cdn.jsdelivr.net/gh/ZERONE2077/STEAMX@main/DownloadRepair/DownloadRepair.ps1';$r=Invoke-WebRequest -Uri $u -UseBasicParsing;$s=[Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()).TrimStart([char]0xFEFF);& ([scriptblock]::Create($s)) -Game 1091500
 ```
 
 GitHub raw：
 
 ```powershell
-$s=((irm -Uri 'https://raw.githubusercontent.com/ZERONE2077/STEAMX/main/DownloadRepair/DownloadRepair.ps1') -join "`n") -replace '^\uFEFF',''; & ([scriptblock]::Create($s)) -Game 1091500
+$u='https://raw.githubusercontent.com/ZERONE2077/STEAMX/main/DownloadRepair/DownloadRepair.ps1';$r=Invoke-WebRequest -Uri $u -UseBasicParsing;$s=[Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()).TrimStart([char]0xFEFF);& ([scriptblock]::Create($s)) -Game 1091500
 ```
 
 ghfast 镜像（raw / jsDelivr 都不通时用）：
 
 ```powershell
-$s=((irm -Uri 'https://ghfast.top/https://raw.githubusercontent.com/ZERONE2077/STEAMX/main/DownloadRepair/DownloadRepair.ps1') -join "`n") -replace '^\uFEFF',''; & ([scriptblock]::Create($s)) -Game 1091500
+$u='https://ghfast.top/https://raw.githubusercontent.com/ZERONE2077/STEAMX/main/DownloadRepair/DownloadRepair.ps1';$r=Invoke-WebRequest -Uri $u -UseBasicParsing;$s=[Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()).TrimStart([char]0xFEFF);& ([scriptblock]::Create($s)) -Game 1091500
 ```
 
 不带 `-Game` 就是菜单模式，把末尾的 ` -Game 1091500` 删掉即可。
@@ -144,7 +146,8 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
 - `无法加载文件 ... 因为在此系统上禁止运行脚本`：这是 ExecutionPolicy 拦的，用第 2 节的**内存执行**版本即可绕过，或 `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force`。
 - Steam 装在 `C:\Program Files (x86)\Steam` 时写入 `depotcache` 需要管理员权限；右键「以管理员身份运行」打开 PowerShell 再执行。
 - 日志默认只在控制台输出，不写文件；加 `-Log` 才写 `logs\repair-<时间戳>.log`。`WARN` / `ERROR` 行始终显示。
-- 中文名来自 `manifest\appnames.json`：**默认只读本地名单，菜单立刻出现**，名字缺失的先显示 AppID，选中后会补一次。本地没有名单文件时，会从仓库拉一次 `manifest/appnames.json`（几百字节）。
+- 中文名来自 `manifest\appnames.json`：**默认只读本地名单，菜单立刻出现**，名字缺失的先显示 AppID，选中后会补一次。本地没有名单文件时，会从仓库拉一次 `manifest/appnames.json`。
+- 名单条目格式为 `"中文名"` 或 `"中文名 || 官方原名"`：显示只用前半段（`中文名  [AppID]  (体积)`），`-Game` 关键词**两段都能匹配**（`-Game Sekiro` 和 `-Game 只狼` 都能命中同一个包）。
 - 只有数字命名的 `<AppID>.zip` 才能查到中文名，旧的游戏名 zip 直接显示文件名。
 - 通过 `irm | iex` 运行时找不到项目根，日志和备份会落到 `%TEMP%\STEAMX\`，本地包源用 `-LocalDir` 或 `$env:STEAMX_MANIFEST_DIR` 指定。
 - 建议先退出 Steam，避免文件占用导致覆盖失败。
