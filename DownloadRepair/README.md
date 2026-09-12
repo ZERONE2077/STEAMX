@@ -92,6 +92,10 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; irm -Uri 'htt
 | `-LuaTarget` | `.lua` 解压目录 | `<Steam>\config\lua` |
 | `-ManifestTarget` | `.manifest` 解压目录 | `<Steam>\depotcache` |
 | `-TimeoutSeconds` | 单次网络超时 | `30` |
+| `-Pause` | 失败时**一定**停在窗口里等按键（即使输入被重定向） | 自动 |
+| `-NoPause` | 失败时**不**停留，直接退出（自动化调用用） | 自动 |
+
+失败时是否留窗口是**自动**判断的：输入没被重定向（双击快捷方式、正常开 PowerShell 跑）就留，输入是管道 / 重定向（脚本调用、CI）就不留。两个开关用于强制覆盖。等价环境变量：`STEAMX_NO_PAUSE=1`。
 
 Steam 路径识别顺序：参数 → `$env:STEAM_PATH` → steam 进程 → 注册表 → 各盘常见路径 → 手动输入。
 
@@ -154,7 +158,7 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
     ```
     `*S-1-5-32-545` 即 `BUILTIN\Users`（用 SID 可避免中文系统组名匹配问题），`/T` 递归子目录。
   - 脚本动手前会先试写一个探针文件做预检，不可写就直接报 `无权写入 <路径>` 并中止，不会留下半截文件；`DownloadRepair\修复下载-无互联网链接-国内版.lnk` 已带「以管理员身份运行」标记，双击会走 UAC。
-- 日志默认只在控制台输出，不写文件；加 `-Log` 才写 `logs\repair-<时间戳>.log`。`WARN` / `ERROR` 行始终显示。
+- 正常运行时日志只打控制台、不写文件；加 `-Log` 才写 `logs\repair-<时间戳>.log`。**失败时例外**：会自动写 `logs\repair-error-<时间戳>.log`（含失败前 200 行日志），见第 7 节。`WARN` / `ERROR` 行始终显示。
 - 中文名来自 `manifest\appnames.json`：**默认只读本地名单，菜单立刻出现**，名字缺失的先显示 AppID，选中后会补一次。本地没有名单文件时，会从仓库拉一次 `manifest/appnames.json`。
 - 名单条目格式为 `"AppID": "中文名"`，仓库里带的就是纯中文（`-Game` 用中文名或 AppID 都能命中）；如需保留英文搜索，可在本地写成 `"中文名 || 官方原名"`，此时显示只用前半段，关键词两段都能匹配。
 - 只有数字命名的 `<AppID>.zip` 才能查到中文名，旧的游戏名 zip 直接显示文件名。
@@ -175,5 +179,23 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
 | 5 | 权限不足 | 目标目录不可写，见第 6 节 |
 | 6 | 缺少依赖 | 系统组件缺失 |
 | 7 | 网络失败 | 所有下载源均失败 |
+
+### 失败不会闪退
+
+双击快捷方式启动的窗口，会在进程退出的瞬间消失，错误信息根本来不及看。所以脚本在退出前会：
+
+1. 打印错误 + `Reason` / `Try`；
+2. 把**完整记录**写到 `logs\repair-error-<时间戳>.log`（错误类型、退出码、命令行、系统版本、异常详情，以及**失败前最后 200 行日志**），路径直接显示在屏幕上；
+3. 停住等一句 `按 Enter 关闭窗口 ...`。
+
+主动按 Esc 取消（退出码 4）不留窗口 —— 那是你自己要退的。
+
+这几个文件会自动生成在项目根（远程双击时为 `%LOCALAPPDATA%\STEAMX`）：
+
+| 路径 | 何时产生 |
+|---|---|
+| `logs\repair-error-<时间戳>.log` | 任何失败，无需加参数 |
+| `logs\repair-<时间戳>.log` | 仅 `-Log` |
+| `backups\repair-<时间戳>\` | 覆盖了已有文件时
 
 交互性是增强而非前提：**没有控制台或输入被重定向时，菜单自动降级为「打印列表 + 输入序号」**，不会再抛「无法读取键」这类异常；完全无输入能力时请直接用 `-Game <AppID|关键词>`。

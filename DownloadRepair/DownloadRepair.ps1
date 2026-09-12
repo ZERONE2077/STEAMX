@@ -30,7 +30,9 @@ param(
     [switch]$ShowEnv,
     [switch]$IncludeLua,
     [switch]$Log,
-    [switch]$RefreshNames
+    [switch]$RefreshNames,
+    [switch]$Pause,
+    [switch]$NoPause
 )
 
 Set-StrictMode -Version Latest
@@ -52,6 +54,11 @@ $script:LogFile = ""
 $script:LogEnabled = [bool]$Log
 $script:ErrorKind = "Operation"
 $script:ExitCode = 0
+# 出错时窗口要不要留住(解决了"双击启动 -> 报错 -> 窗口秒关")
+$script:Failed = $false
+$script:CrashLogFile = ""
+# 最近 200 行日志的环形缓冲: 失败时连同异常一起落盘, 关窗后也能复盘
+$script:LogRing = New-Object System.Collections.ArrayList
 
 # 退出码基线(不要随意增删, 见文件头注释)
 $script:Codes = @{
@@ -262,6 +269,12 @@ function Write-LogLine {
     if (-not [string]::IsNullOrWhiteSpace($script:LogFile)) {
         $line = "{0} [{1}] {2} {3}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $scopeKey, $Message
         Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8
+    }
+
+    # 环形缓冲(只驻内存): 失败时把这几十行一起写进崩溃日志
+    if ($null -ne $script:LogRing) {
+        [void]$script:LogRing.Add(("{0} {1} {2} {3}" -f $stamp, $tag.TrimEnd(), $scopeKey, $Message))
+        if ($script:LogRing.Count -gt 200) { $script:LogRing.RemoveAt(0) }
     }
 }
 
@@ -1497,6 +1510,72 @@ function Restore-Terminal {
     try { [Console]::CursorVisible = $true } catch { }
 }
 
+# 失败时该不该把窗口留住:
+#   双击 / 快捷方式启动 -> 进程一退窗口就没了, 必须留, 否则用户什么都看不到
+#   管道 / 自动化调用   -> 没人按键, 等了就是挂死, 不留
+# 显式开关: -Pause 强制留, -NoPause 或环境变量 STEAMX_NO_PAUSE=1 强制不留
+function Test-ShouldPause {
+    if ($NoPause) { return $false }
+    if ($Pause) { return $true }
+    if (-not [string]::IsNullOrWhiteSpace($env:STEAMX_NO_PAUSE)) { return $false }
+    try {
+        if ([Console]::IsInputRedirected) { return $false }
+    } catch {
+        return $false
+    }
+    return $true
+}
+
+# 把错误 + 最近 200 行日志落盘, 窗口关了也能事后查(甚至直接发给作者)
+function Save-CrashLog {
+    param(
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [AllowEmptyString()][string]$Detail = "",
+        [int]$ExitCodeValue = 0
+    )
+
+    try {
+        $dir = Join-Path (Get-ProjectRoot) "logs"
+        Ensure-Dir -PathValue $dir
+        $path = Join-Path $dir ("repair-error-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+
+        $lines = New-Object System.Collections.ArrayList
+        [void]$lines.Add("===== STEAMX 修复下载 / 失败记录 =====")
+        [void]$lines.Add(("时间    : {0}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss")))
+        [void]$lines.Add(("退出码  : {0} ({1})" -f $ExitCodeValue, $Kind))
+        [void]$lines.Add(("错误    : {0}" -f $Message))
+        [void]$lines.Add(("命令行  : {0}" -f ([Environment]::CommandLine)))
+        [void]$lines.Add(("环境    : PowerShell {0} / OS {1}" -f $PSVersionTable.PSVersion, [Environment]::OSVersion.Version))
+        if (-not [string]::IsNullOrWhiteSpace($Detail)) {
+            [void]$lines.Add("")
+            [void]$lines.Add("--- 异常详情 ---")
+            foreach ($detailLine in ($Detail -split "`r?`n")) { [void]$lines.Add($detailLine) }
+        }
+        [void]$lines.Add("")
+        [void]$lines.Add(("--- 失败前日志 (末 {0} 行) ---" -f $script:LogRing.Count))
+        foreach ($entry in $script:LogRing) { [void]$lines.Add([string]$entry) }
+
+        Set-Content -LiteralPath $path -Value $lines -Encoding UTF8
+        return $path
+    } catch {
+        return ""
+    }
+}
+
+# 停在窗口里等人按 Enter, 而不是 exit 之后窗口消失
+function Wait-WindowBeforeExit {
+    Write-Host ""
+    Write-Host "  按 Enter 关闭窗口 ..." -ForegroundColor DarkGray
+    try {
+        $line = [Console]::ReadLine()
+        # stdin 已经到 EOF(无人值守) -> 至少留几秒给人看, 不无限挂住
+        if ($null -eq $line) { Start-Sleep -Seconds 10 }
+    } catch {
+        Start-Sleep -Seconds 10
+    }
+}
+
 # ================================================================ 主流程
 
 function Invoke-Repair {
@@ -1704,16 +1783,32 @@ try {
     $kind = Get-ErrorKind -ErrorRecord $_
     $message = [string]$_.Exception.Message
     if ([string]::IsNullOrWhiteSpace($message)) { $message = (T -Key "EnvUnknown") }
+    $detail = $_.Exception.ToString()
 
     if ($kind -eq "Cancelled") {
         Write-LogWarning -Scope "repair" -Message $message
     } else {
         Write-LogError -Scope "repair" -Message $message
-        Show-ErrorGuidance -Kind $kind -Detail $_.Exception.ToString()
+        Show-ErrorGuidance -Kind $kind -Detail $detail
     }
     $script:ExitCode = Get-ExitCodeForKind -Kind $kind
+
+    # 主动取消(Esc)不留窗口, 其他失败都留: 见 Test-ShouldPause 注释
+    if ($script:ExitCode -ne 0 -and $kind -ne "Cancelled") {
+        $script:Failed = $true
+        $script:CrashLogFile = Save-CrashLog -Kind $kind -Message $message -Detail $detail -ExitCodeValue $script:ExitCode
+    }
 } finally {
     Restore-Terminal
+}
+
+# 双击启动的场景: exit 一执行窗口就关, 所以留窗口这件事必须发生在 exit 之前
+if ($script:Failed) {
+    if (-not [string]::IsNullOrWhiteSpace($script:CrashLogFile)) {
+        Write-Host ""
+        Write-Host ("  详细日志: " + $script:CrashLogFile) -ForegroundColor DarkGray
+    }
+    if (Test-ShouldPause) { Wait-WindowBeforeExit }
 }
 
 exit $script:ExitCode
