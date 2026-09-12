@@ -12,36 +12,63 @@
 
 ---
 
-## 0. 两个快捷方式（双击即用）
+## 0. 三个双击入口
 
-| 快捷方式 | 跑什么 | 日志 | 适用 |
+| 文件 | 跑什么 | 日志 | 适用 |
 |---|---|---|---|
 | `修复下载-本地测试版.lnk` | 直接跑本机的 `DownloadRepair.ps1`（`-File`），带 `-Log -Pause` | **写** `logs\repair-<时间戳>.log` | 自己调试用。本机脚本永远是最新的那一份，跑完留窗能看结果和日志路径 |
-| `修复下载-线上正式版.lnk` | 从 CDN/仓库拉脚本再跑，**不写日志** | 不写 | 对外分发用。不需要仓库、不需要更新，双击就拿仓库里当前的最新脚本 |
+| `修复下载-线上正式版.cmd` | `curl` 取 `boot.ps1` → `powershell -File` 运行 → boot 再取最新脚本 → 跑 | 不写 | 对外分发用，**首选**。整条链路里每个进程的命令行都很平淡（`curl.exe ... -o` / `powershell ... -File`），不会撞安全软件 |
+| `修复下载-线上正式版.lnk` | `iex` 一条 `irm` 拉 `boot.ps1` 再跑 | 不写 | 同上，图标和悬停文字更好看；代价是命令行里带一条下载 URL —— 这正是 Defender 误判的那种形状（见 0.2），所以只作备用 |
 
-两个都**不带**「以管理员身份运行」标记。之前带过，但那个标记在部分机器上会让快捷方式直接启动失败（双击报 Windows 的「无法访问指定设备、路径或文件」），已改为**脚本按需自动提权**：目标目录不可写且当前不是管理员时，脚本会自己弹 UAC、以管理员身份重开一个窗口接管，本窗口安静退出（`-NoElevate` 可禁用；普通权限能写的机器上不会触发）。
+三个都**不带**「以管理员身份运行」标记。之前带过，但那个标记在部分机器上会让快捷方式直接启动失败（双击报 Windows 的「无法访问指定设备、路径或文件」），已改为**脚本按需自动提权**：目标目录不可写且当前不是管理员时，脚本会自己弹 UAC、以管理员身份重开一个窗口接管，本窗口安静退出（`-NoElevate` 可禁用；普通权限能写的机器上不会触发）。
 
 命名口径：**本地测试版** = 只在本机跑、跑的是工作区里正在改的脚本、带日志，改完代码立刻能验；**线上正式版** = 发给别人的那一份，每次启动自己去仓库取最新脚本，拿到什么就是线上发布的那一版。
 
-线上正式版为什么不钉死某个 commit：钉 `@<sha>` 会一直卡在那个版本。它改成**每次启动现取最新**，按顺序试，取到第一个能用的就走：
+### 0.1 线上版为什么要多一个 `boot.ps1`
 
-| # | 源 | 实测 |
+`boot.ps1` 就是原来塞在快捷方式 `Arguments` 里的那段取源逻辑，现在独立成文件。三个入口都指向它：
+
+- `.cmd` 用 `curl.exe -sSL -o "%TEMP%\STEAMX-boot.ps1" <url>` 取下来，再 `powershell -File` 跑它
+- `.lnk` 用 `-Command "iex (irm '<url>')"` 取下来直接执行
+
+它做两件事：问 `api.github.com/.../commits/main` 拿 `main` 的最新 sha → 用 `cdn.jsdelivr.net/gh/...@<sha>/...` 取真正的 `DownloadRepair.ps1` → 跑。取源顺序（全部失败才报错并留窗）：
+
+| # | 源 | 备注 |
 |---|---|---|
-| 1 | `api.github.com/repos/ZERONE2077/STEAMX/commits/main` 问出 `main` 当前 sha → `cdn.jsdelivr.net/gh/...@<sha>/...` | 推送后立刻可用（`Age: 0`），国内速度也好；sha 形式永久缓存 |
-| 2 | 同上，但 API 走 `gh-proxy.com` 转发（直连 GitHub 不通时） | 实测 0.6 s 返回同一个 sha |
-| 3 | `raw.githubusercontent.com/.../main/...` | ≤5 分钟缓存，实测推送后 30 s 内就是新版 |
+| 1 | `api.github.com/repos/ZERONE2077/STEAMX/commits/main` → jsDelivr `@<sha>` | 推送后 `Age: 0` 立刻可用，国内速度也好；sha 地址永久缓存 |
+| 2 | 同一个 API 走 `gh-proxy.com` 转发 | 直连 GitHub 不通时用，实测 0.6 s 返回同一个 sha |
+| 3 | `raw.githubusercontent.com/.../main/...` | ≤5 分钟缓存 |
 | 4 | `ghfast.top/https://raw.githubusercontent.com/.../main/...` | 国内镜像 |
-| 5 | `cdn.jsdelivr.net/gh/...@latest/...` | 兜底，见下 |
+| 5 | jsDelivr `@latest` | 兜底 |
 
-全部失败才报错并留窗（会列出每个源的具体错误）。
+`boot.ps1` **必须保持纯 ASCII**、不写中文：`.lnk` 那条路径是用 `irm` 拉的，而 jsDelivr 把 `.ps1` 当 `application/octet-stream` 返回，`Invoke-RestMethod` 会按 ISO-8859-1 解码 —— 任何非 ASCII 字节都会变成乱码。中文提示交给它启动的 `DownloadRepair.ps1`。
 
-**别用 jsDelivr 的 `@main`，`@latest` 也别当主力**：两者都走 jsDelivr 的分支缓存（`s-maxage=43200`，最长 12 h）。实测推送后：
+`.cmd` 本身存成 **GBK**（头部 `chcp 936`），因为 cmd.exe 是按当前控制台代码页逐行解码批处理文件的。
 
-- `@main` 5 小时后仍是旧版（`Age: 18354`，文件 62630 字节 vs 新版 74570）
-- `@latest` 是解析 HEAD，比 `@main` 好，但推送后仍滞后约 15 分钟（`Age: 443` 时还是旧版），之后才跟上
-- `@<sha>` 形式是 `Age: 0`，永远立刻可用 —— 所以正确姿势是**先用 API 拿 sha，再拿 sha 地址**
+### 0.2 为什么不能把「下载并执行」写在快捷方式的命令行里
 
-加 `?ts=...` 之类的查询参数没用，jsDelivr 会把它规范化掉（实测带不带参数 `Age` 一样）。
+**Microsoft Defender 会把这种快捷方式判成木马。** 实测记录（`Get-MpThreatDetection`，路径前缀都是 `CmdLine:`，也就是按命令行内容拦）：
+
+| 时间 | 检测名 | 命令行 |
+|---|---|---|
+| 2026-09-12 18:20 / 23:42 | `Trojan:Win32/Commando.A!ml` | `powershell -Command irm '<raw.githubusercontent.com>/.../main.ps1' \| iex` |
+| 2026-09-13 03:13 | `Trojan:Win32/Commando.A!ml` | 第一版线上快捷方式的长 payload |
+| 2026-09-13 03:43 / 04:02 / 05:34 / 06:05 | `Trojan:Win32/ClickFix.DAC!MTB` | 现版线上快捷方式的 1665 字符内联 payload |
+
+命中后 Defender 在**进程创建阶段就拒绝**，ShellExecute 拿不到进程，于是双击弹的是 Windows 的「无法访问指定设备、路径或文件。你可能没有适当的权限访问该项目。」—— 看着像权限问题，其实跟权限无关。
+
+对照实验（同一台机器、同一时间窗，逐个跑一遍再看日志有没有新增检测）：
+
+| 写法 | 结果 |
+|---|---|
+| `-File "本地脚本"` | ✅ 从不被拦（本地测试版就是这条） |
+| `curl -o x.ps1` 然后 `-File x.ps1` | ✅ 不被拦 |
+| `iwr ... -OutFile x.ps1; & x.ps1` | ✅ 不被拦 |
+| `iex (irm '<cdn.jsdelivr.net>/...')` | ✅ 不被拦（`.lnk` 走的就是这条） |
+| 长内联 payload + 真的下载并执行 | 🚫 拦 |
+| `iex (irm '<raw.githubusercontent.com>/...')` | 🚫 拦（这个域名的启发式权重很高） |
+
+结论：**逻辑放文件里（走 `-File`）就没事，塞进命令行就会被当成 ClickFix 那类「快捷方式投放器」**。所以线上版的取源逻辑一律留在 `boot.ps1`，`Arguments` 越短越好。
 
 ---
 
@@ -191,7 +218,7 @@ $dr="D:\Dev\STEAMX\DownloadRepair\DownloadRepair.ps1"
     icacls "C:\Program Files (x86)\Steam" /grant "*S-1-5-32-545:(OI)(CI)M" /T
     ```
     `*S-1-5-32-545` 即 `BUILTIN\Users`（用 SID 可避免中文系统组名匹配问题），`/T` 递归子目录。
-  - 脚本动手前会先试写一个探针文件做预检，不可写就直接报 `无权写入 <路径>` 并中止，不会留下半截文件。两个快捷方式都**不带**「以管理员身份运行」标记——那个标记在提权不可用的机器上会让快捷方式本身启动失败（报「无法访问指定设备、路径或文件」），改由脚本按需自动提权。
+  - 脚本动手前会先试写一个探针文件做预检，不可写就直接报 `无权写入 <路径>` 并中止，不会留下半截文件。第 0 节那三个入口都**不带**「以管理员身份运行」标记——那个标记在提权不可用的机器上会让入口本身启动失败（报「无法访问指定设备、路径或文件」），改由脚本按需自动提权。
 - 正常运行时日志只打控制台、不写文件；加 `-Log` 才写 `logs\repair-<时间戳>.log`。**失败时例外**：会自动写 `logs\repair-error-<时间戳>.log`（含失败前 200 行日志），见第 7 节。`WARN` / `ERROR` 行始终显示。
 - 中文名来自 `manifest\appnames.json`：**默认只读本地名单，菜单立刻出现**，名字缺失的先显示 AppID，选中后会补一次。本地没有名单文件时，会从仓库拉一次 `manifest/appnames.json`。
 - 名单条目格式为 `"AppID": "中文名"`，仓库里带的就是纯中文（`-Game` 用中文名或 AppID 都能命中）；如需保留英文搜索，可在本地写成 `"中文名 || 官方原名"`，此时显示只用前半段，关键词两段都能匹配。
