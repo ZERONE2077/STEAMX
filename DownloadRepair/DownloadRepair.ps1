@@ -19,6 +19,8 @@
 #   -Log           全过程写进 logs\repair-<时间戳>.log (本地版快捷方式用)
 #   -Pause         跑完留窗等 Enter(成功也留); -NoPause / STEAMX_NO_PAUSE=1 强制不留
 #   -IncludeLua    连 .lua 一起装; -NoBackup 不建备份; -ShowEnv 打印路径
+#   -NoElevate     目标不可写时不自动提权, 只打印提示(给自动化用)
+#   提权      目标不可写且当前不是管理员 -> 自动用管理员身份重开一个窗口继续(只提一次)
 #   -Game <关键词> 跳过菜单直接装; -Offline 只用本地包; -RefreshNames 全量刷新中文名
 [CmdletBinding()]
 param(
@@ -38,7 +40,8 @@ param(
     [switch]$Log,
     [switch]$RefreshNames,
     [switch]$Pause,
-    [switch]$NoPause
+    [switch]$NoPause,
+    [switch]$NoElevate
 )
 
 Set-StrictMode -Version Latest
@@ -62,6 +65,8 @@ $script:ErrorKind = "Operation"
 $script:ExitCode = 0
 # 出错时窗口要不要留住(解决了"双击启动 -> 报错 -> 窗口秒关")
 $script:Failed = $false
+# 已把工作交接给提权后的新窗口: 本进程安静退出, 不报错、不留窗
+$script:HandedOff = $false
 $script:CrashLogFile = ""
 # 最近 200 行日志的环形缓冲: 失败时连同异常一起落盘, 关窗后也能复盘
 $script:LogRing = New-Object System.Collections.ArrayList
@@ -104,6 +109,9 @@ $script:Strings = @{
     NoPermission       = "无权写入 {0}"
     NotWritable        = "目标不可写 {0} (可能被安全软件或系统策略拦截)"
     RunAsAdmin         = "请右键本快捷方式 -> 以管理员身份运行, 或用管理员 PowerShell 重跑"
+    Elevating          = "目标需要管理员权限, 正在以管理员身份重新启动 ..."
+    ElevateHandoff     = "已交接给管理员窗口继续执行, 本窗口可以关闭"
+    ElevateFailed      = "自动提权未成功 (可能被 UAC 拒绝)"
     RemoteUnavailable  = "远端不可用: {0}"
     RemoteListed       = "远端列表 {0} 个包 ({1})"
     RemoteDegraded     = "GitHub API 不可用, 已降级: {0}"
@@ -872,6 +880,54 @@ function Test-DirWritable {
     }
 }
 
+# ---------------------------------------------------------------- 提权
+
+# 目标不可写 + 当前不是管理员 -> 用"原始命令行"把自己以管理员身份重开一次
+# 原始命令行有两种形态, 函数自己判断:
+#   -File <脚本> <参数...>   本地版快捷方式 / 命令行调用
+#   -Command "<载荷>"        远程版快捷方式(先拉脚本再执行)
+# 子进程带 STEAMX_ELEVATED=1 作标记, 避免无限递归;
+# 提权被拒或环境不支持时返回 $false, 由调用方打印可操作提示
+function Invoke-SelfElevate {
+    if ($env:STEAMX_ELEVATED -eq "1") { return $false }
+
+    $hostExe = ""
+    try { $hostExe = (Get-Process -Id $PID).Path } catch { $hostExe = "" }
+    if ([string]::IsNullOrWhiteSpace($hostExe)) { return $false }
+
+    $original = [Environment]::CommandLine
+    if ([string]::IsNullOrWhiteSpace($original)) { return $false }
+
+    # 原始命令行整条 base64 带过去, 避开所有引号 / 空格转义问题
+    $blob = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($original))
+
+    $bootstrap = @(
+        '$env:STEAMX_ELEVATED = ''1'''
+        ('$blob = ''' + $blob + '''')
+        '$cl = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($blob))'
+        '$idxFile = $cl.IndexOf(''-File'')'
+        '$idxCmd = $cl.IndexOf(''-Command'')'
+        'if ($idxCmd -ge 0 -and ($idxFile -lt 0 -or $idxCmd -lt $idxFile)) {'
+        '    $body = $cl.Substring($idxCmd + 8).Trim()'
+        '    if ($body.StartsWith(''"'') -and $body.EndsWith(''"'')) { $body = $body.Substring(1, $body.Length - 2) }'
+        '    & ([scriptblock]::Create($body))'
+        '} elseif ($idxFile -ge 0) {'
+        '    $rest = $cl.Substring($idxFile + 5).Trim()'
+        '    Invoke-Expression (''& '' + $rest)'
+        '} else {'
+        '    throw ''无法解析原始命令行, 请手动以管理员身份重跑'''
+        '}'
+    ) -join "`r`n"
+
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrap))
+    try {
+        Start-Process -FilePath $hostExe -Verb RunAs -ArgumentList ("-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + $encoded) | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 # ---------------------------------------------------------------- Steam 定位
 
 function Test-SteamDir {
@@ -1633,6 +1689,20 @@ function Invoke-Repair {
     $blockedTargets = @($writeTargets | Where-Object { -not (Test-DirWritable -PathValue $_) })
     if ($blockedTargets.Count -gt 0) {
         $isAdmin = Test-IsAdministrator
+
+        # 不是管理员且没禁用提权 -> 自动以管理员身份重开一个窗口接管
+        # (以前靠快捷方式的"以管理员身份运行"标记, 但那个标记会让快捷方式在提权
+        #  不可用的机器上直接启动失败, 报 Windows 的"无法访问指定设备、路径或文件")
+        if (-not $isAdmin -and -not $NoElevate) {
+            Write-LogInfo -Scope "install" -Message (T -Key "Elevating")
+            if (Invoke-SelfElevate) {
+                $script:HandedOff = $true
+                Set-ErrorKind -Kind "Permission"
+                throw (T -Key "ElevateHandoff")
+            }
+            Write-LogWarning -Scope "install" -Message (T -Key "ElevateFailed")
+        }
+
         foreach ($blockedPath in $blockedTargets) {
             if ($isAdmin) {
                 Write-LogError -Scope "install" -Message (Format-Text -Key "NotWritable" -Values @($blockedPath))
@@ -1787,23 +1857,28 @@ function Invoke-Repair {
 try {
     Invoke-Repair
 } catch {
-    $kind = Get-ErrorKind -ErrorRecord $_
-    $message = [string]$_.Exception.Message
-    if ([string]::IsNullOrWhiteSpace($message)) { $message = (T -Key "EnvUnknown") }
-    $detail = $_.Exception.ToString()
-
-    if ($kind -eq "Cancelled") {
-        Write-LogWarning -Scope "repair" -Message $message
+    if ($script:HandedOff) {
+        # 活儿已经交给管理员窗口: 本进程不算失败, 不写崩溃日志, 也不留窗
+        Write-LogInfo -Scope "install" -Message ([string]$_.Exception.Message)
     } else {
-        Write-LogError -Scope "repair" -Message $message
-        Show-ErrorGuidance -Kind $kind -Detail $detail
-    }
-    $script:ExitCode = Get-ExitCodeForKind -Kind $kind
+        $kind = Get-ErrorKind -ErrorRecord $_
+        $message = [string]$_.Exception.Message
+        if ([string]::IsNullOrWhiteSpace($message)) { $message = (T -Key "EnvUnknown") }
+        $detail = $_.Exception.ToString()
 
-    # 主动取消(Esc)不留窗口, 其他失败都留: 见 Test-ShouldPause 注释
-    if ($script:ExitCode -ne 0 -and $kind -ne "Cancelled") {
-        $script:Failed = $true
-        $script:CrashLogFile = Save-CrashLog -Kind $kind -Message $message -Detail $detail -ExitCodeValue $script:ExitCode
+        if ($kind -eq "Cancelled") {
+            Write-LogWarning -Scope "repair" -Message $message
+        } else {
+            Write-LogError -Scope "repair" -Message $message
+            Show-ErrorGuidance -Kind $kind -Detail $detail
+        }
+        $script:ExitCode = Get-ExitCodeForKind -Kind $kind
+
+        # 主动取消(Esc)不留窗口, 其他失败都留: 见 Test-ShouldPause 注释
+        if ($script:ExitCode -ne 0 -and $kind -ne "Cancelled") {
+            $script:Failed = $true
+            $script:CrashLogFile = Save-CrashLog -Kind $kind -Message $message -Detail $detail -ExitCodeValue $script:ExitCode
+        }
     }
 } finally {
     Restore-Terminal
@@ -1811,7 +1886,8 @@ try {
 
 # 双击启动的场景: exit 一执行窗口就关, 所以留窗口这件事必须发生在 exit 之前
 # 开过日志就把路径回显出来, 否则窗口一关用户根本找不到那个 txt
-if (-not [string]::IsNullOrWhiteSpace($script:LogFile)) {
+# (交接给管理员窗口时本进程没干活, 别回显半截日志路径)
+if (-not $script:HandedOff -and -not [string]::IsNullOrWhiteSpace($script:LogFile)) {
     Write-Host ""
     Write-Host ("  日志文件: " + $script:LogFile) -ForegroundColor DarkGray
 }
@@ -1825,9 +1901,12 @@ if ($script:Failed -and -not [string]::IsNullOrWhiteSpace($script:CrashLogFile))
 #   失败 + 双击     -> 留(Test-ShouldPause 自动判定)
 #   失败 + 管道/CI  -> 不留(没人按键, 等了就是挂死)
 #   主动取消(Esc)   -> 不留(用户自己知道)
+#   交接给管理员窗口 -> 不留(本窗口立刻退, 只剩管理员那个窗口)
 #   -NoPause / STEAMX_NO_PAUSE=1 永远优先, 强制不留
 $stayOpen = $false
-if ($Pause -and -not $NoPause) {
+if ($script:HandedOff) {
+    $stayOpen = $false
+} elseif ($Pause -and -not $NoPause) {
     $stayOpen = $true
 } elseif ($script:Failed -and (Test-ShouldPause)) {
     $stayOpen = $true
