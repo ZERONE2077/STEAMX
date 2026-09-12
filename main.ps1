@@ -1,8 +1,11 @@
-# Keep this entry script UTF-8 without BOM for Windows PowerShell 5.1 web execution.
+# Keep this entry script ASCII-only, UTF-8 without BOM, LF endings.
+# Run.Local.lnk starts it with `powershell.exe -File`, and PowerShell 5.1 decodes a
+# BOM-less .ps1 with the system ANSI code page (936 here), so any non-ASCII byte in
+# code or comments can break parsing. Chinese UI text must go through ConvertFrom-Utf8Base64.
 [CmdletBinding()]
 param(
-    [ValidateSet("Menu", "Check", "EnableUnlockMode", "AddGame", "DeployOst", "SetManifestSource", "UninstallOst", "UninstallOstAndLua")]
-    [string]$Command = "Menu",
+    [ValidateSet("Start", "Check", "EnableUnlockMode", "AddGame", "DeployOst", "SetManifestSource", "UninstallOst", "UninstallOstAndLua")]
+    [string]$Command = "Start",
     [string]$ManifestSource,
     [string]$ConfigPath = "",
     [string]$AppId = "",
@@ -12,6 +15,7 @@ param(
     [string]$CredentialPath = "",
     [switch]$ResetApiKey,
     [string]$LuaPath = "",
+    [string]$DepotCachePath = "",
     [string]$OutputName = "",
     [int]$TimeoutSeconds = 0
 )
@@ -22,7 +26,6 @@ $utf8Encoding = New-Object System.Text.UTF8Encoding $false
 [Console]::InputEncoding = $utf8Encoding
 [Console]::OutputEncoding = $utf8Encoding
 $OutputEncoding = $utf8Encoding
-Clear-Host
 $script:OstReleaseCache = @{}
 $script:SteamPathCache = ""
 $script:NetworkRegionCache = ""
@@ -56,13 +59,33 @@ function Read-UiInput {
     return Read-Host $Prompt
 }
 
-function Test-UiInteractive {
+function Test-LauncherSession {
+    # True when the script was started as a file (shortcut / double click), where the
+    # console window disappears the moment the script ends.
     try {
-        if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) { return $false }
-        $null = $host.UI.RawUI.WindowSize
-        return $true
+        foreach ($argument in [Environment]::GetCommandLineArgs()) {
+            if ($argument -ieq "-File" -or $argument -ieq "/File") { return $true }
+        }
     } catch {
-        return $false
+    }
+    return $false
+}
+
+function Wait-LauncherExit {
+    if (-not (Test-LauncherSession)) { return }
+    try {
+        # Redirected stdin can never answer Read-Host, so do not block on it.
+        if ([Console]::IsInputRedirected) {
+            Start-Sleep -Seconds 5
+            return
+        }
+    } catch {
+    }
+    try {
+        Write-UiLine
+        [void](Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJ5Zue6L2m6ZSu5YWz6Zet56qX5Y+j"))
+    } catch {
+        Start-Sleep -Seconds 5
     }
 }
 
@@ -89,230 +112,41 @@ function Get-UiWidth {
     return [Math]::Max(24, [Math]::Min(96, $width - 1))
 }
 
-function Get-UiCharacterWidth {
-    param([Parameter(Mandatory = $true)][char]$Character)
-
-    $category = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($Character)
-    if ($category -in @(
-            [Globalization.UnicodeCategory]::NonSpacingMark,
-            [Globalization.UnicodeCategory]::EnclosingMark,
-            [Globalization.UnicodeCategory]::Format,
-            [Globalization.UnicodeCategory]::Control
-        )) {
-        return 0
-    }
-
-    $codePoint = [int]$Character
-    if (($codePoint -ge 0x1100 -and $codePoint -le 0x115F) -or
-        ($codePoint -ge 0x2329 -and $codePoint -le 0x232A) -or
-        ($codePoint -ge 0x2E80 -and $codePoint -le 0xA4CF) -or
-        ($codePoint -ge 0xAC00 -and $codePoint -le 0xD7A3) -or
-        ($codePoint -ge 0xF900 -and $codePoint -le 0xFAFF) -or
-        ($codePoint -ge 0xFE10 -and $codePoint -le 0xFE19) -or
-        ($codePoint -ge 0xFE30 -and $codePoint -le 0xFE6F) -or
-        ($codePoint -ge 0xFF00 -and $codePoint -le 0xFF60) -or
-        ($codePoint -ge 0xFFE0 -and $codePoint -le 0xFFE6)) {
-        return 2
-    }
-
-    return 1
+$script:UiLogLevelStyle = @{
+    DEBUG   = @{ Tag = "DEBUG"; Ansi = "90" }
+    INFO    = @{ Tag = "INFO";  Ansi = "36" }
+    SUCCESS = @{ Tag = "OK";    Ansi = "32" }
+    WARN    = @{ Tag = "WARN";  Ansi = "33" }
+    ERROR   = @{ Tag = "ERROR"; Ansi = "31" }
 }
+$script:UiLogTagWidth = 5
+$script:UiLogScopeWidth = 8
 
-function Get-UiTextWidth {
-    param([AllowEmptyString()][string]$Text)
-
-    if ([string]::IsNullOrEmpty($Text)) { return 0 }
-    $width = 0
-    foreach ($character in $Text.ToCharArray()) {
-        $width += Get-UiCharacterWidth -Character $character
-    }
-    return $width
-}
-
-function Limit-UiText {
-    param(
-        [AllowEmptyString()][string]$Text,
-        [int]$Width = (Get-UiWidth)
-    )
-
-    if ($null -eq $Text) { return "" }
-    if ((Get-UiTextWidth -Text $Text) -le $Width) { return $Text }
-    if ($Width -le 3) { return "." * [Math]::Max(0, $Width) }
-
-    $builder = New-Object System.Text.StringBuilder
-    $usedWidth = 0
-    $contentWidth = $Width - 3
-    foreach ($character in $Text.ToCharArray()) {
-        $characterWidth = Get-UiCharacterWidth -Character $character
-        if (($usedWidth + $characterWidth) -gt $contentWidth) { break }
-        [void]$builder.Append($character)
-        $usedWidth += $characterWidth
-    }
-    return $builder.ToString() + "..."
-}
-
-function Pad-UiText {
-    param(
-        [AllowEmptyString()][string]$Text,
-        [int]$Width = (Get-UiWidth)
-    )
-
-    if ($null -eq $Text) { $Text = "" }
-    $padding = [Math]::Max(0, $Width - (Get-UiTextWidth -Text $Text))
-    return $Text + (" " * $padding)
-}
-
-function Write-UiRule {
-    param(
-        [string]$Title = "",
-        [System.ConsoleColor]$ForegroundColor = [System.ConsoleColor]::DarkGray
-    )
-
-    $width = Get-UiWidth
-    if ([string]::IsNullOrWhiteSpace($Title)) {
-        Write-UiLine -Text ("-" * $width) -ForegroundColor $ForegroundColor
-        return
-    }
-
-    $prefix = "-- {0} " -f $Title
-    $suffixLength = [Math]::Max(0, $width - $prefix.Length)
-    Write-UiLine -Text (Limit-UiText -Text ($prefix + ("-" * $suffixLength)) -Width $width) -ForegroundColor $ForegroundColor
-}
-
-function Write-UiField {
-    param(
-        [Parameter(Mandatory = $true)][string]$Label,
-        [AllowEmptyString()][string]$Value = "",
-        [System.ConsoleColor]$ValueColor = [System.ConsoleColor]::Gray
-    )
-
-    $labelWidth = 16
-    $prefix = "  {0,-$labelWidth}" -f $Label
-    $available = [Math]::Max(8, (Get-UiWidth) - $prefix.Length)
-    if ($env:NO_COLOR) {
-        Write-Host ($prefix + (Limit-UiText -Text $Value -Width $available))
-        return
-    }
-    Write-Host $prefix -NoNewline -ForegroundColor DarkGray
-    Write-Host (Limit-UiText -Text $Value -Width $available) -ForegroundColor $ValueColor
-}
-
-function Write-UiNotice {
+function Write-UiLog {
     param(
         [Parameter(Mandatory = $true)][string]$Message,
-        [ValidateSet("INFO", "SUCCESS", "WARN", "ERROR")][string]$Level = "INFO"
+        [ValidateSet("DEBUG", "INFO", "SUCCESS", "WARN", "ERROR")][string]$Level = "INFO",
+        [string]$Scope = "steamx"
     )
 
-    $style = @{
-        INFO    = @{ Prefix = "[i]"; Color = [System.ConsoleColor]::Cyan }
-        SUCCESS = @{ Prefix = "[+]"; Color = [System.ConsoleColor]::Green }
-        WARN    = @{ Prefix = "[!]"; Color = [System.ConsoleColor]::Yellow }
-        ERROR   = @{ Prefix = "[x]"; Color = [System.ConsoleColor]::Red }
-    }[$Level]
-    Write-UiLine -Text ("  {0} {1}" -f $style.Prefix, $Message) -ForegroundColor $style.Color
-}
+    $style = $script:UiLogLevelStyle[$Level]
+    $timestamp = (Get-Date).ToString("HH:mm:ss")
+    $tag = $style.Tag.PadRight($script:UiLogTagWidth)
+    $scopeText = $Scope.PadRight($script:UiLogScopeWidth)
 
-function Wait-UiContinue {
-    Write-UiLine
-    [void](Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJIEVudGVyIOi/lOWbnuiPnOWNlQ=="))
-}
-
-function Read-UiMenu {
-    param(
-        [Parameter(Mandatory = $true)][array]$Items,
-        [string]$Title = "Actions"
-    )
-
-    Write-UiRule -Title $Title
-
-    if (-not (Test-UiInteractive)) {
-        foreach ($item in $Items) {
-            $color = if ($item.Enabled) { [System.ConsoleColor]::White } else { [System.ConsoleColor]::DarkGray }
-            Write-UiLine -Text ("  {0}. {1}" -f $item.Shortcut, $item.Label) -ForegroundColor $color
-        }
-        Write-UiLine
-        $choice = Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "6K+36YCJ5oup")
-        if ([string]::IsNullOrWhiteSpace($choice)) { return "0" }
-        $match = @($Items | Where-Object { $_.Enabled -and ([string]$_.Shortcut -eq $choice) } | Select-Object -First 1)
-        if ($match.Count -gt 0) { return [string]$match[0].Value }
-        return ""
+    if (-not (Test-UiVirtualTerminal)) {
+        Write-UiLine -Text ("{0} {1} {2} {3}" -f $timestamp, $tag, $scopeText, $Message)
+        return
     }
 
-    $enabledIndexes = @()
-    for ($i = 0; $i -lt $Items.Count; $i++) {
-        if ([bool]$Items[$i].Enabled) { $enabledIndexes += $i }
+    $esc = [string][char]27
+    $line = "{0}[90m{1} {0}[{2}m{3}{0}[37m {4} {0}[0m" -f $esc, $timestamp, $style.Ansi, $tag, $scopeText
+    if ($Level -in @("WARN", "ERROR")) {
+        $line += "{0}[{1}m{2}{0}[0m" -f $esc, $style.Ansi, $Message
+    } else {
+        $line += $Message
     }
-    if ($enabledIndexes.Count -eq 0) { return "" }
-
-    $selectedPosition = 0
-    $width = Get-UiWidth
-    $lineCount = $Items.Count + 1
-    $hasRendered = $false
-    try {
-        $menuTop = [Console]::CursorTop
-    } catch {
-        $menuTop = $host.UI.RawUI.CursorPosition.Y
-    }
-
-    while ($true) {
-        if ($hasRendered) {
-            try {
-                [Console]::SetCursorPosition(0, $menuTop)
-            } catch {
-                $host.UI.RawUI.CursorPosition = New-Object System.Management.Automation.Host.Coordinates 0, $menuTop
-            }
-        }
-
-        for ($i = 0; $i -lt $Items.Count; $i++) {
-            $item = $Items[$i]
-            $isSelected = ($i -eq $enabledIndexes[$selectedPosition])
-            $marker = if ($isSelected) { ">" } else { " " }
-            $line = "  {0} {1}. {2}" -f $marker, $item.Shortcut, $item.Label
-            $line = Limit-UiText -Text $line -Width $width
-            $line = Pad-UiText -Text $line -Width $width
-            $color = if (-not $item.Enabled) {
-                [System.ConsoleColor]::DarkGray
-            } elseif ($isSelected) {
-                [System.ConsoleColor]::Cyan
-            } else {
-                [System.ConsoleColor]::White
-            }
-            Write-UiLine -Text $line -ForegroundColor $color
-        }
-        $hint = Limit-UiText -Text "  Up/Down select   Enter confirm   Number shortcut   Esc back" -Width $width
-        $hint = Pad-UiText -Text $hint -Width $width
-        Write-UiLine -Text $hint -ForegroundColor DarkGray
-
-        if (-not $hasRendered) {
-            try {
-                $menuTop = [Math]::Max(0, [Console]::CursorTop - $lineCount)
-            } catch {
-            }
-        }
-        $hasRendered = $true
-
-        $key = [Console]::ReadKey($true)
-        if ($key.Key -eq [ConsoleKey]::UpArrow) {
-            $selectedPosition = ($selectedPosition - 1 + $enabledIndexes.Count) % $enabledIndexes.Count
-            continue
-        }
-        if ($key.Key -eq [ConsoleKey]::DownArrow) {
-            $selectedPosition = ($selectedPosition + 1) % $enabledIndexes.Count
-            continue
-        }
-        if ($key.Key -eq [ConsoleKey]::Enter) {
-            return [string]$Items[$enabledIndexes[$selectedPosition]].Value
-        }
-        if ($key.Key -eq [ConsoleKey]::Escape) {
-            return "0"
-        }
-
-        $shortcut = [string]$key.KeyChar
-        $match = @($Items | Where-Object { $_.Enabled -and ([string]$_.Shortcut -eq $shortcut) } | Select-Object -First 1)
-        if ($match.Count -gt 0) {
-            return [string]$match[0].Value
-        }
-    }
+    Write-UiLine -Text $line
 }
 
 function Get-ScriptRoot {
@@ -415,7 +249,10 @@ function New-DefaultConfig {
     return [pscustomobject]@{
         steamPath  = ""
         network    = [pscustomobject]@{
-            timeoutSeconds = 30
+            timeoutSeconds       = 30
+            # Hubcap builds a manifest archive on first request; response headers can take
+            # over a minute, so this needs its own (much larger) budget.
+            hubcapTimeoutSeconds = 180
         }
         manifest   = [pscustomobject]@{
             source = "wudrm"
@@ -479,13 +316,14 @@ function New-RunContext {
 function Write-Log {
     param(
         [Parameter(Mandatory = $true)][string]$Message,
-        [ValidateSet("INFO", "SUCCESS", "WARN", "ERROR")][string]$Level = "INFO",
+        [ValidateSet("DEBUG", "INFO", "SUCCESS", "WARN", "ERROR")][string]$Level = "INFO",
+        [string]$Scope = "steamx",
         [string]$LogFile = ""
     )
 
-    $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-    Write-UiNotice -Message $Message -Level $Level
+    Write-UiLog -Message $Message -Level $Level -Scope $Scope
     if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+        $line = "{0} [{1}] {2} {3}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Scope, $Message
         Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
     }
 }
@@ -835,7 +673,7 @@ function Get-HubcapApiKey {
                     return (ConvertTo-PlainText -SecureValue $secureApiKey).Trim()
                 }
             } catch {
-                Write-UiNotice -Message "Saved Hubcap API Key could not be decrypted. Enter a new key." -Level WARN
+                Write-UiLog -Scope "hubcap" -Level WARN -Message "saved API Key could not be decrypted; a new key is required"
             }
         }
     }
@@ -847,7 +685,7 @@ function Get-HubcapApiKey {
     }
 
     Save-HubcapApiKey -SecureApiKey $promptedApiKey -CredentialFile $CredentialFile
-    Write-UiNotice -Message ("API Key encrypted for the current Windows user: {0}" -f (Get-DisplayPath -PathValue $CredentialFile)) -Level SUCCESS
+    Write-UiLog -Scope "hubcap" -Level SUCCESS -Message ("API Key encrypted for the current Windows user -> {0}" -f (Get-DisplayPath -PathValue $CredentialFile))
     return $plainApiKey.Trim()
 }
 
@@ -882,16 +720,17 @@ function Show-HubcapApiStatus {
             ([DateTimeOffset]::Parse($expiresValue)).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz")
         }
 
-        Write-UiField -Label "Hubcap User" -Value ([string](Get-ObjectPropertyValue -Object $stats -Name "username"))
-        Write-UiField -Label "API Expires" -Value $expiresText
-        Write-UiField -Label "Daily Quota" -Value ("{0}/{1} used, {2} remaining" -f $dailyUsage, $dailyLimit, $remaining)
+        $userName = [string](Get-ObjectPropertyValue -Object $stats -Name "username")
+        Write-UiLog -Scope "hubcap" -Level INFO -Message ("{0,-10}{1}" -f "user", $userName)
+        Write-UiLog -Scope "hubcap" -Level INFO -Message ("{0,-10}{1}" -f "expires", $expiresText)
+        Write-UiLog -Scope "hubcap" -Level INFO -Message ("{0,-10}{1}" -f "quota", ("{0}/{1} used, {2} remaining" -f $dailyUsage, $dailyLimit, $remaining))
         return "Ready"
     } catch {
         if ((Get-HttpStatusCode -ErrorRecord $_) -eq 401) {
-            Write-UiNotice -Message "Hubcap API Key is invalid or expired." -Level WARN
+            Write-UiLog -Scope "hubcap" -Level WARN -Message "API Key is invalid or expired"
             return "Unauthorized"
         }
-        Write-UiNotice -Message ("Unable to query Hubcap API status: {0}" -f $_.Exception.Message) -Level WARN
+        Write-UiLog -Scope "hubcap" -Level WARN -Message ("status query failed: {0}" -f $_.Exception.Message)
         return "Unavailable"
     }
 }
@@ -902,8 +741,10 @@ function Get-HubcapLuaUrl {
         [Parameter(Mandatory = $true)][string]$ResolvedAppId
     )
 
+    # /manifest/<appid> returns a zip: <appid>.lua plus one .manifest per depot.
+    # /lua/... returns plain-text lua only, with no depot manifests.
     switch ($ResolvedVariant) {
-        "full" { return "https://hubcapmanifest.com/api/v1/lua/$ResolvedAppId" }
+        "full" { return "https://hubcapmanifest.com/api/v1/manifest/$ResolvedAppId" }
         "basegame" { return "https://hubcapmanifest.com/api/v1/lua/basegame/$ResolvedAppId" }
         "dlc" { return "https://hubcapmanifest.com/api/v1/lua/dlc/$ResolvedAppId" }
         default { throw "Unsupported Hubcap variant: $ResolvedVariant" }
@@ -924,6 +765,21 @@ function Test-ZipFile {
     }
 }
 
+function Test-HubcapTimeoutError {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $inner = $ErrorRecord.Exception
+    while ($null -ne $inner) {
+        if ($inner -is [System.Net.WebException] -and $inner.Status -eq [System.Net.WebExceptionStatus]::Timeout) {
+            return $true
+        }
+        $inner = $inner.InnerException
+    }
+    # WebException messages are localized, so the status chain above is the reliable
+    # signal; keep this text match ASCII-only as a secondary check.
+    return ([string]$ErrorRecord.Exception.Message -match '(?i)timed?\s*out|timeout')
+}
+
 function Invoke-HubcapDownloadWithProgress {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
@@ -932,47 +788,60 @@ function Invoke-HubcapDownloadWithProgress {
         [Parameter(Mandatory = $true)][int]$RequestTimeoutSeconds
     )
 
-    $request = [System.Net.HttpWebRequest]::Create($Url)
-    $request.UserAgent = [string]$Headers["User-Agent"]
-    $request.Accept = [string]$Headers["Accept"]
-    $request.Headers["Authorization"] = [string]$Headers["Authorization"]
-    $request.AllowAutoRedirect = $true
-    $request.Timeout = $RequestTimeoutSeconds * 1000
-    $request.ReadWriteTimeout = $RequestTimeoutSeconds * 1000
-    $response = $null
-    $responseStream = $null
-    $fileStream = $null
-    try {
-        $response = $request.GetResponse()
-        $totalBytes = [long]$response.ContentLength
-        $responseStream = $response.GetResponseStream()
-        $fileStream = [System.IO.File]::Open($Destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-        $buffer = New-Object byte[] 131072
-        $downloaded = 0L
-        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        while (($read = $responseStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            $fileStream.Write($buffer, 0, $read)
-            $downloaded += $read
-            $speed = $downloaded / [Math]::Max(0.001, $stopwatch.Elapsed.TotalSeconds)
-            if ($totalBytes -gt 0) {
-                $percent = [Math]::Min(100, [int](($downloaded * 100) / $totalBytes))
-                $status = "{0} / {1} | {2}/s" -f (Format-FileSize $downloaded), (Format-FileSize $totalBytes), (Format-FileSize $speed)
-                Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Status $status -PercentComplete $percent
-            } else {
-                Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Status ("{0} downloaded" -f (Format-FileSize $downloaded))
+    $maxAttempts = 2
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $request = [System.Net.HttpWebRequest]::Create($Url)
+        $request.UserAgent = [string]$Headers["User-Agent"]
+        $request.Accept = [string]$Headers["Accept"]
+        $request.Headers["Authorization"] = [string]$Headers["Authorization"]
+        $request.AllowAutoRedirect = $true
+        $request.Timeout = $RequestTimeoutSeconds * 1000
+        $request.ReadWriteTimeout = $RequestTimeoutSeconds * 1000
+        $response = $null
+        $responseStream = $null
+        $fileStream = $null
+        try {
+            $response = $request.GetResponse()
+            $totalBytes = [long]$response.ContentLength
+            $responseStream = $response.GetResponseStream()
+            $fileStream = [System.IO.File]::Open($Destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $buffer = New-Object byte[] 131072
+            $downloaded = 0L
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            while (($read = $responseStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $fileStream.Write($buffer, 0, $read)
+                $downloaded += $read
+                $speed = $downloaded / [Math]::Max(0.001, $stopwatch.Elapsed.TotalSeconds)
+                if ($totalBytes -gt 0) {
+                    $percent = [Math]::Min(100, [int](($downloaded * 100) / $totalBytes))
+                    $status = "{0} / {1} | {2}/s" -f (Format-FileSize $downloaded), (Format-FileSize $totalBytes), (Format-FileSize $speed)
+                    Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Status $status -PercentComplete $percent
+                } else {
+                    Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Status ("{0} downloaded" -f (Format-FileSize $downloaded))
+                }
             }
-        }
-        Write-UiNotice -Message ("Downloaded {0}." -f (Format-FileSize $downloaded)) -Level SUCCESS
-    } catch {
-        if ((Get-HttpStatusCode -ErrorRecord $_) -eq 401) {
-            throw "Hubcap rejected the API Key while downloading. Run the game import again to replace the saved key."
-        }
-        throw
-    } finally {
-        if ($null -ne $fileStream) { $fileStream.Dispose() }
-        if ($null -ne $responseStream) { $responseStream.Dispose() }
-        if ($null -ne $response) { $response.Dispose() }
-        Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Completed
+            Write-UiLog -Scope "hubcap" -Level SUCCESS -Message ("downloaded {0} <- {1}" -f (Format-FileSize $downloaded), ($Url -replace '^https?://[^/]+', ''))
+            return
+        } catch {
+            $statusCode = Get-HttpStatusCode -ErrorRecord $_
+            if ($statusCode -eq 401) {
+                throw "Hubcap rejected the API Key while downloading. Run the game import again to replace the saved key."
+            }
+            $retryable = ($statusCode -eq 0) -and (Test-HubcapTimeoutError -ErrorRecord $_)
+            if ((-not $retryable) -or ($attempt -ge $maxAttempts)) {
+                if ($retryable) {
+                    throw "Hubcap did not answer within $RequestTimeoutSeconds s. The server builds the manifest archive on demand; try again in a minute."
+                }
+                throw
+            }
+            Write-UiLog -Scope "hubcap" -Level WARN -Message ("no response in {0}s, retrying ({1}/{2})" -f $RequestTimeoutSeconds, ($attempt + 1), $maxAttempts)
+            Start-Sleep -Seconds 3
+        } finally {
+            if ($null -ne $fileStream) { $fileStream.Dispose() }
+            if ($null -ne $responseStream) { $responseStream.Dispose() }
+            if ($null -ne $response) { $response.Dispose() }
+            Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Completed
+    }
     }
 }
 
@@ -980,20 +849,24 @@ function Install-HubcapLuaDownload {
     param(
         [Parameter(Mandatory = $true)][string]$DownloadPath,
         [Parameter(Mandatory = $true)][string]$TargetDirectory,
-        [Parameter(Mandatory = $true)][string]$TargetFileName
+        [Parameter(Mandatory = $true)][string]$TargetFileName,
+        [AllowEmptyString()][string]$DepotCacheDirectory = ""
     )
 
     Ensure-Directory -PathValue $TargetDirectory
     if (-not (Test-ZipFile -PathValue $DownloadPath)) {
         $targetFile = Join-Path $TargetDirectory ([System.IO.Path]::GetFileName($TargetFileName))
         Copy-Item -LiteralPath $DownloadPath -Destination $targetFile -Force
-        Write-UiNotice -Message ("Installed Lua manifest: {0}" -f (Get-DisplayPath -PathValue $targetFile)) -Level SUCCESS
+        Write-UiLog -Scope "install" -Level SUCCESS -Message ("lua -> {0}" -f (Get-DisplayPath -PathValue $targetFile))
+        Write-UiLog -Scope "install" -Level WARN -Message "raw lua download carries no depot manifests"
         return
     }
 
     $extractDirectory = Join-Path (Split-Path -Parent $DownloadPath) "extract"
     Ensure-Directory -PathValue $extractDirectory
-    Expand-Archive -LiteralPath $DownloadPath -DestinationPath $extractDirectory -Force
+    # ZipFile::ExtractToDirectory works regardless of the file extension (Expand-Archive does not).
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($DownloadPath, $extractDirectory)
     $luaFiles = @(Get-ChildItem -LiteralPath $extractDirectory -Recurse -File -Filter *.lua)
     if ($luaFiles.Count -eq 0) {
         throw "The Hubcap archive did not contain any Lua files."
@@ -1001,18 +874,27 @@ function Install-HubcapLuaDownload {
     foreach ($luaFile in $luaFiles) {
         $targetFile = Join-Path $TargetDirectory $luaFile.Name
         Copy-Item -LiteralPath $luaFile.FullName -Destination $targetFile -Force
-        Write-UiNotice -Message ("Installed Lua manifest: {0}" -f (Get-DisplayPath -PathValue $targetFile)) -Level SUCCESS
+        Write-UiLog -Scope "install" -Level SUCCESS -Message ("lua -> {0}" -f (Get-DisplayPath -PathValue $targetFile))
     }
-}
 
-function Get-GameVariantLabel {
-    param([Parameter(Mandatory = $true)][ValidateSet("full", "basegame", "dlc")][string]$Variant)
+    if ([string]::IsNullOrWhiteSpace($DepotCacheDirectory)) { return }
 
-    switch ($Variant) {
-        "full" { return ConvertFrom-Utf8Base64 "5a6M5pW05YaF5a6577yI5pys5L2TICsgRExD77yJ" }
-        "basegame" { return ConvertFrom-Utf8Base64 "5LuF5pys5L2T" }
-        "dlc" { return ConvertFrom-Utf8Base64 "5LuFIERMQw==" }
+    $manifestFiles = @(Get-ChildItem -LiteralPath $extractDirectory -Recurse -File -Filter *.manifest)
+    if ($manifestFiles.Count -eq 0) {
+        Write-UiLog -Scope "install" -Level WARN -Message "archive contains no depot manifest files"
+        return
     }
+
+    Ensure-Directory -PathValue $DepotCacheDirectory
+    $copied = 0
+    $totalBytes = 0L
+    foreach ($manifestFile in $manifestFiles) {
+        $targetFile = Join-Path $DepotCacheDirectory $manifestFile.Name
+        Copy-Item -LiteralPath $manifestFile.FullName -Destination $targetFile -Force
+        $copied++
+        $totalBytes += $manifestFile.Length
+    }
+    Write-UiLog -Scope "install" -Level SUCCESS -Message ("{0} depot manifest(s), {1} -> {2}" -f $copied, (Format-FileSize -Bytes $totalBytes), (Get-DisplayPath -PathValue $DepotCacheDirectory))
 }
 
 function Invoke-AddGame {
@@ -1025,6 +907,7 @@ function Invoke-AddGame {
         [switch]$ForceApiKeyPrompt,
         [switch]$RetryInvalidCredential,
         [string]$LuaOverride = "",
+        [string]$DepotCacheOverride = "",
         [string]$RequestedOutputName = "",
         [int]$RequestTimeoutSeconds = 0
     )
@@ -1039,9 +922,14 @@ function Invoke-AddGame {
     } else {
         Resolve-LocalPath -PathValue $LuaOverride -BasePath (Get-ScriptRoot)
     }
+    $targetDepotCachePath = if ([string]::IsNullOrWhiteSpace($DepotCacheOverride)) {
+        Join-Path $steamPath "depotcache"
+    } else {
+        Resolve-LocalPath -PathValue $DepotCacheOverride -BasePath (Get-ScriptRoot)
+    }
     $networkConfig = Get-ConfigValue -Object $Config -Name "network" -DefaultValue $null
     if ($RequestTimeoutSeconds -le 0) {
-        $RequestTimeoutSeconds = [int](Get-ConfigValue -Object $networkConfig -Name "timeoutSeconds" -DefaultValue 60)
+        $RequestTimeoutSeconds = [int](Get-ConfigValue -Object $networkConfig -Name "hubcapTimeoutSeconds" -DefaultValue 180)
     }
     $credentialFile = Get-HubcapCredentialFile -CredentialOverride $CredentialOverride
     $resolvedApiKey = Get-HubcapApiKey `
@@ -1056,17 +944,16 @@ function Invoke-AddGame {
         [System.IO.Path]::GetFileName($RequestedOutputName)
     }
 
-    Write-UiRule -Title (ConvertFrom-Utf8Base64 "5ri45oiP5YWl5bqT")
-    Write-UiField -Label "AppID" -Value $resolvedAppId
-    Write-UiField -Label (ConvertFrom-Utf8Base64 "5YaF5a65") -Value (Get-GameVariantLabel -Variant $InputVariant)
-    Write-UiField -Label (ConvertFrom-Utf8Base64 "THVhIOi3r+W+hA==") -Value (Get-DisplayPath -PathValue $targetLuaPath)
+    Write-UiLog -Scope "addgame" -Level INFO -Message ("{0,-10}{1}" -f "appid", ("{0} (variant={1})" -f $resolvedAppId, $InputVariant))
+    Write-UiLog -Scope "addgame" -Level INFO -Message ("{0,-10}{1}" -f "lua", (Get-DisplayPath -PathValue $targetLuaPath))
+    Write-UiLog -Scope "addgame" -Level INFO -Message ("{0,-10}{1}" -f "depot", (Get-DisplayPath -PathValue $targetDepotCachePath))
     $apiStatus = Show-HubcapApiStatus -Headers $headers -RequestTimeoutSeconds $RequestTimeoutSeconds
     if ($apiStatus -eq "Unauthorized") {
         if (-not $RetryInvalidCredential) {
             throw "Hubcap API Key is invalid or expired. Run again with -ResetApiKey to replace it."
         }
 
-        Write-UiNotice -Message "Enter a new Hubcap API Key to replace the saved credential." -Level INFO
+        Write-UiLog -Scope "hubcap" -Level INFO -Message "entering a new API Key to replace the saved credential"
         $resolvedApiKey = Get-HubcapApiKey `
             -ConfiguredApiKey "" `
             -CredentialFile $credentialFile `
@@ -1079,9 +966,11 @@ function Invoke-AddGame {
     }
 
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("STEAMX\hubcap\{0}" -f [Guid]::NewGuid().ToString("N"))
-    $tempDownload = Join-Path $tempRoot "download.bin"
+    # Must keep the .zip extension: Windows PowerShell 5.1 Expand-Archive rejects other suffixes.
+    $tempDownload = Join-Path $tempRoot "download.zip"
     try {
         Ensure-Directory -PathValue $tempRoot
+        Write-UiLog -Scope "hubcap" -Level INFO -Message "requesting the manifest archive (the server may take up to a minute to build it)"
         Invoke-HubcapDownloadWithProgress `
             -Url $downloadUrl `
             -Destination $tempDownload `
@@ -1090,51 +979,15 @@ function Invoke-AddGame {
         Install-HubcapLuaDownload `
             -DownloadPath $tempDownload `
             -TargetDirectory $targetLuaPath `
-            -TargetFileName $outputFileName
+            -TargetFileName $outputFileName `
+            -DepotCacheDirectory $targetDepotCachePath
     } finally {
         if (Test-Path -LiteralPath $tempRoot) {
             Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-}
 
-function Select-GameContentVariant {
-    $items = @(
-        [pscustomobject]@{ Shortcut = "1"; Value = "full"; Enabled = $true; Label = (Get-GameVariantLabel -Variant "full") }
-        [pscustomobject]@{ Shortcut = "2"; Value = "basegame"; Enabled = $true; Label = (Get-GameVariantLabel -Variant "basegame") }
-        [pscustomobject]@{ Shortcut = "3"; Value = "dlc"; Enabled = $true; Label = (Get-GameVariantLabel -Variant "dlc") }
-        [pscustomobject]@{ Shortcut = "0"; Value = "0"; Enabled = $true; Label = (ConvertFrom-Utf8Base64 "6L+U5Zue") }
-    )
-    return Read-UiMenu -Items $items -Title (ConvertFrom-Utf8Base64 "5YaF5a6557G75Z6L")
-}
-
-function Invoke-InteractiveAddGame {
-    param([Parameter(Mandatory = $true)][pscustomobject]$Config)
-
-    while ($true) {
-        Write-UiLine
-        Write-UiRule -Title "Add game"
-        $gameInput = Read-UiInput -Prompt "Game AppID or Steam store URL (Q to return)"
-        if ($gameInput.Trim().ToUpperInvariant() -eq "Q") { return }
-        $selectedVariant = Select-GameContentVariant
-        if ($selectedVariant -eq "0") { return }
-
-        try {
-            Invoke-AddGame `
-                -Config $Config `
-                -InputAppId $gameInput `
-                -InputVariant $selectedVariant `
-                -ConfiguredApiKey $ApiKey `
-                -CredentialOverride $CredentialPath `
-                -ForceApiKeyPrompt:$ResetApiKey `
-                -RetryInvalidCredential `
-                -LuaOverride $LuaPath `
-                -RequestedOutputName $OutputName `
-                -RequestTimeoutSeconds $TimeoutSeconds
-        } catch {
-            Write-UiNotice -Message $_.Exception.Message -Level ERROR
-        }
-    }
+    Write-UiLog -Scope "steam" -Level INFO -Message "restart Steam to load the new lua and depot manifests"
 }
 
 function Get-SteamVersionInfo {
@@ -1263,7 +1116,7 @@ function Stop-SteamProcesses {
     $processes = @(Get-SteamRelatedProcesses)
     if ($processes.Count -eq 0) { return }
 
-    Write-Log -Message ("Steam is running; closing related processes before continuing: {0}" -f (Get-SteamRunningSummary)) -Level "INFO" -LogFile $RunContext.LogFile
+    Write-Log -Message ("Steam is running; closing related processes before continuing: {0}" -f (Get-SteamRunningSummary)) -Level "INFO" -Scope "steam" -LogFile $RunContext.LogFile
     foreach ($process in $processes) {
         try {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
@@ -1274,7 +1127,7 @@ function Stop-SteamProcesses {
     if (@(Get-SteamRelatedProcesses).Count -gt 0) {
         $taskKill = Start-Process -FilePath "cmd.exe" -ArgumentList "/c taskkill /f /im steam.exe" -WindowStyle Hidden -Wait -PassThru -ErrorAction SilentlyContinue
         if ($null -ne $taskKill -and $taskKill.ExitCode -ne 0) {
-            Write-Log -Message "Steam could not be terminated automatically. Waiting for the user to exit Steam." -Level "WARN" -LogFile $RunContext.LogFile
+            Write-Log -Message "Steam could not be terminated automatically. Waiting for the user to exit Steam." -Level "WARN" -Scope "steam" -LogFile $RunContext.LogFile
         }
     }
 
@@ -1292,12 +1145,12 @@ function Start-Steam {
 
     $steamExe = Join-Path $SteamPath "steam.exe"
     if (-not (Test-Path -LiteralPath $steamExe)) {
-        Write-Log -Message "steam.exe not found; skip restart." -Level "WARN" -LogFile $RunContext.LogFile
+        Write-Log -Message "steam.exe not found; skip restart." -Level "WARN" -Scope "steam" -LogFile $RunContext.LogFile
         return
     }
 
     Start-Process -FilePath $steamExe -WorkingDirectory $SteamPath | Out-Null
-    Write-Log -Message "Steam restarted." -LogFile $RunContext.LogFile
+    Write-Log -Message "Steam restarted." -Scope "steam" -LogFile $RunContext.LogFile
 }
 
 function Get-LatestOstReleaseInfo {
@@ -1541,14 +1394,14 @@ function Get-OstDownloadUrls {
 
     $networkRegion = Get-NetworkRegion
     if ($networkRegion -eq "CN") {
-        Write-UiNotice -Message "Network region: CN. Mirror download sources have priority." -Level INFO
+        Write-UiLog -Scope "net" -Level INFO -Message "region CN, mirror download sources have priority"
         return @(
             @($urls | Where-Object { $_ -ne $OfficialUrl })
             $OfficialUrl
         )
     }
     if (-not [string]::IsNullOrWhiteSpace($networkRegion)) {
-        Write-UiNotice -Message ("Network region: {0}. GitHub official source has priority." -f $networkRegion) -Level INFO
+        Write-UiLog -Scope "net" -Level INFO -Message ("region {0}, GitHub official source has priority" -f $networkRegion)
         return @(
             $OfficialUrl
             @($urls | Where-Object { $_ -ne $OfficialUrl })
@@ -1562,14 +1415,14 @@ function Get-OstDownloadUrls {
     )
     $reachableUrls = @($probes | Where-Object { $_.Reachable } | Sort-Object ElapsedMilliseconds | ForEach-Object { $_.Url })
     if ($reachableUrls.Count -gt 0) {
-        Write-UiNotice -Message "Network region detection unavailable. Download sources ordered by connectivity." -Level WARN
+        Write-UiLog -Scope "net" -Level WARN -Message "region detection unavailable, sources ordered by connectivity"
         return @(
             $reachableUrls
             @($urls | Where-Object { $_ -notin $reachableUrls })
         )
     }
 
-    Write-UiNotice -Message "Network region and endpoint probes were unavailable. Using configured source order." -Level WARN
+    Write-UiLog -Scope "net" -Level WARN -Message "region and endpoint probes unavailable, using configured source order"
     return $urls
 }
 
@@ -1666,18 +1519,18 @@ function Assert-OstDownloadSha256 {
         if ($downloadedSha256 -ne $ExpectedSha256.ToLowerInvariant()) {
             throw ("OST SHA-256 mismatch. Expected {0}, received {1}." -f $ExpectedSha256, $downloadedSha256)
         }
-        Write-Log -Message ("OST SHA-256 verified against GitHub release metadata: {0}" -f $downloadedSha256) -LogFile $LogFile
+        Write-Log -Message ("OST SHA-256 verified against GitHub release metadata: {0}" -f $downloadedSha256) -Scope "ost" -LogFile $LogFile
         return
     }
 
     if ($DownloadUrl -eq $OfficialUrl) {
-        Write-Log -Message ("GitHub release metadata has no SHA-256 digest; official asset SHA-256: {0}" -f $downloadedSha256) -Level "WARN" -LogFile $LogFile
+        Write-Log -Message ("GitHub release metadata has no SHA-256 digest; official asset SHA-256: {0}" -f $downloadedSha256) -Level "WARN" -Scope "ost" -LogFile $LogFile
         return
     }
 
     $officialVerificationPath = "$DownloadedPath.official"
     try {
-        Write-Log -Message "Release metadata has no SHA-256 digest; downloading the official asset for comparison." -Level "WARN" -LogFile $LogFile
+        Write-Log -Message "Release metadata has no SHA-256 digest; downloading the official asset for comparison." -Level "WARN" -Scope "ost" -LogFile $LogFile
         Invoke-DownloadFileWithProgress -Url $OfficialUrl -Destination $officialVerificationPath -TimeoutSeconds $TimeoutSeconds
         $officialSha256 = Get-FileSha256 -PathValue $officialVerificationPath
         if ([string]::IsNullOrWhiteSpace($officialSha256)) {
@@ -1686,7 +1539,7 @@ function Assert-OstDownloadSha256 {
         if ($downloadedSha256 -ne $officialSha256) {
             throw ("Mirror OST SHA-256 does not match the official asset. Mirror {0}, official {1}." -f $downloadedSha256, $officialSha256)
         }
-        Write-Log -Message ("OST SHA-256 verified against the official asset: {0}" -f $downloadedSha256) -LogFile $LogFile
+        Write-Log -Message ("OST SHA-256 verified against the official asset: {0}" -f $downloadedSha256) -Scope "ost" -LogFile $LogFile
     } finally {
         if (Test-Path -LiteralPath $officialVerificationPath) {
             Remove-Item -LiteralPath $officialVerificationPath -Force -ErrorAction SilentlyContinue
@@ -1755,7 +1608,7 @@ function Get-OstSourceDirectoryFromGitHub {
     Ensure-Directory -PathValue $cacheRoot
 
     $apiUrl = "https://api.github.com/repos/{0}/releases/latest" -f $repo
-    Write-Log -Message ("Resolving latest OST release: {0}" -f $repo) -LogFile $RunContext.LogFile
+    Write-Log -Message ("Resolving latest OST release: {0}" -f $repo) -Scope "ost" -LogFile $RunContext.LogFile
     try {
         $release = Get-LatestOstRelease -Config $Config
     } catch {
@@ -1796,7 +1649,7 @@ function Get-OstSourceDirectoryFromGitHub {
             $errors = @()
             foreach ($downloadUrl in $downloadUrls) {
                 try {
-                    Write-Log -Message ("Downloading OST asset from: {0}" -f $downloadUrl) -LogFile $RunContext.LogFile
+                    Write-Log -Message ("Downloading OST asset from: {0}" -f $downloadUrl) -Scope "ost" -LogFile $RunContext.LogFile
                     Invoke-DownloadFileWithProgress -Url $downloadUrl -Destination $partialPath -TimeoutSeconds $timeoutSeconds
                     if (-not (Test-Path -LiteralPath $partialPath -PathType Leaf) -or (Get-Item -LiteralPath $partialPath).Length -eq 0) {
                         throw "Downloaded OST asset is empty."
@@ -1815,7 +1668,7 @@ function Get-OstSourceDirectoryFromGitHub {
                     if (Test-Path -LiteralPath $partialPath) {
                         Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue
                     }
-                    Write-Log -Message ("Download candidate failed: {0}" -f $_.Exception.Message) -Level "WARN" -LogFile $RunContext.LogFile
+                    Write-Log -Message ("Download candidate failed: {0}" -f $_.Exception.Message) -Level "WARN" -Scope "ost" -LogFile $RunContext.LogFile
                 }
             }
             if (-not $downloaded) {
@@ -1960,13 +1813,11 @@ function Invoke-Check {
         $kernelState.Status = "ReadyByDate"
     }
 
-    Write-UiLine
-    Write-UiRule -Title "Environment"
-    Write-UiField -Label "Steam Path" -Value (Get-DisplayPath -PathValue $steamPath)
     $steamVersion = Get-SteamVersionInfo -SteamPath $steamPath
     $steamBuildDisplay = Format-DateStamp -DateValue $steamVersion.BuildDate
     if ([string]::IsNullOrWhiteSpace($steamBuildDisplay)) { $steamBuildDisplay = "unknown" }
-    Write-UiField -Label "Steam Build" -Value $steamBuildDisplay
+    Write-UiLog -Scope "check" -Level INFO -Message ("{0,-12}{1}" -f "steam.path", (Get-DisplayPath -PathValue $steamPath))
+    Write-UiLog -Scope "check" -Level INFO -Message ("{0,-12}{1}" -f "steam.build", $steamBuildDisplay)
     $localOstDisplay = if ([string]::IsNullOrWhiteSpace($kernelState.Version)) {
         Format-VersionWithDate -Version "" -DateValue $kernelState.FileDate
     } else {
@@ -1977,23 +1828,23 @@ function Invoke-Check {
     } else {
         Format-VersionWithDate -Version $remote.Version -DateValue $remote.PublishedDate
     }
-    $localOstColor = if ($kernelState.Status -in @("Ready", "ReadyByDate")) {
-        [System.ConsoleColor]::Green
+    $localOstLevel = if ($kernelState.Status -in @("Ready", "ReadyByDate")) {
+        "SUCCESS"
     } elseif ($kernelState.Status -eq "UpdateAvailable") {
-        [System.ConsoleColor]::Yellow
+        "WARN"
     } else {
-        [System.ConsoleColor]::Gray
+        "INFO"
     }
-    Write-UiField -Label "Local OST" -Value ("{0} ({1})" -f $localOstDisplay, $kernelState.Status) -ValueColor $localOstColor
-    Write-UiField -Label "Latest OST" -Value $latestOstDisplay
-    Write-UiField -Label "Legacy Paths" -Value $(if ($kernelState.LegacyPaths.Count -gt 0) { @($kernelState.LegacyPaths | ForEach-Object { Get-DisplayPath -PathValue $_ }) -join ", " } else { "none" })
+    Write-UiLog -Scope "check" -Level $localOstLevel -Message ("{0,-12}{1}" -f "ost.local", ("{0} ({1})" -f $localOstDisplay, $kernelState.Status))
+    Write-UiLog -Scope "check" -Level INFO -Message ("{0,-12}{1}" -f "ost.latest", $latestOstDisplay)
+    Write-UiLog -Scope "check" -Level INFO -Message ("{0,-12}{1}" -f "ost.legacy", $(if ($kernelState.LegacyPaths.Count -gt 0) { @($kernelState.LegacyPaths | ForEach-Object { Get-DisplayPath -PathValue $_ }) -join ", " } else { "none" }))
     if ($cfgState -ne "None") {
-        Write-UiField -Label "Steam.cfg" -Value $cfgState -ValueColor Yellow
+        Write-UiLog -Scope "check" -Level WARN -Message ("{0,-12}{1}" -f "steam.cfg", $cfgState)
     }
-    Write-UiField -Label "OST Config" -Value (Get-DisplayPath -PathValue (Get-OstConfigPath -Config $Config -SteamPath $steamPath))
+    Write-UiLog -Scope "check" -Level INFO -Message ("{0,-12}{1}" -f "ost.config", (Get-DisplayPath -PathValue (Get-OstConfigPath -Config $Config -SteamPath $steamPath)))
 
     if (-not $remote.Available) {
-        Write-Log -Message ("Remote OST status unavailable: {0}" -f $remote.Error) -Level "WARN" -LogFile $RunContext.LogFile
+        Write-Log -Message ("Remote OST status unavailable: {0}" -f $remote.Error) -Level "WARN" -Scope "ost" -LogFile $RunContext.LogFile
     }
 }
 
@@ -2066,7 +1917,7 @@ function Invoke-DeployOst {
                 sha256       = $steamCfgHash
             }
             $steamCfgRenamedThisRun = $true
-            Write-Log -Message "Renamed steam.cfg to steam.cfg.bak." -LogFile $RunContext.LogFile
+            Write-Log -Message "Renamed steam.cfg to steam.cfg.bak." -Scope "ost" -LogFile $RunContext.LogFile
         }
 
         foreach ($item in $stagedFiles) {
@@ -2083,7 +1934,7 @@ function Invoke-DeployOst {
                 sha256       = $installedHash
                 rollbackBackupPath = $rollbackBackup
             }
-            Write-Log -Message ("Deployed: {0}" -f $item.TargetPath) -LogFile $RunContext.LogFile
+            Write-Log -Message ("Deployed: {0}" -f $item.TargetPath) -Scope "ost" -LogFile $RunContext.LogFile
         }
 
         $tomlPath = Get-OstConfigPath -Config $Config -SteamPath $steamPath
@@ -2102,7 +1953,7 @@ function Invoke-DeployOst {
         }
 
     } catch {
-        Write-Log -Message ("Deployment failed; rolling back: {0}" -f $_.Exception.Message) -Level "ERROR" -LogFile $RunContext.LogFile
+        Write-Log -Message ("Deployment failed; rolling back: {0}" -f $_.Exception.Message) -Level "ERROR" -Scope "ost" -LogFile $RunContext.LogFile
         for ($index = $fileRecords.Count - 1; $index -ge 0; $index--) {
             $record = $fileRecords[$index]
             if (-not [string]::IsNullOrWhiteSpace([string]$record.rollbackBackupPath) -and (Test-Path -LiteralPath $record.rollbackBackupPath)) {
@@ -2137,7 +1988,7 @@ function Invoke-DeployOst {
     } else {
         ConvertFrom-Utf8Base64 "T1NUIOmDqOe9suaIkOWKn+OAgg=="
     }
-    Write-Log -Message $successMessage -Level "SUCCESS" -LogFile $RunContext.LogFile
+    Write-Log -Message $successMessage -Level "SUCCESS" -Scope "ost" -LogFile $RunContext.LogFile
 }
 
 function Invoke-SetManifestSource {
@@ -2161,7 +2012,7 @@ function Invoke-SetManifestSource {
     }
     try {
         Set-OstManifestSourceInToml -TomlPath $tomlPath -Source $Source
-        Write-Log -Message ("Manifest source set to: {0}" -f $Source) -LogFile $RunContext.LogFile
+        Write-Log -Message ("Manifest source set to: {0}" -f $Source) -Scope "ost" -LogFile $RunContext.LogFile
     } catch {
         if (-not [string]::IsNullOrWhiteSpace($backupPath) -and (Test-Path -LiteralPath $backupPath)) {
             Copy-Item -LiteralPath $backupPath -Destination $tomlPath -Force
@@ -2190,8 +2041,7 @@ function Invoke-EnableUnlockMode {
 function Confirm-DestructiveAction {
     param([Parameter(Mandatory = $true)][string]$Message)
 
-    Write-UiLine
-    Write-UiLine -Text $Message -ForegroundColor Yellow
+    Write-UiLog -Scope "steamx" -Level WARN -Message $Message
     $answer = Read-UiInput -Prompt "Press Enter to continue, or type anything else to cancel"
     return ([string]::IsNullOrWhiteSpace($answer))
 }
@@ -2243,7 +2093,7 @@ function Invoke-UninstallOst {
         "This will remove only STEAMX-managed OST files from: {0}" -f $steamPath
     }
     if (-not (Confirm-DestructiveAction -Message $message)) {
-        Write-Log -Message "Uninstall cancelled by user." -Level "WARN" -LogFile $RunContext.LogFile
+        Write-Log -Message "Uninstall cancelled by user." -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile
         return
     }
 
@@ -2257,7 +2107,7 @@ function Invoke-UninstallOst {
         $currentHash = Get-FileSha256 -PathValue $targetFile
         if ($currentHash -ne [string]$fileRecord.sha256) {
             $warnings += "Skipped externally modified file: $targetFile"
-            Write-Log -Message $warnings[-1] -Level "WARN" -LogFile $RunContext.LogFile
+            Write-Log -Message $warnings[-1] -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile
             continue
         }
 
@@ -2267,13 +2117,13 @@ function Invoke-UninstallOst {
             $originalBackup = [string]$fileRecord.backupPath
             if ([string]::IsNullOrWhiteSpace($originalBackup) -or -not (Test-Path -LiteralPath $originalBackup -PathType Leaf)) {
                 $warnings += "Original backup is missing; cannot restore: $targetFile"
-                Write-Log -Message $warnings[-1] -Level "WARN" -LogFile $RunContext.LogFile
+                Write-Log -Message $warnings[-1] -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile
             } else {
                 Copy-Item -LiteralPath $originalBackup -Destination $targetFile -Force
-                Write-Log -Message ("Restored original file: {0}" -f $targetFile) -LogFile $RunContext.LogFile
+                Write-Log -Message ("Restored original file: {0}" -f $targetFile) -Scope "uninstall" -LogFile $RunContext.LogFile
             }
         } else {
-            Write-Log -Message ("Removed: {0}" -f $targetFile) -LogFile $RunContext.LogFile
+            Write-Log -Message ("Removed: {0}" -f $targetFile) -Scope "uninstall" -LogFile $RunContext.LogFile
         }
     }
 
@@ -2298,90 +2148,102 @@ function Invoke-UninstallOst {
             foreach ($item in @(Get-ChildItem -LiteralPath $luaPath -Force -ErrorAction SilentlyContinue)) {
                 Remove-Item -LiteralPath $item.FullName -Recurse -Force
             }
-            Write-Log -Message ("Cleared Lua manifests: {0}" -f $luaPath) -LogFile $RunContext.LogFile
+            Write-Log -Message ("Cleared Lua manifests: {0}" -f $luaPath) -Scope "uninstall" -LogFile $RunContext.LogFile
         }
     }
 
     if ($warnings.Count -eq 0) {
         if ($RemoveLua) {
-            Write-Log -Message ("Lua backup retained at: {0}" -f (Join-Path $RunContext.BackupDir "lua")) -Level "WARN" -LogFile $RunContext.LogFile
+            Write-Log -Message ("Lua backup retained at: {0}" -f (Join-Path $RunContext.BackupDir "lua")) -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile
         } elseif (Test-Path -LiteralPath $RunContext.TransactionDir) {
             Remove-Item -LiteralPath $RunContext.TransactionDir -Recurse -Force -ErrorAction SilentlyContinue
         }
-        Write-Log -Message "Uninstall completed." -LogFile $RunContext.LogFile
+        Write-Log -Message "Uninstall completed." -Scope "uninstall" -LogFile $RunContext.LogFile
     } else {
-        Write-Log -Message ("Uninstall completed with warnings. {0}" -f ($warnings -join " | ")) -Level "WARN" -LogFile $RunContext.LogFile
+        Write-Log -Message ("Uninstall completed with warnings. {0}" -f ($warnings -join " | ")) -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile
     }
 }
 
-function Invoke-Menu {
+function Invoke-QuickStart {
     param([pscustomobject]$Config)
-
-    $mainMenuItems = @(
-        [pscustomobject]@{ Shortcut = "1"; Value = "1"; Enabled = $true;  Label = ((ConvertFrom-Utf8Base64 "MS4g5byA5ZCvIC8g5pu05paw6Kej6ZSB5qih5byP") -replace '^\d+\.\s*', '') }
-        [pscustomobject]@{ Shortcut = "2"; Value = "2"; Enabled = $true;  Label = ((ConvertFrom-Utf8Base64 "Mi4g546v5aKD5qOA5rWL5LiO5L+u5aSN") -replace '^\d+\.\s*', '') }
-        [pscustomobject]@{ Shortcut = "3"; Value = "3"; Enabled = $true;  Label = (ConvertFrom-Utf8Base64 "5ri45oiP5YWl5bqT") }
-        [pscustomobject]@{ Shortcut = "4"; Value = "4"; Enabled = $false; Label = ((ConvertFrom-Utf8Base64 "NC4g57O757uf5LyY5YyW77yI5byA5Y+R5Lit77yJ") -replace '^\d+\.\s*', '') }
-        [pscustomobject]@{ Shortcut = "5"; Value = "5"; Enabled = $true;  Label = ((ConvertFrom-Utf8Base64 "NS4g5Y246L29") -replace '^\d+\.\s*', '') }
-        [pscustomobject]@{ Shortcut = "6"; Value = "6"; Enabled = $false; Label = ((ConvertFrom-Utf8Base64 "Ni4g6LWe6LWP77yI5byA5Y+R5Lit77yJ") -replace '^\d+\.\s*', '') }
-        [pscustomobject]@{ Shortcut = "0"; Value = "0"; Enabled = $true;  Label = ((ConvertFrom-Utf8Base64 "MC4g6YCA5Ye6") -replace '^\d+\.\s*', '') }
-    )
-    $uninstallMenuItems = @(
-        [pscustomobject]@{ Shortcut = "1"; Value = "1"; Enabled = $true; Label = ((ConvertFrom-Utf8Base64 "MS4g5LuF5Y246L29IE9TVA==") -replace '^\d+\.\s*', '') }
-        [pscustomobject]@{ Shortcut = "2"; Value = "2"; Enabled = $true; Label = ((ConvertFrom-Utf8Base64 "Mi4g5Y246L29IE9TVCDlubbmuIXnkIbmuLjmiI/muIXljZU=") -replace '^\d+\.\s*', '') }
-        [pscustomobject]@{ Shortcut = "0"; Value = "0"; Enabled = $true; Label = ((ConvertFrom-Utf8Base64 "MC4g6L+U5Zue") -replace '^\d+\.\s*', '') }
-    )
 
     Clear-Host
     Write-SteampXLogo
-    $initialContext = New-RunContext -Config $Config
-    try {
-        Invoke-Check -Config $Config -RunContext $initialContext
-    } catch {
-        Write-UiNotice -Message ("Environment check failed: {0}" -f $_.Exception.Message) -Level WARN
+
+    $steamPath = Get-SteamPath -Config $Config
+    $kernelState = Get-OstKernelState -Config $Config -SteamPath $steamPath
+    if (-not $kernelState.IsReady) {
+        Write-UiLine
+        Write-UiLog -Scope "ost" -Message (ConvertFrom-Utf8Base64 "5pyq5qOA5rWL5Yiw6Kej6ZSB5YaF5qC477yM5q2j5Zyo6Ieq5Yqo6YOo572yIE9TVOKApg==") -Level WARN
+        $runContext = New-RunContext -Config $Config
+        Invoke-DeployOst -Config $Config -RunContext $runContext
+        Write-UiLog -Scope "ost" -Message (ConvertFrom-Utf8Base64 "T1NUIOmDqOe9suWujOaIkO+8jOaOpeS4i+adpei+k+WFpea4uOaIjyBBcHBJRCDljbPlj6/lhaXlupPjgII=") -Level SUCCESS
     }
 
     while ($true) {
         Write-UiLine
-        $choice = Read-UiMenu -Items $mainMenuItems -Title "Actions"
-        $runContext = New-RunContext -Config $Config
+        $rawInput = [string](Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "6K+36L6T5YWl5ri45oiPIEFwcElEIOaIliBTdGVhbSDllYblupfpk77mjqXvvIgxIOmDqOe9su+8jDAg5Y246L2977yMaCDluK7liqnvvIzlm57ovabpgIDlh7rvvIk="))
+        $value = $rawInput.Trim()
+        if ([string]::IsNullOrWhiteSpace($value)) { return }
+        if ($value -match '^(?i)(q|quit|exit)$') { return }
 
-        if ($choice -eq "1") {
+        if ($value -match '^(?i)(h|help|\?)$') {
             Write-UiLine
-            Write-UiRule -Title "Unlock mode"
-            Write-UiNotice -Message (ConvertFrom-Utf8Base64 "U1RFQU1YIOWwhuS4i+i9veW5tuagoemqjCBPU1TjgIHlhbPpl60gU3RlYW3jgIHlpIfku73lubbpg6jnvbLmlofku7bvvIzlrozmiJDlkI7lj6rlkK/liqjkuIDmrKEgU3RlYW3jgII=") -Level WARN
-            $answer = Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJIEVudGVyIOe7p+e7re+8jOi+k+WFpeWFtuS7luWGheWuueWPlua2iA==")
-            if ([string]::IsNullOrWhiteSpace($answer)) {
-                Invoke-EnableUnlockMode -Config $Config -RunContext $runContext
-            } else {
-                Write-UiNotice -Message (ConvertFrom-Utf8Base64 "5pON5L2c5bey5Y+W5raI44CC") -Level WARN
-            }
-            Wait-UiContinue
-        } elseif ($choice -eq "2") {
-            Invoke-Check -Config $Config -RunContext $runContext
-            Wait-UiContinue
-        } elseif ($choice -eq "3") {
-            Invoke-InteractiveAddGame -Config $Config
-        } elseif ($choice -eq "5") {
+            Write-UiLine -Text (ConvertFrom-Utf8Base64 "5Y+v55So5ZG95Luk")
             Write-UiLine
-            $uninstallChoice = Read-UiMenu -Items $uninstallMenuItems -Title "Uninstall"
-            if ($uninstallChoice -eq "1") {
-                Invoke-UninstallOst -Config $Config -RunContext $runContext
-            } elseif ($uninstallChoice -eq "2") {
-                Invoke-UninstallOst -Config $Config -RunContext $runContext -RemoveLua
-            }
-            if ($uninstallChoice -ne "0") {
-                Wait-UiContinue
-            }
-        } elseif ($choice -eq "0") {
-            return
-        } else {
-            Write-UiNotice -Message (ConvertFrom-Utf8Base64 "5peg5pWI6YCJ5oup44CC") -Level WARN
-            Start-Sleep -Seconds 1
+            Write-UiLine -Text (ConvertFrom-Utf8Base64 "PEFwcElEIOaIliBTdGVhbSDpk77mjqU+ICAg5ri45oiP5YWl5bqT")
+            Write-UiLine -Text (ConvertFrom-Utf8Base64 "MSAgICDpg6jnvbIgLyDph43mlrDpg6jnvbIgT1NU")
+            Write-UiLine -Text (ConvertFrom-Utf8Base64 "MCAgICDljbjovb0gT1NU77yIMSDku4UgT1NUIC8gMiDov57muIXljZXvvIk=")
+            Write-UiLine -Text (ConvertFrom-Utf8Base64 "aCAgICDmmL7npLrmnKzluK7liqk=")
+            Write-UiLine -Text (ConvertFrom-Utf8Base64 "cSAvIOWbnui9piAgICDpgIDlh7o=")
+            continue
         }
 
-        Clear-Host
-        Write-SteampXLogo
+        if ($value -eq "1") {
+            $runContext = New-RunContext -Config $Config
+            Write-UiLog -Scope "ost" -Level INFO -Message (ConvertFrom-Utf8Base64 "5q2j5Zyo6YOo572yIE9TVCDnjq/looPigKY=")
+            try {
+                Invoke-DeployOst -Config $Config -RunContext $runContext
+            } catch {
+                Write-UiLog -Scope "steamx" -Level ERROR -Message $_.Exception.Message
+            }
+            continue
+        }
+
+        if ($value -match '^(?i)(0|u|uninstall)$') {
+            $uninstallChoice = [string](Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "6L6T5YWlIDEg5LuF5Y246L29IE9TVO+8m+i+k+WFpSAyIOWNuOi9vSBPU1Qg5bm25riF55CG5ri45oiP5riF5Y2V77yb5Zue6L2m5Y+W5raI"))
+            $runContext = New-RunContext -Config $Config
+            if ($uninstallChoice.Trim() -eq "1") {
+                Invoke-UninstallOst -Config $Config -RunContext $runContext
+            } elseif ($uninstallChoice.Trim() -eq "2") {
+                Invoke-UninstallOst -Config $Config -RunContext $runContext -RemoveLua
+            } else {
+                Write-UiLog -Scope "steamx" -Message (ConvertFrom-Utf8Base64 "5bey5Y+W5raI44CC") -Level WARN
+            }
+            continue
+        }
+
+        # Single digits other than 0/1 are reserved command slots, not AppIDs.
+        if ($value -match '^\d$') {
+            Write-UiLog -Scope "steamx" -Level WARN -Message (ConvertFrom-Utf8Base64 "5peg5pWI6L6T5YWl44CC5Y+v6L6T5YWlIEFwcElEIC8gU3RlYW0g6ZO+5o6l77yM5oiWIDHjgIEw44CBaOOAgXE=")
+            continue
+        }
+
+        try {
+            Invoke-AddGame `
+                -Config $Config `
+                -InputAppId $value `
+                -InputVariant "full" `
+                -ConfiguredApiKey $ApiKey `
+                -CredentialOverride $CredentialPath `
+                -ForceApiKeyPrompt:$ResetApiKey `
+                -RetryInvalidCredential `
+                -LuaOverride $LuaPath `
+                -DepotCacheOverride $DepotCachePath `
+                -RequestTimeoutSeconds $TimeoutSeconds
+        } catch {
+            Write-UiLog -Scope "steamx" -Message $_.Exception.Message -Level ERROR
+        }
     }
 }
 
@@ -2391,7 +2253,7 @@ if ($MyInvocation.InvocationName -ne ".") {
         $runContext = New-RunContext -Config $config
 
         switch ($Command) {
-            "Menu" { Invoke-Menu -Config $config }
+            "Start" { Invoke-QuickStart -Config $config }
             "Check" { Invoke-Check -Config $config -RunContext $runContext }
             "DeployOst" { Invoke-DeployOst -Config $config -RunContext $runContext }
             "EnableUnlockMode" { Invoke-EnableUnlockMode -Config $config -RunContext $runContext }
@@ -2404,6 +2266,7 @@ if ($MyInvocation.InvocationName -ne ".") {
                     -CredentialOverride $CredentialPath `
                     -ForceApiKeyPrompt:$ResetApiKey `
                     -LuaOverride $LuaPath `
+                    -DepotCacheOverride $DepotCachePath `
                     -RequestedOutputName $OutputName `
                     -RequestTimeoutSeconds $TimeoutSeconds
             }
@@ -2413,7 +2276,8 @@ if ($MyInvocation.InvocationName -ne ".") {
         }
 
     } catch {
-        Write-UiLine -Text ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
+        Write-UiLog -Scope "steamx" -Level ERROR -Message $_.Exception.Message
+        Wait-LauncherExit
         exit 1
     }
 }
