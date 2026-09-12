@@ -310,13 +310,27 @@ function Get-CharWidth {
     return 1
 }
 
+# 2 列宽的码点区间(与 Get-CharWidth 一一对应):
+# 单个正则扫描比逐字符调 PowerShell 函数快两个数量级, 菜单每帧要量几十行的宽度
+$script:WideCharPattern = "[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6]"
+
 function Get-DisplayWidth {
     param([AllowEmptyString()][string]$Text)
 
     if ([string]::IsNullOrEmpty($Text)) { return 0 }
-    $width = 0
-    foreach ($ch in $Text.ToCharArray()) { $width += (Get-CharWidth -Ch $ch) }
-    return $width
+    return ($Text.Length + [regex]::Matches($Text, $script:WideCharPattern).Count)
+}
+
+# 按显示宽度右侧补空格(直接 PadRight 会把中文行算短, 表格立刻歪)
+function Add-DisplayPadding {
+    param(
+        [AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][int]$Width
+    )
+
+    $pad = $Width - (Get-DisplayWidth -Text $Text)
+    if ($pad -le 0) { return $Text }
+    return ($Text + (" " * $pad))
 }
 
 # 按显示宽度截断, 超出部分用 … 收尾
@@ -431,6 +445,30 @@ function New-GameLabel {
     return ($display + $suffix)
 }
 
+# 拆列: 名字 / [AppID] / 体积数字 / 体积单位 分开返回, 菜单靠它对齐成表格
+function Get-GameLabelParts {
+    param([Parameter(Mandatory = $true)]$Item)
+
+    $name = [string]$Item.DisplayName
+    $appId = [string]$Item.AppId
+    $size = Format-Size -Bytes ([long]$Item.Size)
+
+    $num = $size
+    $unit = ""
+    $split = $size.LastIndexOf(" ")
+    if ($split -gt 0) {
+        $num = $size.Substring(0, $split)
+        $unit = $size.Substring($split + 1)
+    }
+
+    # 名字还没补上时 DisplayName 就是 AppID, 不重复显示两次
+    $id = ""
+    if (-not [string]::IsNullOrWhiteSpace($appId) -and $appId -ne $name) { $id = "[{0}]" -f $appId }
+
+    return [pscustomobject]@{ Name = $name; AppId = $id; SizeNum = $num; SizeUnit = $unit }
+}
+
+
 # ================================================================ 交互: 菜单 / 确认
 
 # 序号模式: 有交互能力时的兜底, 也是非交互终端(重定向/无控制台)的唯一可用模式
@@ -463,104 +501,243 @@ function Read-MenuByNumber {
     }
 }
 
-# 方向键模式: 原地重绘, 每帧写满 consoleWidth-1 防折行, 并清掉上一帧多出的行
+# ---------------------------------------------------------------- 菜单渲染
+# 一帧一次写: 定位到帧顶 -> 整帧(含 ANSI)单次写出。
+# 旧实现逐行 Write-Host = 每行一次刷新, 方向键连按时整屏逐行撕裂, 也就是"闪屏"。
+# 同时把每项的列内容预先算好, 每帧只做拼接(逐帧逐字符量宽度会拖慢手感)。
+
+$script:MenuStyles = @{
+    Rule    = "90"     # 亮黑: 分隔线 / 次要信息
+    Head    = "1"      # 加粗: 标题行
+    Item    = ""       # 跟随终端默认前景色(亮底/暗底都不会看不清)
+    ItemSel = "7"      # 反显: 选中项整行高亮条
+    Foot    = "90"     # 亮黑: 快捷键
+}
+
+# 往帧缓冲里追加一行: 按样式包 ANSI + 补齐到 Cols 列。
+# 补位放在 SGR 内部, 选中条才能铺满整行; 补到 Cols(<=控制台宽-1) 而不是宽,
+# 是为了不让光标停进最后一列(待换行态, 下一个字符就换行 -> 整屏上滚)
+# -Exact 表示调用方已保证文本正好 Cols 宽(表格行), 跳过量宽/截断/补位
+function Add-MenuRowText {
+    param(
+        [Parameter(Mandatory = $true)][System.Text.StringBuilder]$Builder,
+        [AllowEmptyString()][string]$Text = "",
+        [string]$Style = "Item",
+        [Parameter(Mandatory = $true)][int]$Cols,
+        [switch]$Exact
+    )
+
+    if ($Builder.Length -gt 0) { [void]$Builder.Append("`n") }
+
+    $code = ""
+    if ($script:Caps.Ansi) { $code = [string]$script:MenuStyles[$Style] }
+    $close = $false
+    if (-not [string]::IsNullOrEmpty($code)) {
+        $esc = [char]27
+        [void]$Builder.Append("${esc}[${code}m")
+        $close = $true
+    }
+
+    if ($Exact) {
+        [void]$Builder.Append($Text)
+    } else {
+        if ((Get-DisplayWidth -Text $Text) -gt $Cols) {
+            $Text = Limit-DisplayWidth -Text $Text -MaxWidth $Cols
+        }
+        [void]$Builder.Append($Text)
+        $pad = $Cols - (Get-DisplayWidth -Text $Text)
+        if ($pad -gt 0) { [void]$Builder.Append(" " * $pad) }
+    }
+
+    if ($close) { [void]$Builder.Append("${esc}[0m") }
+}
+
+# 拼一整帧(不含换行结尾)
+function New-MenuFrame {
+    param(
+        [Parameter(Mandatory = $true)][array]$Rows,
+        [Parameter(Mandatory = $true)][int]$Cols
+    )
+
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($row in $Rows) {
+        Add-MenuRowText -Builder $builder -Text ([string]$row.Text) -Style ([string]$row.Style) -Cols $Cols
+    }
+    return $builder.ToString()
+}
+
+# 定位 + 整帧单次写出: 一次 SetCursorPosition + 一次 Write, 中间没有任何刷新
+function Write-MenuFrameText {
+    param(
+        [Parameter(Mandatory = $true)][string]$Text,
+        [Parameter(Mandatory = $true)][int]$Top
+    )
+
+    # 定位一次 + 整帧一次写出: 中间不发生任何刷新, 所以看不到逐行撕裂
+    try {
+        [Console]::SetCursorPosition(0, $Top)
+    } catch {
+        # 拿不到定位能力(无控制台/重定向): 退化为顺序输出, 至少让人看得到菜单
+        [Console]::Out.WriteLine($Text)
+        return
+    }
+
+    # 2026 = 同步输出(Windows Terminal 1.18+): 前后包住整帧做成原子刷新;
+    # 拼在同一个字符串里是为了让"每帧一次写"真正成立(不支持的终端会忽略这两个序列)
+    if ($script:Caps.Ansi) {
+        $esc = [char]27
+        [Console]::Out.Write("${esc}[?2026h" + $Text + "${esc}[?2026l")
+    } else {
+        [Console]::Out.Write($Text)
+    }
+}
+
+# 行数组 -> 上屏(给外部/测试用的组合入口)
+function Write-MenuFrame {
+    param(
+        [Parameter(Mandatory = $true)][array]$Rows,
+        [Parameter(Mandatory = $true)][int]$Top,
+        [Parameter(Mandatory = $true)][int]$Cols
+    )
+
+    Write-MenuFrameText -Text (New-MenuFrame -Rows $Rows -Cols $Cols) -Top $Top
+}
+
+# 标题行: 左标题 + 右页码, 中间空格撑开
+function New-MenuHeaderText {
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][int]$Position,
+        [Parameter(Mandatory = $true)][int]$Total,
+        [Parameter(Mandatory = $true)][int]$Width
+    )
+
+    $left = "  " + $Title
+    $right = "  " + (Format-Text -Key "MenuPosition" -Values @($Position, $Total))
+    $leftWidth = Get-DisplayWidth -Text $left
+    $pad = $Width - $leftWidth - (Get-DisplayWidth -Text $right)
+    if ($pad -lt 2) { $pad = 2 }
+    return ((Add-DisplayPadding -Text $left -Width ($leftWidth + $pad)) + $right)
+}
+
+# 方向键模式: 原地整帧覆盖, 不整屏清屏 -> 不闪
 function Read-MenuByArrow {
     param(
         [Parameter(Mandatory = $true)][array]$Items,
         [Parameter(Mandatory = $true)][string]$Title
     )
 
-    $index = 0
-    $hasRendered = $false
-    $lastLineCount = 0
-
-    # 页面大小按"光标到窗口底部还剩多少行"定, 尽量不把上面的日志滚掉
+    # 行布局: 前缀 4 列(含选中标记) + 名字列(弹性) + [AppID] 10 + 体积 10
+    # 帧宽由快捷键行的宽度定(宽屏上不拉成一条长线), 名字列再吃掉剩下的宽度:
+    # 这样表格右端、分隔线、选中条三者严格对齐, 整块是个矩形
+    $layoutWidth = Get-ConsoleWidth
     $windowHeight = Get-ConsoleHeight
-    $menuTop = 0
-    try { $menuTop = [Console]::CursorTop } catch { $menuTop = 0 }
-    $available = ($windowHeight - 1) - $menuTop
-    $pageSize = [Math]::Min(20, [Math]::Min($windowHeight - 12, $available - 3))
-    if ($pageSize -lt 5) { $pageSize = 5 }
-    if (($menuTop + $pageSize + 3) -gt ($windowHeight - 1)) {
-        try { [Console]::Clear() } catch { }
-        $menuTop = 0
-        $pageSize = [Math]::Max(5, [Math]::Min(20, $windowHeight - 12))
+    $chromeRows = 4
+    $footerText = T -Key "MenuKeys"
+    $baseFrame = [Math]::Max((Get-DisplayWidth -Text $footerText) + 2, 62)
+    if ($baseFrame -gt ($layoutWidth - 1)) { $baseFrame = $layoutWidth - 1 }
+    $nameWidth = [Math]::Max(16, $baseFrame - 24)
+
+    # 列内容一次算好(名字列要按显示宽度补位, 中文占 2 列), 每帧只做拼接
+    $entries = New-Object System.Collections.ArrayList
+    foreach ($entry in $Items) {
+        $part = Get-GameLabelParts -Item $entry.Item
+        [void]$entries.Add(@{
+                Name = (Add-DisplayPadding -Text (Limit-DisplayWidth -Text $part.Name -MaxWidth $nameWidth) -Width $nameWidth)
+                Id   = ([string]$part.AppId).PadLeft(10)
+                Size = $part.SizeNum.PadLeft(7) + " " + $part.SizeUnit.PadRight(2)
+            })
     }
 
-    while ($true) {
-        $windowHeight = Get-ConsoleHeight
-        $consoleWidth = Get-ConsoleWidth
+    $menuTop = 0
+    try { $menuTop = [Console]::CursorTop } catch { $menuTop = 0 }
 
-        $page = [Math]::Floor($index / $pageSize)
-        $start = $page * $pageSize
-        $end = [Math]::Min($start + $pageSize, $Items.Count) - 1
-
-        # 前缀 "  > " 占 4 列, 右侧留 1 列; 每项严格一行
-        $rowLimit = $consoleWidth - 1
-        $labelWidth = [Math]::Max(12, $consoleWidth - 5)
-        $rows = New-Object System.Collections.ArrayList
-        [void]$rows.Add(@{ Text = (Format-RuleText -Title $Title); Color = "DarkGray" })
-        for ($i = $start; $i -le $end; $i++) {
-            $isSelected = ($i -eq $index)
-            $marker = if ($isSelected) { ">" } else { " " }
-            $label = New-GameLabel -Item $Items[$i].Item -MaxWidth $labelWidth
-            $color = if ($isSelected) { "Cyan" } else { "Gray" }
-            [void]$rows.Add(@{ Text = ("  {0} {1}" -f $marker, $label); Color = $color })
-        }
-        [void]$rows.Add(@{ Text = (Format-Text -Key "MenuPosition" -Values @(($index + 1), $Items.Count)); Color = "DarkGray" })
-        [void]$rows.Add(@{
-                Text  = (Limit-DisplayWidth -MaxWidth $rowLimit -Text (T -Key "MenuKeys"))
-                Color = "DarkGray"
-            })
-
-        $lineCount = $rows.Count
-
-        if ($hasRendered) {
-            if (($menuTop + $lineCount) -gt ($windowHeight - 1)) {
-                # 窗口被缩小 / 本帧比上帧长, 整屏重绘避免残影
-                try { [Console]::Clear() } catch { }
-                $menuTop = 0
-                $pageSize = [Math]::Max(5, [Math]::Min(20, $windowHeight - 12))
-                continue
-            }
+    # 腾地方: 先用换行把日志顶上去(保留上下文), 实在没地方才清屏
+    $minPage = 5
+    $avail = ($windowHeight - 1) - $menuTop
+    if ($avail -lt ($minPage + $chromeRows)) {
+        $need = ($minPage + $chromeRows) - $avail
+        if ($menuTop -ge $need) {
+            for ($k = 0; $k -lt $need; $k++) { [Console]::Out.Write("`n") }
+            try { $menuTop = [Console]::CursorTop } catch { $menuTop = 0 }
         } else {
-            $hasRendered = $true
-        }
-
-        try {
-            [Console]::SetCursorPosition(0, $menuTop)
-        } catch {
             try { [Console]::Clear() } catch { }
             $menuTop = 0
         }
+        $avail = ($windowHeight - 1) - $menuTop
+    }
+    $basePage = [Math]::Min(20, $avail - $chromeRows)
+    if ($basePage -lt $minPage) { $basePage = $minPage }
 
-        foreach ($row in $rows) {
-            $pad = $consoleWidth - 1 - (Get-DisplayWidth -Text $row.Text)
-            if ($pad -lt 0) { $pad = 0 }
-            Write-Host ($row.Text + (" " * $pad)) -ForegroundColor $row.Color
-        }
-        for ($k = $lineCount; $k -lt $lastLineCount; $k++) {
-            Write-Host (" " * ($consoleWidth - 1))
-        }
-        $lastLineCount = $lineCount
+    $index = 0
+    $lastLineCount = 0
+    $cursorHidden = $false
+    try { [Console]::CursorVisible = $false; $cursorHidden = $true } catch { }
 
-        $key = [Console]::ReadKey($true)
-        switch ($key.Key) {
-            ([ConsoleKey]::UpArrow) { $index = ($index - 1 + $Items.Count) % $Items.Count; continue }
-            ([ConsoleKey]::DownArrow) { $index = ($index + 1) % $Items.Count; continue }
-            ([ConsoleKey]::PageUp) { $index = [Math]::Max(0, $start - $pageSize); continue }
-            ([ConsoleKey]::PageDown) { $index = [Math]::Min($Items.Count - 1, $start + $pageSize); continue }
-            ([ConsoleKey]::Home) { $index = 0; continue }
-            ([ConsoleKey]::End) { $index = $Items.Count - 1; continue }
-            ([ConsoleKey]::Enter) { return $Items[$index].Value }
-            ([ConsoleKey]::Escape) { return $null }
-        }
+    try {
+        while ($true) {
+            # 窗口宽度变了就按新宽度收缩, 免得行超宽触发折行(折行 = 帧高算错 = 残影)
+            $windowWidth = [Math]::Min((Get-ConsoleWidth), $layoutWidth)
+            $windowHeight = Get-ConsoleHeight
+            $frameWidth = [Math]::Min($baseFrame, ($windowWidth - 1))
+            $footer = Limit-DisplayWidth -Text $footerText -MaxWidth $frameWidth
+            $rules = "-" * $frameWidth
 
-        $typed = [string]$key.KeyChar
-        if ($typed -match '^[0-9]$') {
-            $target = $start + ([int]$typed - 1)
-            if ($target -lt $Items.Count) { $index = $target }
+            # 窗口变矮时收缩页大小, 帧高始终不超过可视区, 避免滚屏
+            $maxPage = ($windowHeight - 1) - $menuTop - $chromeRows
+            $pageSize = [Math]::Min($basePage, [Math]::Max($minPage, $maxPage))
+
+            $page = [Math]::Floor($index / $pageSize)
+            $start = $page * $pageSize
+            $end = [Math]::Min($start + $pageSize, $Items.Count) - 1
+
+            # 整帧拼成一个字符串再一次写出(逐行写出 = 逐行刷新 = 闪屏)
+            $exact = ($frameWidth -eq $baseFrame)
+            $builder = New-Object System.Text.StringBuilder
+            Add-MenuRowText -Builder $builder -Text $rules -Style "Rule" -Cols $frameWidth -Exact
+            Add-MenuRowText -Builder $builder -Text (New-MenuHeaderText -Title $Title -Position ($index + 1) -Total $Items.Count -Width $frameWidth) -Style "Head" -Cols $frameWidth -Exact:$exact
+            Add-MenuRowText -Builder $builder -Text $rules -Style "Rule" -Cols $frameWidth -Exact
+            for ($i = $start; $i -le $end; $i++) {
+                $isSelected = ($i -eq $index)
+                $data = $entries[$i]
+                $text = $(if ($isSelected) { "  > " } else { "    " }) + $data.Name + $data.Id + $data.Size
+                Add-MenuRowText -Builder $builder -Text $text -Style $(if ($isSelected) { "ItemSel" } else { "Item" }) -Cols $frameWidth -Exact:$exact
+            }
+            Add-MenuRowText -Builder $builder -Text $rules -Style "Rule" -Cols $frameWidth -Exact
+            Add-MenuRowText -Builder $builder -Text $footer -Style "Foot" -Cols $frameWidth
+
+            # 本帧比上一帧短(翻到最后页/窗口变矮)时补空行, 否则会留下残影
+            $lineCount = 4 + ($end - $start + 1)
+            for ($k = $lineCount; $k -lt $lastLineCount; $k++) {
+                Add-MenuRowText -Builder $builder -Text "" -Style "Item" -Cols $frameWidth
+            }
+            $lastLineCount = $lineCount
+
+            Write-MenuFrameText -Text $builder.ToString() -Top $menuTop
+
+            $key = [Console]::ReadKey($true)
+            switch ($key.Key) {
+                ([ConsoleKey]::UpArrow) { $index = ($index - 1 + $Items.Count) % $Items.Count; continue }
+                ([ConsoleKey]::DownArrow) { $index = ($index + 1) % $Items.Count; continue }
+                ([ConsoleKey]::PageUp) { $index = [Math]::Max(0, $start - $pageSize); continue }
+                ([ConsoleKey]::PageDown) { $index = [Math]::Min($Items.Count - 1, $start + $pageSize); continue }
+                ([ConsoleKey]::Home) { $index = 0; continue }
+                ([ConsoleKey]::End) { $index = $Items.Count - 1; continue }
+                ([ConsoleKey]::Enter) { return $Items[$index].Value }
+                ([ConsoleKey]::Escape) { return $null }
+            }
+
+            $typed = [string]$key.KeyChar
+            if ($typed -match '^[0-9]$') {
+                $target = $start + ([int]$typed - 1)
+                if ($target -lt $Items.Count) { $index = $target }
+            }
         }
+    } finally {
+        if ($cursorHidden) { try { [Console]::CursorVisible = $true } catch { } }
+        # 光标落到帧下方: 后续日志往下写, 菜单继续留在屏幕上
+        $line = [Math]::Min($menuTop + $lastLineCount, (Get-ConsoleHeight) - 1)
+        try { [Console]::SetCursorPosition(0, $line) } catch { }
     }
 }
 

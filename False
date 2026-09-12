@@ -1,0 +1,8 @@
+﻿Caps ansi=True console=120x30
+rows=28
+step0
+A 拼串(混合) x20 = 228 ms
+frameLen=1881 lines=25
+B 定位+单次写 x20 = 25 ms
+C Read-MenuByArrow 20 帧 = 252 ms -> 每帧 12.61 ms  picked=3280350
+done
