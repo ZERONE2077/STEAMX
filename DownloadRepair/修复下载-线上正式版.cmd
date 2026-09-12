@@ -16,7 +16,7 @@ if defined OK goto run
 goto fail
 
 :run
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%F%"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%F%" %*
 set "RC=%ERRORLEVEL%"
 endlocal & exit /b %RC%
 
