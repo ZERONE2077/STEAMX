@@ -149,7 +149,23 @@ function Write-UiLog {
     Write-UiLine -Text $line
 }
 
+function Test-SteamxProjectRoot {
+    # A directory only counts as the project root when it really looks like a checkout.
+    param([AllowEmptyString()][string]$PathValue)
+
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { return $false }
+    try {
+        if (-not (Test-Path -LiteralPath $PathValue -PathType Container)) { return $false }
+        foreach ($marker in @("main.ps1", "manifest", "Lua", "DownloadRepair")) {
+            if (Test-Path -LiteralPath (Join-Path $PathValue $marker)) { return $true }
+        }
+    } catch {
+    }
+    return $false
+}
+
 function Get-ScriptRoot {
+    # Launched as a file: the script folder is the project root.
     if ($PSScriptRoot) { return $PSScriptRoot }
 
     $commandPath = [string](Get-Variable -Name PSCommandPath -ValueOnly -ErrorAction SilentlyContinue)
@@ -162,7 +178,30 @@ function Get-ScriptRoot {
     if (-not [string]::IsNullOrWhiteSpace($commandPath)) {
         return (Split-Path -Parent $commandPath)
     }
-    return (Get-Location).Path
+
+    # Launched through irm | iex there is no script file, so the working directory is
+    # the only hint. A shortcut shipped to another machine still carries this project's
+    # path, which neither exists nor is writable there, so trust it only when it really
+    # is a checkout. Otherwise relative paths (config, ost cache) would point at a
+    # missing drive and the run would break before it starts.
+    $current = (Get-Location).Path
+    if (Test-SteamxProjectRoot -PathValue $current) { return $current }
+
+    $fallbacks = @()
+    $localAppData = [Environment]::GetFolderPath("LocalApplicationData")
+    if (-not [string]::IsNullOrWhiteSpace($localAppData)) {
+        $fallbacks += (Join-Path $localAppData "STEAMX")
+    }
+    $fallbacks += (Join-Path ([System.IO.Path]::GetTempPath()) "STEAMX")
+
+    foreach ($candidate in $fallbacks) {
+        try {
+            [void][System.IO.Directory]::CreateDirectory($candidate)
+            return $candidate
+        } catch {
+        }
+    }
+    return $current
 }
 
 function Resolve-LocalPath {
