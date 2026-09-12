@@ -1,8 +1,19 @@
-﻿# repair.ps1 - STEAMX 单游戏清单修复工具
-# 识别 Steam 路径 -> 手动选择游戏 -> 从仓库下载 zip -> 解压覆盖到 Steam 目录
-# .lua -> <Steam>\config\lua      .manifest -> <Steam>\depotcache
+﻿# DownloadRepair.ps1 - STEAMX 单游戏清单修复工具
+# 识别 Steam 路径 -> 选择游戏 -> 从仓库/本地取 zip -> 解压覆盖
+#   .lua      -> <Steam>\config\lua
+#   .manifest -> <Steam>\depotcache
 #
-# 编码: UTF-8 with BOM,可直接右键 / powershell -File 运行(PS 5.1 安全)
+# 目标环境: Windows 10 / 11 + Windows PowerShell 5.1, 零外部依赖
+# 文件编码: UTF-8 with BOM —— BOM 是 -File 与 irm|iex 两条路径都能正确解出中文的前提
+#
+# 退出码:
+#   0 成功        1 其他失败        2 参数/选择无效    3 环境不满足(未找到 Steam)
+#   4 用户取消    5 权限不足        6 缺少依赖         7 网络失败
+#
+# 分层:
+#   业务逻辑 -> 只发语义日志(Write-Log*), 不直接写屏幕
+#   渲染层   -> Show-* / Read-* 负责一切终端输出与输入
+#   能力探测 -> $script:Caps 一次性判定(交互能力 / ANSI / JSON)
 [CmdletBinding()]
 param(
     [string]$Repo = "ZERONE2077/STEAMX",
@@ -24,69 +35,226 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
 $OutputEncoding = [System.Text.Encoding]::UTF8
-# PS 5.1 默认不一定启用 TLS 1.2,GitHub API / jsDelivr 需要
+# 只在交互式控制台改输出编码; 重定向/管道时不碰, 免得破坏下游消费方
+if (-not [Console]::IsOutputRedirected) {
+    try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+}
+# PS 5.1 默认不一定启用 TLS 1.2, GitHub API / jsDelivr 需要
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 } catch { }
 
-# 日志文件默认不写, -Log 才落到 logs\repair-<时间戳>.log
+# ================================================================ 运行时状态
+
 $script:LogFile = ""
-$script:LogEnabled = $false
+$script:LogEnabled = [bool]$Log
+$script:ErrorKind = "Operation"
+$script:ExitCode = 0
 
-# ---------------------------------------------------------------- 输出
-
-# tail 风格日志: HH:mm:ss TAG scope message
-# TAG 宽 5 (INFO/OK/WARN/ERROR/DBUG), scope 宽 8
-# 整行拼成单个 Write-Host(ANSI SGR), 避免重定向时被拆行;
-# 非 VT 终端 / 输出被重定向 / 设了 NO_COLOR 时退化为纯文本
-
-function Test-VirtualTerminal {
-    if (-not [string]::IsNullOrEmpty($env:NO_COLOR)) { return $false }
-    if ([Console]::IsOutputRedirected) { return $false }
-    if (-not [string]::IsNullOrEmpty($env:WT_SESSION)) { return $true }
-    try {
-        $property = $Host.UI.PSObject.Properties["SupportsVirtualTerminal"]
-        if ($null -ne $property) { return [bool]$property.Value }
-    } catch { }
-    return $false
+# 退出码基线(不要随意增删, 见文件头注释)
+$script:Codes = @{
+    Success     = 0
+    Failure     = 1
+    BadInput    = 2
+    Environment = 3
+    Cancelled   = 4
+    Permission  = 5
+    Dependency  = 6
+    Network     = 7
 }
 
-function Initialize-Ui {
-    $script:UseAnsi = Test-VirtualTerminal
+# ---------------------------------------------------------------- 文案表
+# UI 文本集中在这里, 业务逻辑只引用键, 改文案不动逻辑
+
+$script:Strings = @{
+    Title              = "STEAMX 清单修复"
+    MenuTitle          = "选择游戏"
+    MenuMatchTitle     = "匹配 [{0}]"
+    MenuKeys           = "  Up/Down 选择   PgUp/PgDn 翻页   Home/End 首尾   Enter 确认   Esc 返回"
+    MenuPosition       = "  第 {0}/{1} 项"
+    MenuByNumberPrompt = "  请输入序号 [1-{0}] (回车取消)"
+    MenuBadChoice      = "  序号无效, 请输入 1-{0} 之间的数字。"
+    MenuFallback       = "当前终端不支持方向键, 已切换为序号选择"
+    MenuNoInput        = "当前环境无法接收键盘输入, 请改用 -Game <AppID|关键词> 指定游戏"
+    SteamAskPath       = "  未自动识别到 Steam, 请输入 steam.exe 所在文件夹 (回车取消)"
+    SteamNotFound      = "未找到 Steam 安装路径。用 -SteamPath 指定, 或设置环境变量 STEAM_PATH。"
+    Cancelled          = "已取消。"
+    NoPackages         = "没有可用的 zip 包 (远端与本地均为空)。"
+    NoMatch            = "没有匹配 [{0}] 的游戏包。"
+    MatchMultiple      = "关键词命中 {0} 个, 请从列表选择"
+    DownloadFailedAll  = "所有下载源均失败, 请检查网络或用 -LocalDir 指定本地包目录。"
+    ZipEmpty           = "下载到的 zip 为空。"
+    ZipNotValid        = "下载到的文件不是有效的 zip (可能是 HTML 错误页)。"
+    TargetBlocked      = "写入目标不可用, 已中止 (未改动任何文件)。"
+    NoPermission       = "无权写入 {0}"
+    NotWritable        = "目标不可写 {0} (可能被安全软件或系统策略拦截)"
+    RunAsAdmin         = "请右键本快捷方式 -> 以管理员身份运行, 或用管理员 PowerShell 重跑"
+    RemoteUnavailable  = "远端不可用: {0}"
+    RemoteListed       = "远端列表 {0} 个包 ({1})"
+    RemoteDegraded     = "GitHub API 不可用, 已降级: {0}"
+    LocalExtra         = "本地补充 {0} 个包 (未推送)"
+    LocalCount         = "本地目录 {0} 个包"
+    LocalFallback      = "回退本地目录 {0} 个包"
+    NamesSynced        = "本地名单为空, 已同步仓库缓存 {0} 条"
+    NamesFilling       = "补全游戏名 {0} 个 (Steam 商店)"
+    SteamRunning       = "Steam 正在运行, 写入可能被占用, 建议先退出"
+    TargetDirLabel     = "目标 {0}"
+    SteamDirLabel      = "Steam {0}"
+    GameSelected       = "游戏 {0}"
+    SourceUsed         = "来源 {0}"
+    LocalHit           = "本地命中 {0}"
+    Downloading        = "下载 {0}"
+    DownloadFailed     = "下载失败 ({0}): {1}"
+    Installed          = "清单已安装 新增 {0} / 覆盖 {1}"
+    SkippedLua         = "跳过 {0} 个 .lua (默认不装, 用 -IncludeLua 开启)"
+    BackupDirLabel     = "备份 {0}"
+    LocalSourceDir     = "本地包源 {0}"
+    RepoLabel          = "仓库 {0}@{1}"
+    LogPathLabel       = "日志 {0}"
+    LuaDirLabel        = "Lua 目录 {0}"
+    EnvUnknown         = "环境检查未通过。"
 }
 
-$script:UseAnsi = $false
+function T {
+    param([Parameter(Mandatory = $true)][string]$Key)
+    if (-not $script:Strings.ContainsKey($Key)) { return $Key }
+    return [string]$script:Strings[$Key]
+}
 
-function Write-UiLog {
+function Format-Text {
     param(
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)][object[]]$Values
+    )
+    return ([string]$script:Strings[$Key] -f $Values)
+}
+
+# ---------------------------------------------------------------- 错误分类
+
+function Set-ErrorKind {
+    param([Parameter(Mandatory = $true)][string]$Kind)
+    $script:ErrorKind = $Kind
+}
+
+function Get-ErrorKind {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    # 显式标记优先(抛错前 Set-ErrorKind)
+    if ($script:ErrorKind -ne "Operation") { return $script:ErrorKind }
+
+    $exception = $ErrorRecord.Exception
+    if ($null -eq $exception) { return "Operation" }
+    if ($exception -is [System.UnauthorizedAccessException]) { return "Permission" }
+    if ($exception -is [System.Security.SecurityException]) { return "Permission" }
+    if ($exception -is [System.Net.WebException]) { return "Network" }
+    if ($exception -is [System.TimeoutException]) { return "Network" }
+    if ($exception -is [System.IO.IOException]) { return "FileSystem" }
+    if ($exception -is [System.IO.DirectoryNotFoundException]) { return "FileSystem" }
+    $typeName = $exception.GetType().FullName
+    if ($null -ne $typeName -and $typeName -like "*Unauthorized*") { return "Permission" }
+    return "Operation"
+}
+
+function Get-ExitCodeForKind {
+    param([Parameter(Mandatory = $true)][string]$Kind)
+
+    switch ($Kind) {
+        "Permission" { return $script:Codes.Permission }
+        "Environment" { return $script:Codes.Environment }
+        "Network" { return $script:Codes.Network }
+        "Dependency" { return $script:Codes.Dependency }
+        "UserInput" { return $script:Codes.BadInput }
+        "Cancelled" { return $script:Codes.Cancelled }
+        default { return $script:Codes.Failure }
+    }
+}
+
+# ================================================================ 能力探测
+
+function Get-TerminalCapabilities {
+    $interactive = $true
+    try {
+        if ([Console]::IsOutputRedirected -or [Console]::IsInputRedirected) { $interactive = $false }
+    } catch {
+        $interactive = $false
+    }
+
+    $ansi = $false
+    if ($interactive -and [string]::IsNullOrEmpty($env:NO_COLOR)) {
+        if (-not [string]::IsNullOrEmpty($env:WT_SESSION)) {
+            $ansi = $true
+        } else {
+            try {
+                $property = $Host.UI.PSObject.Properties["SupportsVirtualTerminal"]
+                if ($null -ne $property) { $ansi = [bool]$property.Value }
+            } catch {
+                $ansi = $false
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Interactive = $interactive
+        Ansi        = $ansi
+        Color       = $interactive
+    }
+}
+
+$script:Caps = Get-TerminalCapabilities
+
+function Get-ConsoleWidth {
+    try {
+        $width = [int]$host.UI.RawUI.WindowSize.Width
+        if ($width -ge 30) { return $width }
+    } catch { }
+    return 80
+}
+
+function Get-ConsoleHeight {
+    try {
+        $height = [int]$host.UI.RawUI.WindowSize.Height
+        if ($height -ge 8) { return $height }
+    } catch { }
+    return 40
+}
+
+# ================================================================ 日志层
+# tail 风格: HH:mm:ss TAG scope message
+#   TAG 宽 5 (INFO/OK/WARN/ERROR/DBUG), scope 宽 8
+#   整行拼成单个 Write-Host(ANSI SGR), 避免重定向时被拆行
+#   非 VT 终端 / 输出被重定向 / 设了 NO_COLOR -> 退化为纯文本
+# 业务逻辑只调这一层, 不直接 Write-Host
+
+$script:LogTags = @{ DEBUG = "DBUG"; INFO = "INFO"; SUCCESS = "OK"; WARN = "WARN"; ERROR = "ERROR" }
+$script:LogAnsi = @{ DEBUG = "90"; INFO = "36"; SUCCESS = "32"; WARN = "33"; ERROR = "31" }
+
+function Write-LogLine {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet("DEBUG", "INFO", "SUCCESS", "WARN", "ERROR")][string]$Level,
         [Parameter(Mandatory = $true)][string]$Scope,
-        [ValidateSet("DEBUG", "INFO", "SUCCESS", "WARN", "ERROR")][string]$Level = "INFO",
         [AllowEmptyString()][string]$Message = ""
     )
 
+    # DEBUG 只在 -Log(写文件)时输出, 正常使用不打扰
     if ($Level -eq "DEBUG" -and -not $script:LogEnabled) { return }
 
-    $tagMap = @{ DEBUG = "DBUG"; INFO = "INFO"; SUCCESS = "OK"; WARN = "WARN"; ERROR = "ERROR" }
-    $colorMap = @{ DEBUG = "90"; INFO = "36"; SUCCESS = "32"; WARN = "33"; ERROR = "31" }
-    $tag = $tagMap[$Level].PadRight(5)
-
+    $tag = ([string]$script:LogTags[$Level]).PadRight(5)
     $scopeKey = $Scope.ToLowerInvariant()
     if ($scopeKey.Length -gt 8) { $scopeKey = $scopeKey.Substring(0, 8) }
     $scopePad = $scopeKey.PadRight(8)
-
     $stamp = Get-Date -Format "HH:mm:ss"
 
-    if ($script:UseAnsi) {
+    if ($script:Caps.Ansi) {
         $esc = [char]27
-        $msgIn = ""
-        $msgOut = ""
+        $messageIn = ""
+        $messageOut = ""
         if ($Level -eq "WARN" -or $Level -eq "ERROR") {
-            $msgIn = "${esc}[$($colorMap[$Level])m"
-            $msgOut = "${esc}[0m"
+            $messageIn = "${esc}[$($script:LogAnsi[$Level])m"
+            $messageOut = "${esc}[0m"
         }
-        Write-Host ("${esc}[90m{0}${esc}[0m ${esc}[{1}m{2}${esc}[0m ${esc}[90m{3}${esc}[0m {4}{5}{6}" -f $stamp, $colorMap[$Level], $tag, $scopePad, $msgIn, $Message, $msgOut)
+        Write-Host ("${esc}[90m{0}${esc}[0m ${esc}[{1}m{2}${esc}[0m ${esc}[90m{3}${esc}[0m {4}{5}{6}" -f $stamp, $script:LogAnsi[$Level], $tag, $scopePad, $messageIn, $Message, $messageOut)
     } else {
         Write-Host ("{0} {1} {2} {3}" -f $stamp, $tag, $scopePad, $Message)
     }
@@ -97,9 +265,31 @@ function Write-UiLog {
     }
 }
 
-# ---------------------------------------------------------------- 显示宽度
+function Write-LogDebug {
+    param([string]$Scope, [string]$Message)
+    Write-LogLine -Level "DEBUG" -Scope $Scope -Message $Message
+}
+function Write-LogInfo {
+    param([string]$Scope, [string]$Message)
+    Write-LogLine -Level "INFO" -Scope $Scope -Message $Message
+}
+function Write-LogSuccess {
+    param([string]$Scope, [string]$Message)
+    Write-LogLine -Level "SUCCESS" -Scope $Scope -Message $Message
+}
+function Write-LogWarning {
+    param([string]$Scope, [string]$Message)
+    Write-LogLine -Level "WARN" -Scope $Scope -Message $Message
+}
+function Write-LogError {
+    param([string]$Scope, [string]$Message)
+    Write-LogLine -Level "ERROR" -Scope $Scope -Message $Message
+}
 
-# 单个字符占几列: 中日韩全角 2 列, 其余 1 列
+# ================================================================ 渲染层
+# 一切终端输出与输入都收在这里, 换主题/换渲染方式不用动业务逻辑
+
+# 显示宽度: CJK 全角算 2 列
 # 菜单重绘靠这个算真实宽度, 用 .Length 会让中文行错位 / 折行
 function Get-CharWidth {
     param([char]$Ch)
@@ -120,7 +310,7 @@ function Get-CharWidth {
     return 1
 }
 
-function Get-TextWidth {
+function Get-DisplayWidth {
     param([AllowEmptyString()][string]$Text)
 
     if ([string]::IsNullOrEmpty($Text)) { return 0 }
@@ -130,14 +320,14 @@ function Get-TextWidth {
 }
 
 # 按显示宽度截断, 超出部分用 … 收尾
-function Limit-TextWidth {
+function Limit-DisplayWidth {
     param(
         [AllowEmptyString()][string]$Text,
         [Parameter(Mandatory = $true)][int]$MaxWidth
     )
 
     if ($MaxWidth -le 0) { return "" }
-    if ((Get-TextWidth -Text $Text) -le $MaxWidth) { return $Text }
+    if ((Get-DisplayWidth -Text $Text) -le $MaxWidth) { return $Text }
 
     $builder = New-Object System.Text.StringBuilder
     $width = 0
@@ -150,22 +340,6 @@ function Limit-TextWidth {
     return ($builder.ToString() + [char]0x2026)
 }
 
-function Get-ConsoleWidth {
-    try {
-        $width = [int]$host.UI.RawUI.WindowSize.Width
-        if ($width -ge 30) { return $width }
-    } catch { }
-    return 80
-}
-
-function Get-ConsoleHeight {
-    try {
-        $height = [int]$host.UI.RawUI.WindowSize.Height
-        if ($height -ge 8) { return $height }
-    } catch { }
-    return 40
-}
-
 # 菜单专用分隔标题(不属于日志流)
 function Format-RuleText {
     param([string]$Title = "")
@@ -175,10 +349,10 @@ function Format-RuleText {
     if ([string]::IsNullOrWhiteSpace($Title)) { return ("-" * $width) }
 
     $prefix = "- {0} " -f $Title
-    return ($prefix + ("-" * [Math]::Max(0, $width - (Get-TextWidth -Text $prefix))))
+    return ($prefix + ("-" * [Math]::Max(0, $width - (Get-DisplayWidth -Text $prefix))))
 }
 
-function Write-Rule {
+function Show-Rule {
     param([string]$Title = "")
     Write-Host (Format-RuleText -Title $Title) -ForegroundColor DarkGray
 }
@@ -204,6 +378,7 @@ function Format-UrlShort {
     }
 }
 
+# 按磁盘上的真实大小写还原路径(Windows 路径大小写不敏感, 显示一致性靠它)
 function Format-PathCase {
     param([AllowEmptyString()][string]$PathValue)
 
@@ -231,35 +406,228 @@ function Format-PathCase {
     return $result
 }
 
-function Get-ScriptRoot {
-    if ($PSScriptRoot) { return $PSScriptRoot }
-    return (Get-Location).Path
+# 游戏行: "<名字>  [AppID]  (体积)"
+# 菜单里限宽时先砍名字, [AppID] 与体积一定留在同一行
+function New-GameLabel {
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [int]$MaxWidth = 0
+    )
+
+    $size = Format-Size -Bytes ([long]$Item.Size)
+    $display = [string]$Item.DisplayName
+    $appId = [string]$Item.AppId
+    # 名字还没补上时 DisplayName 就是 AppID, 不重复显示两次
+    $suffix = if ([string]::IsNullOrWhiteSpace($appId) -or $appId -eq $display) {
+        ("  ({0})" -f $size)
+    } else {
+        ("  [{0}]  ({1})" -f $appId, $size)
+    }
+
+    if ($MaxWidth -gt 0) {
+        $room = $MaxWidth - (Get-DisplayWidth -Text $suffix)
+        $display = Limit-DisplayWidth -Text $display -MaxWidth ([Math]::Max(8, $room - 1))
+    }
+    return ($display + $suffix)
 }
 
-# 脚本位于 <项目根>\DownloadRepair,manifest/backups/logs 都在项目根
-# irm | iex 运行时 $PSScriptRoot 为空,需要按 manifest 目录反查项目根
+# ================================================================ 交互: 菜单 / 确认
+
+# 序号模式: 有交互能力时的兜底, 也是非交互终端(重定向/无控制台)的唯一可用模式
+function Read-MenuByNumber {
+    param(
+        [Parameter(Mandatory = $true)][array]$Items,
+        [Parameter(Mandatory = $true)][string]$Title
+    )
+
+    Show-Rule -Title $Title
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        Write-Host ("  [{0}] {1}" -f ($i + 1), (New-GameLabel -Item $Items[$i].Item)) -ForegroundColor Gray
+    }
+    Write-Host ""
+
+    while ($true) {
+        $raw = $null
+        try {
+            $raw = Read-Host (Format-Text -Key "MenuByNumberPrompt" -Values @($Items.Count))
+        } catch {
+            Set-ErrorKind -Kind "UserInput"
+            throw (T -Key "MenuNoInput")
+        }
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        $choice = 0
+        if ([int]::TryParse($raw.Trim(), [ref]$choice) -and $choice -ge 1 -and $choice -le $Items.Count) {
+            return $Items[$choice - 1].Value
+        }
+        Write-Host (Format-Text -Key "MenuBadChoice" -Values @($Items.Count)) -ForegroundColor Yellow
+    }
+}
+
+# 方向键模式: 原地重绘, 每帧写满 consoleWidth-1 防折行, 并清掉上一帧多出的行
+function Read-MenuByArrow {
+    param(
+        [Parameter(Mandatory = $true)][array]$Items,
+        [Parameter(Mandatory = $true)][string]$Title
+    )
+
+    $index = 0
+    $hasRendered = $false
+    $lastLineCount = 0
+
+    # 页面大小按"光标到窗口底部还剩多少行"定, 尽量不把上面的日志滚掉
+    $windowHeight = Get-ConsoleHeight
+    $menuTop = 0
+    try { $menuTop = [Console]::CursorTop } catch { $menuTop = 0 }
+    $available = ($windowHeight - 1) - $menuTop
+    $pageSize = [Math]::Min(20, [Math]::Min($windowHeight - 12, $available - 3))
+    if ($pageSize -lt 5) { $pageSize = 5 }
+    if (($menuTop + $pageSize + 3) -gt ($windowHeight - 1)) {
+        try { [Console]::Clear() } catch { }
+        $menuTop = 0
+        $pageSize = [Math]::Max(5, [Math]::Min(20, $windowHeight - 12))
+    }
+
+    while ($true) {
+        $windowHeight = Get-ConsoleHeight
+        $consoleWidth = Get-ConsoleWidth
+
+        $page = [Math]::Floor($index / $pageSize)
+        $start = $page * $pageSize
+        $end = [Math]::Min($start + $pageSize, $Items.Count) - 1
+
+        # 前缀 "  > " 占 4 列, 右侧留 1 列; 每项严格一行
+        $rowLimit = $consoleWidth - 1
+        $labelWidth = [Math]::Max(12, $consoleWidth - 5)
+        $rows = New-Object System.Collections.ArrayList
+        [void]$rows.Add(@{ Text = (Format-RuleText -Title $Title); Color = "DarkGray" })
+        for ($i = $start; $i -le $end; $i++) {
+            $isSelected = ($i -eq $index)
+            $marker = if ($isSelected) { ">" } else { " " }
+            $label = New-GameLabel -Item $Items[$i].Item -MaxWidth $labelWidth
+            $color = if ($isSelected) { "Cyan" } else { "Gray" }
+            [void]$rows.Add(@{ Text = ("  {0} {1}" -f $marker, $label); Color = $color })
+        }
+        [void]$rows.Add(@{ Text = (Format-Text -Key "MenuPosition" -Values @(($index + 1), $Items.Count)); Color = "DarkGray" })
+        [void]$rows.Add(@{
+                Text  = (Limit-DisplayWidth -MaxWidth $rowLimit -Text (T -Key "MenuKeys"))
+                Color = "DarkGray"
+            })
+
+        $lineCount = $rows.Count
+
+        if ($hasRendered) {
+            if (($menuTop + $lineCount) -gt ($windowHeight - 1)) {
+                # 窗口被缩小 / 本帧比上帧长, 整屏重绘避免残影
+                try { [Console]::Clear() } catch { }
+                $menuTop = 0
+                $pageSize = [Math]::Max(5, [Math]::Min(20, $windowHeight - 12))
+                continue
+            }
+        } else {
+            $hasRendered = $true
+        }
+
+        try {
+            [Console]::SetCursorPosition(0, $menuTop)
+        } catch {
+            try { [Console]::Clear() } catch { }
+            $menuTop = 0
+        }
+
+        foreach ($row in $rows) {
+            $pad = $consoleWidth - 1 - (Get-DisplayWidth -Text $row.Text)
+            if ($pad -lt 0) { $pad = 0 }
+            Write-Host ($row.Text + (" " * $pad)) -ForegroundColor $row.Color
+        }
+        for ($k = $lineCount; $k -lt $lastLineCount; $k++) {
+            Write-Host (" " * ($consoleWidth - 1))
+        }
+        $lastLineCount = $lineCount
+
+        $key = [Console]::ReadKey($true)
+        switch ($key.Key) {
+            ([ConsoleKey]::UpArrow) { $index = ($index - 1 + $Items.Count) % $Items.Count; continue }
+            ([ConsoleKey]::DownArrow) { $index = ($index + 1) % $Items.Count; continue }
+            ([ConsoleKey]::PageUp) { $index = [Math]::Max(0, $start - $pageSize); continue }
+            ([ConsoleKey]::PageDown) { $index = [Math]::Min($Items.Count - 1, $start + $pageSize); continue }
+            ([ConsoleKey]::Home) { $index = 0; continue }
+            ([ConsoleKey]::End) { $index = $Items.Count - 1; continue }
+            ([ConsoleKey]::Enter) { return $Items[$index].Value }
+            ([ConsoleKey]::Escape) { return $null }
+        }
+
+        $typed = [string]$key.KeyChar
+        if ($typed -match '^[0-9]$') {
+            $target = $start + ([int]$typed - 1)
+            if ($target -lt $Items.Count) { $index = $target }
+        }
+    }
+}
+
+# 方向键是增强, 序号是保底: 拿不到控制台输入时自动降级, 而不是崩掉
+function Show-GameMenu {
+    param(
+        [Parameter(Mandatory = $true)][array]$Items,
+        [Parameter(Mandatory = $true)][string]$Title
+    )
+
+    if ($script:Caps.Interactive) {
+        try {
+            return (Read-MenuByArrow -Items $Items -Title $Title)
+        } catch [System.InvalidOperationException] {
+            Write-LogWarning -Scope "repair" -Message (T -Key "MenuFallback")
+        }
+    }
+    return (Read-MenuByNumber -Items $Items -Title $Title)
+}
+
+# ================================================================ 路径与环境
+
+function Get-ScriptRoot {
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { return $PSScriptRoot }
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        $parent = Split-Path -Parent $PSCommandPath
+        if (-not [string]::IsNullOrWhiteSpace($parent)) { return $parent }
+    }
+    return ""
+}
+
+# 项目根判定: 含 manifest / Lua / DownloadRepair / main.ps1 任一
+function Test-SteamxProjectRoot {
+    param([AllowNull()][string]$PathValue)
+
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { return $false }
+    if (-not (Test-Path -LiteralPath $PathValue -PathType Container)) { return $false }
+    foreach ($marker in @("manifest", "Lua", "DownloadRepair", "main.ps1")) {
+        if (Test-Path -LiteralPath (Join-Path $PathValue $marker)) { return $true }
+    }
+    return $false
+}
+
+# 项目根依次尝试: 脚本所在目录 -> 其父目录(脚本在 DownloadRepair\ 下) -> 当前目录 -> %LOCALAPPDATA%\STEAMX
+# 不把当前目录当默认值: 快捷方式启动时 CWD 是 C:\Windows\System32
 function Get-ProjectRoot {
-    $root = Get-ScriptRoot
-    $candidates = @($root)
-    try {
-        $parent = Split-Path -Parent $root
-        if (-not [string]::IsNullOrWhiteSpace($parent)) { $candidates += $parent }
-    } catch { }
-    $candidates += (Get-Location).Path
+    $candidates = New-Object System.Collections.ArrayList
+    $scriptRoot = Get-ScriptRoot
+    if (-not [string]::IsNullOrWhiteSpace($scriptRoot)) {
+        [void]$candidates.Add($scriptRoot)
+        try {
+            $parent = Split-Path -Parent $scriptRoot
+            if (-not [string]::IsNullOrWhiteSpace($parent)) { [void]$candidates.Add($parent) }
+        } catch { }
+    }
+    try { [void]$candidates.Add((Get-Location).Path) } catch { }
 
     foreach ($candidate in @($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
-        if (Test-Path -LiteralPath (Join-Path $candidate "manifest") -PathType Container) { return $candidate }
+        if (Test-SteamxProjectRoot -PathValue $candidate) { return [System.IO.Path]::GetFullPath($candidate) }
     }
-    return $root
-}
 
-# 日志/备份落盘位置:找到项目根就用它,否则退到 %TEMP%\STEAMX(irm|iex 场景)
-function Get-DataRoot {
-    param([Parameter(Mandatory = $true)][string]$ProjectRoot)
-
-    if (Test-Path -LiteralPath (Join-Path $ProjectRoot "manifest") -PathType Container) { return $ProjectRoot }
-    $temp = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
-    return (Join-Path $temp "STEAMX")
+    # 远程执行(irm|iex / 快捷方式)时的稳定落点, 与 main.ps1 保持一致
+    $local = $env:LOCALAPPDATA
+    if ([string]::IsNullOrWhiteSpace($local)) { $local = $env:TEMP }
+    if ([string]::IsNullOrWhiteSpace($local)) { $local = [System.IO.Path]::GetTempPath() }
+    $fallback = Join-Path $local "STEAMX"
+    return [System.IO.Path]::GetFullPath($fallback)
 }
 
 function Ensure-Dir {
@@ -271,7 +639,7 @@ function Ensure-Dir {
 
 # ---------------------------------------------------------------- 权限
 
-function Test-Admin {
+function Test-IsAdministrator {
     try {
         $principal = [System.Security.Principal.WindowsPrincipal]::new([System.Security.Principal.WindowsIdentity]::GetCurrent())
         return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -308,7 +676,7 @@ function Test-DirWritable {
     }
 }
 
-# ---------------------------------------------------------------- Steam 路径
+# ---------------------------------------------------------------- Steam 定位
 
 function Test-SteamDir {
     param([AllowNull()][string]$PathValue)
@@ -320,6 +688,7 @@ function Test-SteamDir {
     }
 }
 
+# 顺序: 显式参数 -> 环境变量 -> 运行中的 steam 进程 -> 注册表 -> 各盘符常见位置 -> 询问
 function Resolve-SteamPath {
     $candidates = New-Object System.Collections.ArrayList
 
@@ -335,10 +704,10 @@ function Resolve-SteamPath {
     }
 
     foreach ($key in @(
-        "HKCU:\Software\Valve\Steam",
-        "HKLM:\Software\WOW6432Node\Valve\Steam",
-        "HKLM:\Software\Valve\Steam"
-    )) {
+            "HKCU:\Software\Valve\Steam",
+            "HKLM:\Software\WOW6432Node\Valve\Steam",
+            "HKLM:\Software\Valve\Steam"
+        )) {
         if (-not (Test-Path $key -ErrorAction SilentlyContinue)) { continue }
         $item = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
         if ($null -eq $item) { continue }
@@ -353,10 +722,10 @@ function Resolve-SteamPath {
     }
 
     foreach ($key in @(
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\steam.exe",
-        "HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\steam.exe",
-        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\steam.exe"
-    )) {
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\steam.exe",
+            "HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\steam.exe",
+            "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\steam.exe"
+        )) {
         if (-not (Test-Path $key -ErrorAction SilentlyContinue)) { continue }
         try {
             $value = [string](Get-Item -Path $key -ErrorAction Stop).GetValue("")
@@ -381,7 +750,18 @@ function Resolve-SteamPath {
         }
     }
 
-    $entered = (Read-Host "  未自动识别到 Steam,请输入 steam.exe 所在文件夹(回车取消)").Trim().Trim('"')
+    if (-not $script:Caps.Interactive) {
+        Set-ErrorKind -Kind "Environment"
+        throw (T -Key "SteamNotFound")
+    }
+
+    $entered = $null
+    try {
+        $entered = (Read-Host (T -Key "SteamAskPath")).Trim().Trim('"')
+    } catch {
+        Set-ErrorKind -Kind "Environment"
+        throw (T -Key "SteamNotFound")
+    }
     if ($entered.EndsWith("steam.exe", [System.StringComparison]::OrdinalIgnoreCase)) {
         $entered = Split-Path -Parent $entered
     }
@@ -389,120 +769,34 @@ function Resolve-SteamPath {
         return [System.IO.Path]::GetFullPath($entered)
     }
 
-    throw "未找到 Steam 安装路径。用 -SteamPath 指定,或设置环境变量 STEAM_PATH。"
+    Set-ErrorKind -Kind "Environment"
+    throw (T -Key "SteamNotFound")
 }
 
-# ---------------------------------------------------------------- 菜单
+# ================================================================ 数据层: zip 索引
 
-function Read-MenuSelection {
+function New-ZipItem {
     param(
-        [Parameter(Mandatory = $true)][array]$Items,
-        [Parameter(Mandatory = $true)][string]$Title
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][long]$Size,
+        [Parameter(Mandatory = $true)][string[]]$DownloadUrls,
+        [Parameter(Mandatory = $true)][string]$Source
     )
-
-    $index = 0
-    $hasRendered = $false
-    $lastLineCount = 0
-
-    # 页面大小按"光标到窗口底部还剩多少行"定, 尽量不把上面的日志滚掉
-    $windowHeight = Get-ConsoleHeight
-    $menuTop = 0
-    try { $menuTop = [Console]::CursorTop } catch { $menuTop = 0 }
-    $avail = ($windowHeight - 1) - $menuTop
-    $pageSize = [Math]::Min(20, [Math]::Min($windowHeight - 12, $avail - 3))
-    if ($pageSize -lt 5) { $pageSize = 5 }
-    if (($menuTop + $pageSize + 3) -gt ($windowHeight - 1)) {
-        try { [Console]::Clear() } catch { }
-        $menuTop = 0
-        $pageSize = [Math]::Max(5, [Math]::Min(20, $windowHeight - 12))
-    }
-
-    while ($true) {
-        $windowHeight = Get-ConsoleHeight
-        $consoleWidth = Get-ConsoleWidth
-
-        $page = [Math]::Floor($index / $pageSize)
-        $start = $page * $pageSize
-        $end = [Math]::Min($start + $pageSize, $Items.Count) - 1
-
-        # 前缀 "  > " 占 4 列, 右侧留 1 列; 每项严格一行, 否则重绘会错位
-        $rowLimit = $consoleWidth - 1
-        $labelWidth = [Math]::Max(12, $consoleWidth - 5)
-        $rows = New-Object System.Collections.ArrayList
-        [void]$rows.Add(@{ Text = (Format-RuleText -Title $Title); Color = "DarkGray" })
-        for ($i = $start; $i -le $end; $i++) {
-            $isSelected = ($i -eq $index)
-            $marker = if ($isSelected) { ">" } else { " " }
-            $label = New-GameLabel -Item $Items[$i].Item -MaxWidth $labelWidth
-            $color = if ($isSelected) { "Cyan" } else { "Gray" }
-            [void]$rows.Add(@{ Text = ("  {0} {1}" -f $marker, $label); Color = $color })
-        }
-        [void]$rows.Add(@{ Text = ("  第 {0}/{1} 项" -f ($index + 1), $Items.Count); Color = "DarkGray" })
-        [void]$rows.Add(@{
-                Text  = (Limit-TextWidth -MaxWidth $rowLimit -Text "  Up/Down 选择   PgUp/PgDn 翻页   Home/End 首尾   Enter 确认   Esc 返回")
-                Color = "DarkGray"
-            })
-
-        $lineCount = $rows.Count
-
-        if ($hasRendered) {
-            if (($menuTop + $lineCount) -gt ($windowHeight - 1)) {
-                # 窗口被缩小 / 本帧比上帧长, 整屏重绘避免残影
-                try { [Console]::Clear() } catch { }
-                $menuTop = 0
-                $pageSize = [Math]::Max(5, [Math]::Min(20, $windowHeight - 12))
-                continue
-            }
-        } else {
-            $hasRendered = $true
-        }
-
-        try {
-            [Console]::SetCursorPosition(0, $menuTop)
-        } catch {
-            try { [Console]::Clear() } catch { }
-            $menuTop = 0
-        }
-
-        foreach ($row in $rows) {
-            $pad = $consoleWidth - 1 - (Get-TextWidth -Text $row.Text)
-            if ($pad -lt 0) { $pad = 0 }
-            Write-Host ($row.Text + (" " * $pad)) -ForegroundColor $row.Color
-        }
-        for ($k = $lineCount; $k -lt $lastLineCount; $k++) {
-            Write-Host (" " * ($consoleWidth - 1))
-        }
-        $lastLineCount = $lineCount
-
-        $key = [Console]::ReadKey($true)
-        switch ($key.Key) {
-            ([ConsoleKey]::UpArrow) { $index = ($index - 1 + $Items.Count) % $Items.Count; continue }
-            ([ConsoleKey]::DownArrow) { $index = ($index + 1) % $Items.Count; continue }
-            ([ConsoleKey]::PageUp) { $index = [Math]::Max(0, $start - $pageSize); continue }
-            ([ConsoleKey]::PageDown) { $index = [Math]::Min($Items.Count - 1, $start + $pageSize); continue }
-            ([ConsoleKey]::Home) { $index = 0; continue }
-            ([ConsoleKey]::End) { $index = $Items.Count - 1; continue }
-            ([ConsoleKey]::Enter) { return $Items[$index].Value }
-            ([ConsoleKey]::Escape) { return $null }
-        }
-
-        $typed = [string]$key.KeyChar
-        if ($typed -match '^[0-9]$') {
-            $target = $start + ([int]$typed - 1)
-            if ($target -lt $Items.Count) { $index = $target }
-        }
+    return [pscustomobject]@{
+        Name         = $Name
+        Size         = $Size
+        DownloadUrls = $DownloadUrls
+        Source       = $Source
     }
 }
 
-# ---------------------------------------------------------------- 远端索引
-
+# 远端索引: GitHub contents API 优先, gh-proxy 镜像次之, 最后退到 jsDelivr 文件索引
 function Get-RemoteZipIndex {
     param([switch]$AllowFailure)
 
     $errors = @()
     $headers = @{ "Accept" = "application/vnd.github+json"; "User-Agent" = "STEAMX" }
-
-    # 直连 api.github.com 在国内常被墙/超时,再试 gh-proxy 镜像转发同一 API
+    # 直连 api.github.com 在部分网络下常被墙/超时, 再试 gh-proxy 镜像转发同一 API
     $apiPrefixes = @("", "https://gh-proxy.com/")
 
     foreach ($dir in $RemoteDir) {
@@ -511,7 +805,7 @@ function Get-RemoteZipIndex {
         foreach ($prefix in $apiPrefixes) {
             $api = "{0}https://api.github.com/{1}" -f $prefix, $apiPath
             try {
-                # 注意: @(Invoke-RestMethod ...) 会把 JSON 数组当成单个元素,必须先赋值再包
+                # 注意: @(Invoke-RestMethod ...) 会把 JSON 数组当成单个元素, 必须先赋值再包
                 $response = Invoke-RestMethod -Uri $api -Headers $headers -TimeoutSec $TimeoutSeconds
                 $entries = @($response)
                 $zips = @($entries | Where-Object { $_.type -eq "file" -and $_.name -like "*.zip" })
@@ -520,23 +814,18 @@ function Get-RemoteZipIndex {
                         foreach ($zip in $zips) {
                             $name = [string]$zip.name
                             $escaped = [Uri]::EscapeDataString($name)
-                            [pscustomobject]@{
-                                Name         = $name
-                                Size         = [long]$zip.size
-                                # jsDelivr 文件级缓存刷新快,优先;镜像 raw 次之;直连 download_url 最后
-                                DownloadUrls = @(
-                                    ("https://cdn.jsdelivr.net/gh/{0}@{1}/{2}/{3}" -f $Repo, $Branch, $dirTrimmed, $escaped),
-                                    ("https://gh-proxy.com/https://raw.githubusercontent.com/{0}/{1}/{2}/{3}" -f $Repo, $Branch, $dirTrimmed, $escaped),
-                                    ("https://ghfast.top/https://raw.githubusercontent.com/{0}/{1}/{2}/{3}" -f $Repo, $Branch, $dirTrimmed, $escaped),
-                                    [string]$zip.download_url
-                                )
-                                Source       = "github:{0}" -f $dirTrimmed
-                            }
+                            # jsDelivr 文件级缓存刷新快, 优先; 镜像 raw 次之; 直连 download_url 最后
+                            New-ZipItem -Name $name -Size ([long]$zip.size) -Source ("github:{0}" -f $dirTrimmed) -DownloadUrls @(
+                                ("https://cdn.jsdelivr.net/gh/{0}@{1}/{2}/{3}" -f $Repo, $Branch, $dirTrimmed, $escaped),
+                                ("https://gh-proxy.com/https://raw.githubusercontent.com/{0}/{1}/{2}/{3}" -f $Repo, $Branch, $dirTrimmed, $escaped),
+                                ("https://ghfast.top/https://raw.githubusercontent.com/{0}/{1}/{2}/{3}" -f $Repo, $Branch, $dirTrimmed, $escaped),
+                                [string]$zip.download_url
+                            )
                         }
                     )
                     return [pscustomobject]@{ Items = $items; Source = "github:{0}" -f $dirTrimmed; Error = "" }
                 }
-                # API 可达但目录里没有 zip,换下一个 RemoteDir
+                # API 可达但目录里没有 zip, 换下一个 RemoteDir
                 $errors += ("{0}: 目录为空" -f $dirTrimmed)
                 break
             } catch {
@@ -555,15 +844,10 @@ function Get-RemoteZipIndex {
             $items = @(
                 foreach ($zip in $zips) {
                     $relative = ([string]$zip.name).TrimStart("/")
-                    [pscustomobject]@{
-                        Name         = Split-Path -Leaf $relative
-                        Size         = [long]$zip.size
-                        DownloadUrls = @(
-                            ("https://cdn.jsdelivr.net/gh/{0}@{1}/{2}" -f $Repo, $Branch, $relative),
-                            ("https://ghfast.top/https://raw.githubusercontent.com/{0}/{1}/{2}" -f $Repo, $Branch, $relative)
-                        )
-                        Source       = "jsdelivr"
-                    }
+                    New-ZipItem -Name (Split-Path -Leaf $relative) -Size ([long]$zip.size) -Source "jsdelivr" -DownloadUrls @(
+                        ("https://cdn.jsdelivr.net/gh/{0}@{1}/{2}" -f $Repo, $Branch, $relative),
+                        ("https://ghfast.top/https://raw.githubusercontent.com/{0}/{1}/{2}" -f $Repo, $Branch, $relative)
+                    )
                 }
             )
             return [pscustomobject]@{ Items = $items; Source = "jsdelivr"; Error = ($errors -join " | ") }
@@ -575,7 +859,8 @@ function Get-RemoteZipIndex {
     if ($AllowFailure) {
         return [pscustomobject]@{ Items = @(); Source = ""; Error = ($errors -join " | ") }
     }
-    throw ("无法获取远端 zip 列表。{0}" -f ($errors -join " | "))
+    Set-ErrorKind -Kind "Network"
+    throw (Format-Text -Key "RemoteUnavailable" -Values @(($errors -join " | ")))
 }
 
 function Get-LocalZipIndex {
@@ -586,17 +871,12 @@ function Get-LocalZipIndex {
         Get-ChildItem -LiteralPath $Directory -File -Filter *.zip -ErrorAction SilentlyContinue |
             Sort-Object Name |
             ForEach-Object {
-                [pscustomobject]@{
-                    Name         = $_.Name
-                    Size         = $_.Length
-                    DownloadUrls = @($_.FullName)
-                    Source       = "local"
-                }
+                New-ZipItem -Name $_.Name -Size ([long]$_.Length) -Source "local" -DownloadUrls @($_.FullName)
             }
     )
 }
 
-# ---------------------------------------------------------------- 游戏中文名
+# ================================================================ 数据层: 游戏中文名
 
 # 名单条目支持 "中文名 || 官方原名": 前半段用于显示, 后半段只用于关键词搜索
 function Split-NameEntry {
@@ -607,30 +887,6 @@ function Split-NameEntry {
     $name = $parts[0].Trim()
     $alias = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
     return @($name, $alias)
-}
-
-function New-GameLabel {
-    param(
-        [Parameter(Mandatory = $true)]$Item,
-        [int]$MaxWidth = 0
-    )
-
-    $size = Format-Size -Bytes ([long]$Item.Size)
-    $display = [string]$Item.DisplayName
-    $appId = [string]$Item.AppId
-    # 名字还没补上时 DisplayName 就是 AppID, 不重复显示两次
-    $suffix = if ([string]::IsNullOrWhiteSpace($appId) -or $appId -eq $display) {
-        ("  ({0})" -f $size)
-    } else {
-        ("  [{0}]  ({1})" -f $appId, $size)
-    }
-
-    # 菜单里限宽: 先砍名字, [AppID] 和体积一定留在同一行
-    if ($MaxWidth -gt 0) {
-        $room = $MaxWidth - (Get-TextWidth -Text $suffix)
-        $display = Limit-TextWidth -Text $display -MaxWidth ([Math]::Max(8, $room - 1))
-    }
-    return ($display + $suffix)
 }
 
 function Get-AppIdFromZipName {
@@ -664,13 +920,18 @@ function Save-AppNameCache {
         [Parameter(Mandatory = $true)][string]$PathValue
     )
 
+    # 缓存写不进去不是致命问题(只影响下次要重新拉名单), 所以只记 DEBUG
     try {
+        Ensure-Dir -PathValue (Split-Path -Parent $PathValue)
         $ordered = New-Object System.Collections.Specialized.OrderedDictionary
         foreach ($key in @($Cache.Keys | Sort-Object)) { $ordered[[string]$key] = [string]$Cache[$key] }
         ($ordered | ConvertTo-Json -Depth 3) | Set-Content -LiteralPath $PathValue -Encoding UTF8
-    } catch { }
+    } catch {
+        Write-LogDebug -Scope "names" -Message ("名单缓存写入失败: {0}" -f $_.Exception.Message)
+    }
 }
 
+# 统一走 HttpWebRequest: PS 5.1 下能显式控制超时与 gzip/deflate
 function Invoke-RemoteText {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
@@ -699,6 +960,7 @@ function Invoke-RemoteText {
     }
 }
 
+# 仓库里的名单: jsDelivr -> raw -> ghfast, 逐个试
 function Read-RemoteAppNameCache {
     param([Parameter(Mandatory = $true)][int]$Timeout)
 
@@ -723,6 +985,7 @@ function Read-RemoteAppNameCache {
     return @{}
 }
 
+# 单个 AppID 的 Steam 商店简中名
 function Get-SteamAppName {
     param(
         [Parameter(Mandatory = $true)][string]$AppId,
@@ -742,7 +1005,7 @@ function Get-SteamAppName {
     return ""
 }
 
-# 名单只走本地缓存(缺失时同步仓库里的 appnames.json), 不做逐个联网
+# 名单只走本地缓存(缺失时同步仓库里的 appnames.json), 不做逐个联网:
 # 这样菜单立刻可见; 名字缺的先显示 AppID, 安装时或 -RefreshNames 再补
 function Add-GameDisplayNames {
     param(
@@ -760,7 +1023,7 @@ function Add-GameDisplayNames {
         if ($remoteCache.Count -gt 0) {
             $cache = $remoteCache
             Save-AppNameCache -Cache $cache -PathValue $CachePath
-            Write-UiLog -Scope "names" -Level "SUCCESS" -Message ("本地名单为空, 已同步仓库缓存 {0} 条" -f $cache.Count)
+            Write-LogSuccess -Scope "names" -Message (Format-Text -Key "NamesSynced" -Values @($cache.Count))
         }
     }
 
@@ -793,14 +1056,14 @@ function Add-GameDisplayNames {
     }
 
     if ($Refresh -and $pending.Count -gt 0) {
-        Write-UiLog -Scope "names" -Level "INFO" -Message ("补全游戏名 {0} 个 (Steam 商店)" -f $pending.Count)
+        Write-LogInfo -Scope "names" -Message (Format-Text -Key "NamesFilling" -Values @($pending.Count))
         $changed = $false
         foreach ($appId in $pending) {
             $name = Get-SteamAppName -AppId $appId -Timeout $Timeout
             if (-not [string]::IsNullOrWhiteSpace($name)) {
                 $cache[$appId] = $name
                 $changed = $true
-                Write-UiLog -Scope "names" -Level "DEBUG" -Message ("{0} = {1}" -f $appId, $name)
+                Write-LogDebug -Scope "names" -Message ("{0} = {1}" -f $appId, $name)
             }
             Start-Sleep -Milliseconds 120
         }
@@ -821,7 +1084,7 @@ function Add-GameDisplayNames {
 }
 
 # 选中的包没有中文名时补一次(单次请求, 顺带写回缓存)
-function Update-PendingDisplayName {
+function Update-PendingGameName {
     param(
         [Parameter(Mandatory = $true)]$Item,
         [Parameter(Mandatory = $true)][string]$CachePath,
@@ -846,8 +1109,9 @@ function Update-PendingDisplayName {
     return $Item
 }
 
-# ---------------------------------------------------------------- 下载 / 解压
+# ================================================================ 下载 / 解压
 
+# 按给定顺序逐个源尝试, 全失败才抛错; 本地路径直接复制
 function Invoke-FileDownload {
     param(
         [Parameter(Mandatory = $true)][string[]]$Urls,
@@ -857,9 +1121,10 @@ function Invoke-FileDownload {
 
     foreach ($url in $Urls) {
         if ([string]::IsNullOrWhiteSpace($url)) { continue }
+
         if ($url -match '^[a-zA-Z]:\\' -or $url.StartsWith("\\\\")) {
             Copy-Item -LiteralPath $url -Destination $Destination -Force
-            Write-UiLog -Scope "net" -Level "DEBUG" -Message ("使用本地文件 {0}" -f $url)
+            Write-LogDebug -Scope "net" -Message ("使用本地文件 {0}" -f $url)
             return $url
         }
 
@@ -873,7 +1138,7 @@ function Invoke-FileDownload {
         $responseStream = $null
         $fileStream = $null
         try {
-            Write-UiLog -Scope "net" -Level "INFO" -Message ("下载 {0}" -f (Format-UrlShort -Url $url))
+            Write-LogInfo -Scope "net" -Message (Format-Text -Key "Downloading" -Values @((Format-UrlShort -Url $url)))
             $response = $request.GetResponse()
             $responseStream = $response.GetResponseStream()
             $fileStream = [System.IO.File]::Open($Destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
@@ -891,7 +1156,7 @@ function Invoke-FileDownload {
             }
             return $url
         } catch {
-            Write-UiLog -Scope "net" -Level "WARN" -Message ("下载失败 ({0}): {1}" -f (Format-UrlShort -Url $url), $_.Exception.Message)
+            Write-LogWarning -Scope "net" -Message (Format-Text -Key "DownloadFailed" -Values @((Format-UrlShort -Url $url), $_.Exception.Message))
         } finally {
             if ($null -ne $fileStream) { $fileStream.Dispose() }
             if ($null -ne $responseStream) { $responseStream.Dispose() }
@@ -900,9 +1165,11 @@ function Invoke-FileDownload {
         }
     }
 
-    throw "所有下载源均失败。"
+    Set-ErrorKind -Kind "Network"
+    throw (T -Key "DownloadFailedAll")
 }
 
+# zip 魔数: PK\x03\x04, 用来挡掉"下载到 HTML 错误页"这类情况
 function Test-ZipMagic {
     param([Parameter(Mandatory = $true)][string]$PathValue)
 
@@ -917,6 +1184,7 @@ function Test-ZipMagic {
     }
 }
 
+# 覆盖前先备份同名文件, 默认只装 .manifest(-IncludeLua 才装 .lua)
 function Expand-GameZip {
     param(
         [Parameter(Mandatory = $true)][string]$ZipPath,
@@ -946,7 +1214,6 @@ function Expand-GameZip {
             }
             switch ($extension) {
                 ".lua" { $targetDir = $LuaDir }
-                ".manifest" { $targetDir = $ManifestDir }
                 default { $targetDir = $ManifestDir }
             }
             Ensure-Dir -PathValue $targetDir
@@ -966,6 +1233,10 @@ function Expand-GameZip {
                 $entryStream = $entry.Open()
                 $outputStream = [System.IO.File]::Open($targetPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
                 $entryStream.CopyTo($outputStream)
+            } catch [System.UnauthorizedAccessException] {
+                Set-ErrorKind -Kind "Permission"
+                Write-LogError -Scope "install" -Message (Format-Text -Key "NoPermission" -Values @($targetPath))
+                throw
             } finally {
                 if ($null -ne $outputStream) { $outputStream.Dispose() }
                 if ($null -ne $entryStream) { $entryStream.Dispose() }
@@ -981,136 +1252,207 @@ function Expand-GameZip {
     return [pscustomobject]@{ Added = $added; Overwritten = $overwritten; Skipped = $skipped }
 }
 
-# ---------------------------------------------------------------- 主流程
+# ================================================================ 错误呈现
+
+# ERROR 行之外的补充说明(Reason / Try), 只在出错时出现, 不参与正常输出
+function Show-ErrorGuidance {
+    param(
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [AllowEmptyString()][string]$Detail = ""
+    )
+
+    $guide = $null
+    switch ($Kind) {
+        "Permission" {
+            $guide = @{
+                Reason = "当前账户没有写入目标目录的权限。"
+                Try    = "右键快捷方式 -> 以管理员身份运行; 或在管理员 PowerShell 里放权一次: icacls `"<Steam 目录>`" /grant `"*S-1-5-32-545:(OI)(CI)M`" /T"
+            }
+        }
+        "Environment" {
+            $guide = @{
+                Reason = "没有找到可用的 Steam 安装目录。"
+                Try    = "用 -SteamPath <steam.exe 所在目录> 指定, 或设置环境变量 STEAM_PATH 后重跑。"
+            }
+        }
+        "Network" {
+            $guide = @{
+                Reason = "远端仓库或 Steam 商店不可达(超时 / 被拦截 / 无网络)。"
+                Try    = "检查网络或代理后重试; 已有本地包时用 -Offline -LocalDir <目录> 走本地。"
+            }
+        }
+        "FileSystem" {
+            $guide = @{
+                Reason = "文件被占用或路径不可用。"
+                Try    = "先完全退出 Steam 再重跑; 确认目标目录存在、磁盘未只读。"
+            }
+        }
+        "UserInput" {
+            $guide = @{
+                Reason = "选择结果不合法, 或当前环境无法接收键盘输入。"
+                Try    = "用 -Game <AppID|关键词> 直接指定游戏后重跑。"
+            }
+        }
+        "Dependency" {
+            $guide = @{
+                Reason = "缺少运行所需的组件。"
+                Try    = "确认系统为 Windows 10/11 且使用 Windows PowerShell 5.1。"
+            }
+        }
+        default { $guide = $null }
+    }
+
+    if ($null -eq $guide) { return }
+
+    Write-Host ""
+    Write-Host "  Reason:" -ForegroundColor DarkGray
+    Write-Host ("    " + $guide.Reason) -ForegroundColor Gray
+    Write-Host "  Try:" -ForegroundColor DarkGray
+    Write-Host ("    " + $guide.Try) -ForegroundColor Gray
+    if ($script:LogEnabled -and -not [string]::IsNullOrWhiteSpace($Detail)) {
+        Write-Host "  Details:" -ForegroundColor DarkGray
+        Write-Host ("    " + $Detail) -ForegroundColor DarkGray
+    }
+}
+
+# 退出前恢复终端状态(光标等), 别把用户终端留在坏状态
+function Restore-Terminal {
+    try { [Console]::CursorVisible = $true } catch { }
+}
+
+# ================================================================ 主流程
 
 function Invoke-Repair {
     $projectRoot = Get-ProjectRoot
-    $dataRoot = Get-DataRoot -ProjectRoot $projectRoot
-    $script:LogEnabled = [bool]$Log
+
     if ($Log) {
-        $logDir = Join-Path $dataRoot "logs"
-        Ensure-Dir -PathValue $logDir
-        $script:LogFile = Join-Path $logDir ("repair-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
-    } else {
-        $script:LogFile = ""
+        try {
+            $logDir = Join-Path $projectRoot "logs"
+            Ensure-Dir -PathValue $logDir
+            $script:LogFile = Join-Path $logDir ("repair-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+            $script:LogEnabled = $true
+        } catch {
+            $script:LogFile = ""
+            Write-LogWarning -Scope "repair" -Message ("日志文件不可写, 已跳过: {0}" -f $_.Exception.Message)
+        }
     }
 
-    Initialize-Ui
+    Write-LogInfo -Scope "repair" -Message (T -Key "Title")
 
-    Write-UiLog -Scope "repair" -Level "INFO" -Message "STEAMX 清单修复"
-
+    # --- 环境: Steam 与目标目录
     $steam = Format-PathCase -PathValue (Resolve-SteamPath)
     $luaDir = if ([string]::IsNullOrWhiteSpace($LuaTarget)) { Join-Path $steam "config\lua" } else { $LuaTarget }
     $manifestDir = if ([string]::IsNullOrWhiteSpace($ManifestTarget)) { Join-Path $steam "depotcache" } else { $ManifestTarget }
     $localZipDir = if (-not [string]::IsNullOrWhiteSpace($LocalDir)) { $LocalDir }
-                   elseif (-not [string]::IsNullOrWhiteSpace($env:STEAMX_MANIFEST_DIR)) { $env:STEAMX_MANIFEST_DIR }
-                   else { Join-Path $projectRoot "manifest" }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:STEAMX_MANIFEST_DIR)) { $env:STEAMX_MANIFEST_DIR }
+    else { Join-Path $projectRoot "manifest" }
 
-    Write-UiLog -Scope "steam" -Level "SUCCESS" -Message ("Steam {0}" -f $steam)
-    Write-UiLog -Scope "install" -Level "INFO" -Message ("目标 {0}" -f $manifestDir)
-
-    # 权限预检: 系统盘下的 Steam(如 C:\Program Files (x86)\Steam) 默认只让管理员写,
-    # 提前失败并给可操作的提示, 而不是抛原始的 UnauthorizedAccessException
-    $writeTargets = @($manifestDir)
-    if ($IncludeLua) { $writeTargets += $luaDir }
-    $blockedTargets = @($writeTargets | Where-Object { -not (Test-DirWritable -PathValue $_) })
-    if ($blockedTargets.Count -gt 0) {
-        $isAdmin = Test-Admin
-        foreach ($blockedPath in $blockedTargets) {
-            if ($isAdmin) {
-                Write-UiLog -Scope "install" -Level "ERROR" -Message ("目标不可写 {0} (可能被安全软件/系统策略拦截)" -f $blockedPath)
-            } else {
-                Write-UiLog -Scope "install" -Level "ERROR" -Message ("无权写入 {0}" -f $blockedPath)
-            }
-        }
-        if (-not $isAdmin) {
-            Write-UiLog -Scope "install" -Level "WARN" -Message "请右键本快捷方式 -> 以管理员身份运行, 或用管理员 PowerShell 重跑"
-        }
-        throw "写入目标不可用, 已中止(未改动任何文件)。"
-    }
+    Write-LogSuccess -Scope "steam" -Message (Format-Text -Key "SteamDirLabel" -Values @($steam))
+    Write-LogInfo -Scope "install" -Message (Format-Text -Key "TargetDirLabel" -Values @($manifestDir))
 
     if ($ShowEnv) {
-        if ($IncludeLua) { Write-UiLog -Scope "install" -Level "INFO" -Message ("Lua 目录 {0}" -f $luaDir) }
-        Write-UiLog -Scope "repair" -Level "INFO" -Message ("本地包源 {0}" -f $localZipDir)
-        Write-UiLog -Scope "repair" -Level "INFO" -Message ("仓库 {0}@{1}" -f $Repo, $Branch)
+        if ($IncludeLua) { Write-LogInfo -Scope "install" -Message (Format-Text -Key "LuaDirLabel" -Values @($luaDir)) }
+        Write-LogInfo -Scope "repair" -Message (Format-Text -Key "LocalSourceDir" -Values @($localZipDir))
+        Write-LogInfo -Scope "repair" -Message (Format-Text -Key "RepoLabel" -Values @($Repo, $Branch))
         if (-not [string]::IsNullOrWhiteSpace($script:LogFile)) {
-            Write-UiLog -Scope "repair" -Level "INFO" -Message ("日志 {0}" -f $script:LogFile)
+            Write-LogInfo -Scope "repair" -Message (Format-Text -Key "LogPathLabel" -Values @($script:LogFile))
         }
     }
 
     if (@(Get-Process -Name "steam" -ErrorAction SilentlyContinue).Count -gt 0) {
-        Write-UiLog -Scope "steam" -Level "WARN" -Message "Steam 正在运行, 写入可能被占用, 建议先退出"
+        Write-LogWarning -Scope "steam" -Message (T -Key "SteamRunning")
     }
 
-    # 1. 索引
+    # --- 权限预检: 系统盘下的 Steam(如 C:\Program Files (x86)\Steam) 默认只让管理员写
+    #     提前失败并给可操作的提示, 而不是抛原始的 UnauthorizedAccessException
+    $writeTargets = @($manifestDir)
+    if ($IncludeLua) { $writeTargets += $luaDir }
+    $blockedTargets = @($writeTargets | Where-Object { -not (Test-DirWritable -PathValue $_) })
+    if ($blockedTargets.Count -gt 0) {
+        $isAdmin = Test-IsAdministrator
+        foreach ($blockedPath in $blockedTargets) {
+            if ($isAdmin) {
+                Write-LogError -Scope "install" -Message (Format-Text -Key "NotWritable" -Values @($blockedPath))
+            } else {
+                Write-LogError -Scope "install" -Message (Format-Text -Key "NoPermission" -Values @($blockedPath))
+            }
+        }
+        if (-not $isAdmin) {
+            Write-LogWarning -Scope "install" -Message (T -Key "RunAsAdmin")
+        }
+        Set-ErrorKind -Kind "Permission"
+        throw (T -Key "TargetBlocked")
+    }
+
+    # --- 索引: 远端列表 + 本地补充
     $index = $null
     if (-not $Offline) {
         $index = Get-RemoteZipIndex -AllowFailure
     }
     $items = @()
-    $remoteCount = 0
     if ($null -ne $index -and @($index.Items).Count -gt 0) {
         $items = @($index.Items)
-        $remoteCount = $items.Count
-        Write-UiLog -Scope "net" -Level "SUCCESS" -Message ("远端列表 {0} 个包 ({1})" -f $remoteCount, $index.Source)
+        Write-LogSuccess -Scope "net" -Message (Format-Text -Key "RemoteListed" -Values @($items.Count, $index.Source))
         if (-not [string]::IsNullOrWhiteSpace($index.Error)) {
-            Write-UiLog -Scope "net" -Level "WARN" -Message ("GitHub API 不可用, 已降级: {0}" -f $index.Error)
+            Write-LogWarning -Scope "net" -Message (Format-Text -Key "RemoteDegraded" -Values @($index.Error))
         }
     } elseif ($null -ne $index -and -not [string]::IsNullOrWhiteSpace($index.Error)) {
-        Write-UiLog -Scope "net" -Level "WARN" -Message ("远端不可用: {0}" -f $index.Error)
+        Write-LogWarning -Scope "net" -Message (Format-Text -Key "RemoteUnavailable" -Values @($index.Error))
     }
 
-    # 本地 manifest/ 作为补充:远端没有的包(尚未推送)也能装
     $localItems = @(Get-LocalZipIndex -Directory $localZipDir)
     if ($Offline) {
         $items = $localItems
-        Write-UiLog -Scope "net" -Level "INFO" -Message ("本地目录 {0} 个包" -f $items.Count)
+        Write-LogInfo -Scope "net" -Message (Format-Text -Key "LocalCount" -Values @($items.Count))
     } elseif ($localItems.Count -gt 0) {
         $remoteNames = @($items | ForEach-Object { $_.Name })
         $extra = @($localItems | Where-Object { $remoteNames -notcontains $_.Name })
         if ($extra.Count -gt 0) {
             $items = @($items) + @($extra)
-            Write-UiLog -Scope "net" -Level "INFO" -Message ("本地补充 {0} 个包 (未推送)" -f $extra.Count)
+            Write-LogInfo -Scope "net" -Message (Format-Text -Key "LocalExtra" -Values @($extra.Count))
         }
     }
 
-    # 远端列表为空时,完全回退本地
+    # 远端列表为空时完全回退本地
     if ($items.Count -eq 0 -and $localItems.Count -gt 0) {
         $items = $localItems
-        Write-UiLog -Scope "net" -Level "WARN" -Message ("回退本地目录 {0} 个包" -f $items.Count)
+        Write-LogWarning -Scope "net" -Message (Format-Text -Key "LocalFallback" -Values @($items.Count))
     }
     if ($items.Count -eq 0) {
-        throw "没有可用的 zip 包(远端与本地均为空)。"
+        throw (T -Key "NoPackages")
     }
 
-    # 1.5 游戏中文名: 默认只读本地名单 manifest\appnames.json, 缺失先用 AppID 顶上
-    #      -RefreshNames 才逐个联网补全(带进度日志)
+    # --- 游戏名: 默认只读本地名单, 缺失先用 AppID 顶上; -RefreshNames 才逐个联网补全
     $cachePath = Join-Path $localZipDir "appnames.json"
     $items = Add-GameDisplayNames -Items $items -CachePath $cachePath -Timeout $TimeoutSeconds -SkipNetwork:$Offline -Refresh:$RefreshNames
 
-    # 2. 选择
+    # --- 选择
     $selected = $null
     if (-not [string]::IsNullOrWhiteSpace($Game)) {
         $matched = @($items | Where-Object {
-            $_.Name -like ("*{0}*" -f $Game) -or
-            $_.DisplayName -like ("*{0}*" -f $Game) -or
-            $_.Alias -like ("*{0}*" -f $Game) -or
-            $_.AppId -eq $Game
-        })
+                $_.Name -like ("*{0}*" -f $Game) -or
+                $_.DisplayName -like ("*{0}*" -f $Game) -or
+                $_.Alias -like ("*{0}*" -f $Game) -or
+                $_.AppId -eq $Game
+            })
         if ($matched.Count -eq 1) {
             $selected = $matched[0]
         } elseif ($matched.Count -gt 1) {
-            Write-UiLog -Scope "repair" -Level "INFO" -Message ("关键词命中 {0} 个, 请从列表选择" -f $matched.Count)
+            Write-LogInfo -Scope "repair" -Message (Format-Text -Key "MatchMultiple" -Values @($matched.Count))
             $menuItems = @(
                 foreach ($item in ($matched | Sort-Object DisplayName)) {
                     [pscustomobject]@{ Item = $item; Value = $item }
                 }
             )
-            $picked = Read-MenuSelection -Items $menuItems -Title ("匹配 [{0}]" -f $Game)
-            if ($null -eq $picked) { throw "已取消。" }
+            $picked = Show-GameMenu -Items $menuItems -Title (Format-Text -Key "MenuMatchTitle" -Values @($Game))
+            if ($null -eq $picked) {
+                Set-ErrorKind -Kind "Cancelled"
+                throw (T -Key "Cancelled")
+            }
             $selected = $picked
         } else {
-            throw ("没有匹配 [{0}] 的游戏包。" -f $Game)
+            Set-ErrorKind -Kind "UserInput"
+            throw (Format-Text -Key "NoMatch" -Values @($Game))
         }
     } else {
         $menuItems = @(
@@ -1118,53 +1460,57 @@ function Invoke-Repair {
                 [pscustomobject]@{ Item = $item; Value = $item }
             }
         )
-        $picked = Read-MenuSelection -Items $menuItems -Title "选择游戏"
-        if ($null -eq $picked) { throw "已取消。" }
+        $picked = Show-GameMenu -Items $menuItems -Title (T -Key "MenuTitle")
+        if ($null -eq $picked) {
+            Set-ErrorKind -Kind "Cancelled"
+            throw (T -Key "Cancelled")
+        }
         $selected = $picked
     }
 
     # 选中的包名字缺失时补一次(单次请求, 不阻塞菜单)
     if (-not $Offline) {
-        $selected = Update-PendingDisplayName -Item $selected -CachePath $cachePath -Timeout $TimeoutSeconds
+        $selected = Update-PendingGameName -Item $selected -CachePath $cachePath -Timeout $TimeoutSeconds
     }
 
-    Write-UiLog -Scope "install" -Level "INFO" -Message ("游戏 {0}" -f (New-GameLabel -Item $selected))
-    Write-UiLog -Scope "install" -Level "INFO" -Message ("来源 {0}" -f $selected.Source)
+    Write-LogInfo -Scope "install" -Message (Format-Text -Key "GameSelected" -Values @((New-GameLabel -Item $selected)))
+    Write-LogInfo -Scope "install" -Message (Format-Text -Key "SourceUsed" -Values @($selected.Source))
 
-    # 3. 下载
+    # --- 取包 + 解压覆盖
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("STEAMX\repair\{0}" -f [Guid]::NewGuid().ToString("N"))
     Ensure-Dir -PathValue $tempRoot
     $zipPath = Join-Path $tempRoot $selected.Name
     try {
-        # 本地已有同名包则直接复用
+        # 本地已有同名包则直接复用, 省一次下载
         $localCandidate = Join-Path $localZipDir $selected.Name
         if (Test-Path -LiteralPath $localCandidate -PathType Leaf) {
-            Write-UiLog -Scope "net" -Level "SUCCESS" -Message ("本地命中 {0}" -f $localCandidate)
+            Write-LogSuccess -Scope "net" -Message (Format-Text -Key "LocalHit" -Values @($localCandidate))
             Copy-Item -LiteralPath $localCandidate -Destination $zipPath -Force
         } else {
             [void](Invoke-FileDownload -Urls $selected.DownloadUrls -Destination $zipPath -Timeout $TimeoutSeconds)
         }
 
         if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf) -or (Get-Item -LiteralPath $zipPath).Length -eq 0) {
-            throw "下载到的 zip 为空。"
+            Set-ErrorKind -Kind "Network"
+            throw (T -Key "ZipEmpty")
         }
         if (-not (Test-ZipMagic -PathValue $zipPath)) {
-            throw "下载到的文件不是有效的 zip(可能是 HTML 错误页)。"
+            Set-ErrorKind -Kind "Network"
+            throw (T -Key "ZipNotValid")
         }
 
-        # 4. 解压覆盖
         $backupDir = ""
         if (-not $NoBackup) {
-            $backupDir = Join-Path (Join-Path $dataRoot "backups") ("repair-{0}" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+            $backupDir = Join-Path (Join-Path $projectRoot "backups") ("repair-{0}" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
         }
         $result = Expand-GameZip -ZipPath $zipPath -LuaDir $luaDir -ManifestDir $manifestDir -BackupDir $backupDir -IncludeLua:$IncludeLua
 
-        Write-UiLog -Scope "install" -Level "SUCCESS" -Message ("清单已安装 新增 {0} / 覆盖 {1}" -f $result.Added, $result.Overwritten)
+        Write-LogSuccess -Scope "install" -Message (Format-Text -Key "Installed" -Values @($result.Added, $result.Overwritten))
         if ($result.Skipped -gt 0) {
-            Write-UiLog -Scope "install" -Level "WARN" -Message ("跳过 {0} 个 .lua (默认不装, 用 -IncludeLua 开启)" -f $result.Skipped)
+            Write-LogWarning -Scope "install" -Message (Format-Text -Key "SkippedLua" -Values @($result.Skipped))
         }
         if (-not [string]::IsNullOrWhiteSpace($backupDir) -and $result.Overwritten -gt 0) {
-            Write-UiLog -Scope "install" -Level "INFO" -Message ("备份 {0}" -f $backupDir)
+            Write-LogInfo -Scope "install" -Message (Format-Text -Key "BackupDirLabel" -Values @($backupDir))
         }
     } finally {
         if (Test-Path -LiteralPath $tempRoot) {
@@ -1173,9 +1519,24 @@ function Invoke-Repair {
     }
 }
 
+# ================================================================ 入口
+
 try {
     Invoke-Repair
 } catch {
-    Write-UiLog -Scope "repair" -Level "ERROR" -Message $_.Exception.Message
-    exit 1
+    $kind = Get-ErrorKind -ErrorRecord $_
+    $message = [string]$_.Exception.Message
+    if ([string]::IsNullOrWhiteSpace($message)) { $message = (T -Key "EnvUnknown") }
+
+    if ($kind -eq "Cancelled") {
+        Write-LogWarning -Scope "repair" -Message $message
+    } else {
+        Write-LogError -Scope "repair" -Message $message
+        Show-ErrorGuidance -Kind $kind -Detail $_.Exception.ToString()
+    }
+    $script:ExitCode = Get-ExitCodeForKind -Kind $kind
+} finally {
+    Restore-Terminal
 }
+
+exit $script:ExitCode
