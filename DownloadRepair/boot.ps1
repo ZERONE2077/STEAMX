@@ -68,4 +68,6 @@ if (-not $src) {
     exit 7
 }
 
-& ([scriptblock]::Create($src))
+# run it, forwarding whatever arguments we were given, so a caller can do
+#   powershell -NoProfile -ExecutionPolicy Bypass -File boot.ps1 -Game 1091500
+& ([scriptblock]::Create($src)) @args
