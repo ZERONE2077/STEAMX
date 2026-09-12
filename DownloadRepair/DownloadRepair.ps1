@@ -269,6 +269,45 @@ function Ensure-Dir {
     }
 }
 
+# ---------------------------------------------------------------- 权限
+
+function Test-Admin {
+    try {
+        $principal = [System.Security.Principal.WindowsPrincipal]::new([System.Security.Principal.WindowsIdentity]::GetCurrent())
+        return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+# 直接试写探针文件判断可写(比读 ACL 可靠); 目录不存在时沿父链向上找最近的已存在目录
+function Test-DirWritable {
+    param([Parameter(Mandatory = $true)][string]$PathValue)
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { return $false }
+
+    $target = $PathValue
+    try {
+        while (-not (Test-Path -LiteralPath $target)) {
+            $parent = Split-Path -Parent $target
+            if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $target) { return $false }
+            $target = $parent
+        }
+    } catch {
+        return $false
+    }
+
+    $probe = Join-Path $target ("steamx-probe-{0}.tmp" -f [Guid]::NewGuid().ToString("N"))
+    try {
+        $stream = [System.IO.File]::Open($probe, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $stream.Dispose()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # ---------------------------------------------------------------- Steam 路径
 
 function Test-SteamDir {
@@ -969,6 +1008,26 @@ function Invoke-Repair {
 
     Write-UiLog -Scope "steam" -Level "SUCCESS" -Message ("Steam {0}" -f $steam)
     Write-UiLog -Scope "install" -Level "INFO" -Message ("目标 {0}" -f $manifestDir)
+
+    # 权限预检: 系统盘下的 Steam(如 C:\Program Files (x86)\Steam) 默认只让管理员写,
+    # 提前失败并给可操作的提示, 而不是抛原始的 UnauthorizedAccessException
+    $writeTargets = @($manifestDir)
+    if ($IncludeLua) { $writeTargets += $luaDir }
+    $blockedTargets = @($writeTargets | Where-Object { -not (Test-DirWritable -PathValue $_) })
+    if ($blockedTargets.Count -gt 0) {
+        $isAdmin = Test-Admin
+        foreach ($blockedPath in $blockedTargets) {
+            if ($isAdmin) {
+                Write-UiLog -Scope "install" -Level "ERROR" -Message ("目标不可写 {0} (可能被安全软件/系统策略拦截)" -f $blockedPath)
+            } else {
+                Write-UiLog -Scope "install" -Level "ERROR" -Message ("无权写入 {0}" -f $blockedPath)
+            }
+        }
+        if (-not $isAdmin) {
+            Write-UiLog -Scope "install" -Level "WARN" -Message "请右键本快捷方式 -> 以管理员身份运行, 或用管理员 PowerShell 重跑"
+        }
+        throw "写入目标不可用, 已中止(未改动任何文件)。"
+    }
 
     if ($ShowEnv) {
         if ($IncludeLua) { Write-UiLog -Scope "install" -Level "INFO" -Message ("Lua 目录 {0}" -f $luaDir) }
