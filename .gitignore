@@ -7,6 +7,8 @@ test/
 .workbuddy/
 backups/
 patch/
+# 清单包源：只留在开发机上，不上传仓库（31 个 zip 约 141MB）
+/manifest/
 # OST 配置属于运行时文件（拷进 Steam 根目录用），仓库不跟踪
 opensteamtool.toml
 opensteamtool.example.toml
