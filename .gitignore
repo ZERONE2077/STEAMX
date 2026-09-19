@@ -7,5 +7,8 @@ test/
 .workbuddy/
 backups/
 patch/
+# OST 配置属于运行时文件（拷进 Steam 根目录用），仓库不跟踪
+opensteamtool.toml
+opensteamtool.example.toml
 *.log
 *.tmp
