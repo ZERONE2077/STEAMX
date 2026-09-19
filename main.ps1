@@ -947,6 +947,23 @@ function Invoke-AddGame {
     } else {
         Resolve-LocalPath -PathValue $LuaOverride -BasePath (Get-ScriptRoot)
     }
+    # OST fetches the depot manifests on its own, but only while its toml points at a source
+    # that still answers: the example shipped with OST defaults to "opensteamtool", and that
+    # one is dead. Align the source before downloading, otherwise a lua-only install is useless.
+    $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
+    $ostFiles = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
+    $ostInstalled = $false
+    foreach ($ostFileName in $ostFiles) {
+        if (Test-Path -LiteralPath (Join-Path $steamPath $ostFileName)) { $ostInstalled = $true; break }
+    }
+    if ($ostInstalled) {
+        $manifestConfig = Get-ConfigValue -Object $Config -Name "manifest" -DefaultValue $null
+        $manifestSource = [string](Get-ConfigValue -Object $manifestConfig -Name "source" -DefaultValue "wudrm")
+        $tomlPath = Get-OstConfigPath -Config $Config -SteamPath $steamPath
+        if (Set-OstManifestSourceInToml -TomlPath $tomlPath -Source $manifestSource) {
+            Write-UiLog -Scope "addgame" -Level SUCCESS -Message ("manifest source -> {0} in {1}" -f $manifestSource, (Get-DisplayPath -PathValue $tomlPath))
+        }
+    }
     $networkConfig = Get-ConfigValue -Object $Config -Name "network" -DefaultValue $null
     if ($RequestTimeoutSeconds -le 0) {
         $RequestTimeoutSeconds = [int](Get-ConfigValue -Object $networkConfig -Name "hubcapTimeoutSeconds" -DefaultValue 180)
@@ -1792,13 +1809,16 @@ function Set-OstManifestSourceInToml {
         [Parameter(Mandatory = $true)][string]$Source
     )
 
-    $validSources = @("opensteamtool", "wudrm", "steamrun")
+    # Sources understood by the OST builds in the wild: the 1.5.x line knows the first three,
+    # the 1.4.8.x line adds "manifestdex". "wudrm" is the one that keeps working from CN.
+    $validSources = @("opensteamtool", "wudrm", "steamrun", "manifestdex")
     if ($Source -notin $validSources) {
         throw ("Invalid manifest source: {0}. Valid: {1}" -f $Source, ($validSources -join ", "))
     }
 
     Ensure-Directory -PathValue (Split-Path -Parent $TomlPath)
     $line = 'url = "{0}"' -f $Source
+
     if (-not (Test-Path -LiteralPath $TomlPath)) {
         Set-Content -LiteralPath $TomlPath -Encoding UTF8 -Value @(
             "[manifest]",
@@ -1808,11 +1828,81 @@ function Set-OstManifestSourceInToml {
             "timeout_send_ms    = 10000",
             "timeout_recv_ms    = 10000"
         )
-        return
+        return $true
     }
 
-    # Preserve an existing OpenSteamTool configuration supplied by the user.
-    return
+    # An existing toml belongs to the user (everyone copies the example that ships with OST),
+    # so only the [manifest] url line is ours to touch: rewrite that single line and keep the
+    # comments, key order, BOM state and line endings exactly as they were. OST hot-reloads
+    # the file, so nothing has to be restarted for this to take effect.
+    $bytes = [System.IO.File]::ReadAllBytes($TomlPath)
+    $hasBom = ($bytes.Length -ge 3) -and ($bytes[0] -eq 0xEF) -and ($bytes[1] -eq 0xBB) -and ($bytes[2] -eq 0xBF)
+    $encoding = New-Object System.Text.UTF8Encoding $hasBom
+    $text = $encoding.GetString($bytes)
+    $eol = ""
+    if ($text.Contains("`r`n")) { $eol = "`r" }
+    $lines = @($text -split "`n")
+
+    $sectionSeen = $false
+    $handled = $false
+    $changed = $false
+    $result = New-Object System.Collections.Generic.List[string]
+
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $current = [string]$lines[$index]
+        $trimmed = $current.Trim()
+
+        if (-not $sectionSeen) {
+            if ($trimmed -eq "[manifest]") { $sectionSeen = $true }
+            $result.Add($current)
+            continue
+        }
+
+        if ($handled) {
+            $result.Add($current)
+            continue
+        }
+
+        if ($trimmed.StartsWith("[")) {
+            # Section ended without a url key: ours goes in directly above this header.
+            $result.Add($line + $eol)
+            $handled = $true
+            $changed = $true
+            $result.Add($current)
+            continue
+        }
+
+        if ($trimmed -match '^url[ \t]*=') {
+            $handled = $true
+            if ($trimmed -eq $line) {
+                $result.Add($current)
+            } else {
+                $result.Add($line + $eol)
+                $changed = $true
+            }
+            continue
+        }
+
+        $result.Add($current)
+    }
+
+    if (-not $sectionSeen) {
+        $result.Add("")
+        $result.Add("[manifest]")
+        $result.Add($line + $eol)
+        $changed = $true
+    } elseif (-not $handled) {
+        # Section runs to the end of the file; step back over the trailing blank lines.
+        $insertAt = $result.Count
+        while ($insertAt -gt 0 -and ([string]$result[$insertAt - 1]).Trim() -eq "") { $insertAt-- }
+        $result.Insert($insertAt, $line + $eol)
+        $changed = $true
+    }
+
+    if (-not $changed) { return $false }
+
+    [System.IO.File]::WriteAllText($TomlPath, ($result -join "`n"), $encoding)
+    return $true
 }
 
 function Invoke-Check {
