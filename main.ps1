@@ -15,7 +15,6 @@ param(
     [string]$CredentialPath = "",
     [switch]$ResetApiKey,
     [string]$LuaPath = "",
-    [string]$DepotCachePath = "",
     [string]$OutputName = "",
     [int]$TimeoutSeconds = 0
 )
@@ -289,8 +288,8 @@ function New-DefaultConfig {
         steamPath  = ""
         network    = [pscustomobject]@{
             timeoutSeconds       = 30
-            # Hubcap builds a manifest archive on first request; response headers can take
-            # over a minute, so this needs its own (much larger) budget.
+            # Hubcap builds the lua on demand; response headers can take over a minute,
+            # so this needs its own (much larger) budget.
             hubcapTimeoutSeconds = 180
         }
         manifest   = [pscustomobject]@{
@@ -780,12 +779,18 @@ function Get-HubcapLuaUrl {
         [Parameter(Mandatory = $true)][string]$ResolvedAppId
     )
 
-    # /manifest/<appid> returns a zip: <appid>.lua plus one .manifest per depot.
-    # /lua/... returns plain-text lua only, with no depot manifests.
+    # Every lua endpoint answers with plain text, so no depot manifest archive is needed:
+    # OST fetches the manifests itself. "full" keeps the old /manifest zip as a fallback -
+    # it carries the same lua, and the .manifest entries inside it are ignored.
     switch ($ResolvedVariant) {
-        "full" { return "https://hubcapmanifest.com/api/v1/manifest/$ResolvedAppId" }
-        "basegame" { return "https://hubcapmanifest.com/api/v1/lua/basegame/$ResolvedAppId" }
-        "dlc" { return "https://hubcapmanifest.com/api/v1/lua/dlc/$ResolvedAppId" }
+        "full" {
+            return @(
+                "https://hubcapmanifest.com/api/v1/lua/$ResolvedAppId",
+                "https://hubcapmanifest.com/api/v1/manifest/$ResolvedAppId"
+            )
+        }
+        "basegame" { return @("https://hubcapmanifest.com/api/v1/lua/basegame/$ResolvedAppId") }
+        "dlc" { return @("https://hubcapmanifest.com/api/v1/lua/dlc/$ResolvedAppId") }
         default { throw "Unsupported Hubcap variant: $ResolvedVariant" }
     }
 }
@@ -869,7 +874,7 @@ function Invoke-HubcapDownloadWithProgress {
             $retryable = ($statusCode -eq 0) -and (Test-HubcapTimeoutError -ErrorRecord $_)
             if ((-not $retryable) -or ($attempt -ge $maxAttempts)) {
                 if ($retryable) {
-                    throw "Hubcap did not answer within $RequestTimeoutSeconds s. The server builds the manifest archive on demand; try again in a minute."
+                    throw "Hubcap did not answer within $RequestTimeoutSeconds s. The lua is built on demand; try again in a minute."
                 }
                 throw
             }
@@ -888,8 +893,7 @@ function Install-HubcapLuaDownload {
     param(
         [Parameter(Mandatory = $true)][string]$DownloadPath,
         [Parameter(Mandatory = $true)][string]$TargetDirectory,
-        [Parameter(Mandatory = $true)][string]$TargetFileName,
-        [AllowEmptyString()][string]$DepotCacheDirectory = ""
+        [Parameter(Mandatory = $true)][string]$TargetFileName
     )
 
     Ensure-Directory -PathValue $TargetDirectory
@@ -897,10 +901,12 @@ function Install-HubcapLuaDownload {
         $targetFile = Join-Path $TargetDirectory ([System.IO.Path]::GetFileName($TargetFileName))
         Copy-Item -LiteralPath $DownloadPath -Destination $targetFile -Force
         Write-UiLog -Scope "install" -Level SUCCESS -Message ("lua -> {0}" -f (Get-DisplayPath -PathValue $targetFile))
-        Write-UiLog -Scope "install" -Level WARN -Message "raw lua download carries no depot manifests"
         return
     }
 
+    # Fallback path only: the Hubcap lua endpoints answer with plain text, but a zip
+    # response is still tolerated. Depot manifests inside the archive are ignored on
+    # purpose - OST fetches them on its own, so nothing is written to depotcache.
     $extractDirectory = Join-Path (Split-Path -Parent $DownloadPath) "extract"
     Ensure-Directory -PathValue $extractDirectory
     # ZipFile::ExtractToDirectory works regardless of the file extension (Expand-Archive does not).
@@ -915,25 +921,6 @@ function Install-HubcapLuaDownload {
         Copy-Item -LiteralPath $luaFile.FullName -Destination $targetFile -Force
         Write-UiLog -Scope "install" -Level SUCCESS -Message ("lua -> {0}" -f (Get-DisplayPath -PathValue $targetFile))
     }
-
-    if ([string]::IsNullOrWhiteSpace($DepotCacheDirectory)) { return }
-
-    $manifestFiles = @(Get-ChildItem -LiteralPath $extractDirectory -Recurse -File -Filter *.manifest)
-    if ($manifestFiles.Count -eq 0) {
-        Write-UiLog -Scope "install" -Level WARN -Message "archive contains no depot manifest files"
-        return
-    }
-
-    Ensure-Directory -PathValue $DepotCacheDirectory
-    $copied = 0
-    $totalBytes = 0L
-    foreach ($manifestFile in $manifestFiles) {
-        $targetFile = Join-Path $DepotCacheDirectory $manifestFile.Name
-        Copy-Item -LiteralPath $manifestFile.FullName -Destination $targetFile -Force
-        $copied++
-        $totalBytes += $manifestFile.Length
-    }
-    Write-UiLog -Scope "install" -Level SUCCESS -Message ("{0} depot manifest(s), {1} -> {2}" -f $copied, (Format-FileSize -Bytes $totalBytes), (Get-DisplayPath -PathValue $DepotCacheDirectory))
 }
 
 function Invoke-AddGame {
@@ -946,7 +933,6 @@ function Invoke-AddGame {
         [switch]$ForceApiKeyPrompt,
         [switch]$RetryInvalidCredential,
         [string]$LuaOverride = "",
-        [string]$DepotCacheOverride = "",
         [string]$RequestedOutputName = "",
         [int]$RequestTimeoutSeconds = 0
     )
@@ -961,11 +947,6 @@ function Invoke-AddGame {
     } else {
         Resolve-LocalPath -PathValue $LuaOverride -BasePath (Get-ScriptRoot)
     }
-    $targetDepotCachePath = if ([string]::IsNullOrWhiteSpace($DepotCacheOverride)) {
-        Join-Path $steamPath "depotcache"
-    } else {
-        Resolve-LocalPath -PathValue $DepotCacheOverride -BasePath (Get-ScriptRoot)
-    }
     $networkConfig = Get-ConfigValue -Object $Config -Name "network" -DefaultValue $null
     if ($RequestTimeoutSeconds -le 0) {
         $RequestTimeoutSeconds = [int](Get-ConfigValue -Object $networkConfig -Name "hubcapTimeoutSeconds" -DefaultValue 180)
@@ -976,7 +957,7 @@ function Invoke-AddGame {
         -CredentialFile $credentialFile `
         -ForcePrompt:$ForceApiKeyPrompt
     $headers = Get-HubcapHeaders -ResolvedApiKey $resolvedApiKey
-    $downloadUrl = Get-HubcapLuaUrl -ResolvedVariant $InputVariant -ResolvedAppId $resolvedAppId
+    $downloadUrls = @(Get-HubcapLuaUrl -ResolvedVariant $InputVariant -ResolvedAppId $resolvedAppId)
     $outputFileName = if ([string]::IsNullOrWhiteSpace($RequestedOutputName)) {
         if ($InputVariant -eq "full") { "$resolvedAppId.lua" } else { "$resolvedAppId.$InputVariant.lua" }
     } else {
@@ -985,7 +966,6 @@ function Invoke-AddGame {
 
     Write-UiLog -Scope "addgame" -Level INFO -Message ("{0,-10}{1}" -f "appid", ("{0} (variant={1})" -f $resolvedAppId, $InputVariant))
     Write-UiLog -Scope "addgame" -Level INFO -Message ("{0,-10}{1}" -f "lua", (Get-DisplayPath -PathValue $targetLuaPath))
-    Write-UiLog -Scope "addgame" -Level INFO -Message ("{0,-10}{1}" -f "depot", (Get-DisplayPath -PathValue $targetDepotCachePath))
     $apiStatus = Show-HubcapApiStatus -Headers $headers -RequestTimeoutSeconds $RequestTimeoutSeconds
     if ($apiStatus -eq "Unauthorized") {
         if (-not $RetryInvalidCredential) {
@@ -1009,24 +989,37 @@ function Invoke-AddGame {
     $tempDownload = Join-Path $tempRoot "download.zip"
     try {
         Ensure-Directory -PathValue $tempRoot
-        Write-UiLog -Scope "hubcap" -Level INFO -Message "requesting the manifest archive (the server may take up to a minute to build it)"
-        Invoke-HubcapDownloadWithProgress `
-            -Url $downloadUrl `
-            -Destination $tempDownload `
-            -Headers $headers `
-            -RequestTimeoutSeconds $RequestTimeoutSeconds
+        $lastDownloadError = $null
+        $downloaded = $false
+        foreach ($downloadUrl in $downloadUrls) {
+            try {
+                Write-UiLog -Scope "hubcap" -Level INFO -Message ("requesting lua <- {0}" -f ($downloadUrl -replace '^https?://[^/]+/api/v1/', ''))
+                Invoke-HubcapDownloadWithProgress `
+                    -Url $downloadUrl `
+                    -Destination $tempDownload `
+                    -Headers $headers `
+                    -RequestTimeoutSeconds $RequestTimeoutSeconds
+                $downloaded = $true
+                break
+            } catch {
+                $lastDownloadError = $_
+                Write-UiLog -Scope "hubcap" -Level WARN -Message ("source failed ({0}): {1}" -f ($downloadUrl -replace '^https?://[^/]+/api/v1/', ''), $_.Exception.Message)
+            }
+        }
+        if (-not $downloaded) {
+            throw $lastDownloadError
+        }
         Install-HubcapLuaDownload `
             -DownloadPath $tempDownload `
             -TargetDirectory $targetLuaPath `
-            -TargetFileName $outputFileName `
-            -DepotCacheDirectory $targetDepotCachePath
+            -TargetFileName $outputFileName
     } finally {
         if (Test-Path -LiteralPath $tempRoot) {
             Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
-    Write-UiLog -Scope "steam" -Level INFO -Message "restart Steam to load the new lua and depot manifests"
+    Write-UiLog -Scope "steam" -Level INFO -Message "restart Steam to load the new lua"
 }
 
 function Get-SteamVersionInfo {
@@ -2278,7 +2271,6 @@ function Invoke-QuickStart {
                 -ForceApiKeyPrompt:$ResetApiKey `
                 -RetryInvalidCredential `
                 -LuaOverride $LuaPath `
-                -DepotCacheOverride $DepotCachePath `
                 -RequestTimeoutSeconds $TimeoutSeconds
         } catch {
             Write-UiLog -Scope "steamx" -Message $_.Exception.Message -Level ERROR
@@ -2305,7 +2297,6 @@ if ($MyInvocation.InvocationName -ne ".") {
                     -CredentialOverride $CredentialPath `
                     -ForceApiKeyPrompt:$ResetApiKey `
                     -LuaOverride $LuaPath `
-                    -DepotCacheOverride $DepotCachePath `
                     -RequestedOutputName $OutputName `
                     -RequestTimeoutSeconds $TimeoutSeconds
             }
