@@ -1,0 +1,19 @@
+# Line endings are load-bearing in this repo.
+#
+# main.ps1 and boot-main.ps1 are consumed through `powershell.exe -File` and through
+# `irm | iex`, and the project treats a stray CR as a defect. Git stores them as LF
+# already, but core.autocrlf=true (set in this working copy) rewrites the working tree
+# to CRLF on every checkout. Pin it here so clones behave the same everywhere.
+*.ps1    text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+*.toml   text eol=lf
+*.drawio text eol=lf
+
+# Never let git normalise these: a single byte swims out of place in a Windows
+# shortcut or an archive.
+*.lnk    binary
+*.zip    binary
+*.vdf    binary
+*.png    binary
+*.ico    binary
