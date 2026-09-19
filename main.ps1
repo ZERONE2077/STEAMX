@@ -155,9 +155,13 @@ function Test-SteamxProjectRoot {
     if ([string]::IsNullOrWhiteSpace($PathValue)) { return $false }
     try {
         if (-not (Test-Path -LiteralPath $PathValue -PathType Container)) { return $false }
-        foreach ($marker in @("main.ps1", "manifest", "Lua", "DownloadRepair")) {
-            if (Test-Path -LiteralPath (Join-Path $PathValue $marker)) { return $true }
+        # A real checkout carries both entry scripts. Requiring the pair instead of any
+        # single marker keeps the download caches - %TEMP%\STEAMX and %LOCALAPPDATA%\STEAMX,
+        # which only ever hold a fetched main.ps1 - from passing as the project root.
+        foreach ($marker in @("main.ps1", "boot-main.ps1")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $PathValue $marker))) { return $false }
         }
+        return $true
     } catch {
     }
     return $false
@@ -468,16 +472,23 @@ function Get-HttpErrorDetail {
 function Get-HttpStatusCode {
     param([Parameter(Mandatory = $true)]$ErrorRecord)
 
-    $responseProperty = $ErrorRecord.Exception.PSObject.Properties["Response"]
-    if ($null -eq $responseProperty -or $null -eq $responseProperty.Value) {
-        return 0
+    # Same trap as Get-HttpErrorDetail: the HttpWebResponse hangs off the inner
+    # WebException, not off the MethodInvocationException PowerShell throws. Reading
+    # .Exception.Response made every status check return 0, which silently disabled the
+    # 401 API-Key-expired branch on the download path.
+    $exception = $ErrorRecord.Exception
+    while ($null -ne $exception) {
+        $responseProperty = $exception.PSObject.Properties["Response"]
+        if ($null -ne $responseProperty -and $null -ne $responseProperty.Value) {
+            try {
+                return [int]$responseProperty.Value.StatusCode
+            } catch {
+                return 0
+            }
+        }
+        $exception = $exception.InnerException
     }
-
-    try {
-        return [int]$responseProperty.Value.StatusCode
-    } catch {
-        return 0
-    }
+    return 0
 }
 
 function Get-LatestOstRelease {
@@ -768,7 +779,7 @@ function Show-HubcapApiStatus {
             Write-UiLog -Scope "hubcap" -Level WARN -Message "API Key is invalid or expired"
             return "Unauthorized"
         }
-        Write-UiLog -Scope "hubcap" -Level WARN -Message ("status query failed: {0}" -f $_.Exception.Message)
+        Write-UiLog -Scope "hubcap" -Level WARN -Message ("status query failed, continuing: {0}" -f $_.Exception.Message)
         return "Unavailable"
     }
 }
@@ -809,19 +820,35 @@ function Test-ZipFile {
     }
 }
 
-function Test-HubcapTimeoutError {
+function Test-HubcapRetryableError {
     param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    # For a large share of users the link to hubcapmanifest.com dies mid-request (VPN node
+    # hopping, cross-border congestion, a proxy that drops long-lived sockets). That shows up
+    # as a closed/broken connection, not as a clean timeout, so every status that means
+    # "the socket died before an answer arrived" has to be treated as retryable here.
+    # Retrying only Timeout used to abort the whole import on a single dropped connection.
+    $retryableStatuses = @(
+        [System.Net.WebExceptionStatus]::Timeout,
+        [System.Net.WebExceptionStatus]::ConnectionClosed,
+        [System.Net.WebExceptionStatus]::KeepAliveFailure,
+        [System.Net.WebExceptionStatus]::SendFailure,
+        [System.Net.WebExceptionStatus]::ReceiveFailure,
+        [System.Net.WebExceptionStatus]::ConnectFailure,
+        [System.Net.WebExceptionStatus]::NameResolutionFailure,
+        [System.Net.WebExceptionStatus]::PipelineFailure
+    )
 
     $inner = $ErrorRecord.Exception
     while ($null -ne $inner) {
-        if ($inner -is [System.Net.WebException] -and $inner.Status -eq [System.Net.WebExceptionStatus]::Timeout) {
+        if ($inner -is [System.Net.WebException] -and ($retryableStatuses -contains $inner.Status)) {
             return $true
         }
         $inner = $inner.InnerException
     }
     # WebException messages are localized, so the status chain above is the reliable
     # signal; keep this text match ASCII-only as a secondary check.
-    return ([string]$ErrorRecord.Exception.Message -match '(?i)timed?\s*out|timeout')
+    return ([string]$ErrorRecord.Exception.Message -match '(?i)timed?\s*out|timeout|closed|reset|refused|aborted|unexpected EOF|SSL|TLS')
 }
 
 function Invoke-HubcapDownloadWithProgress {
@@ -832,7 +859,7 @@ function Invoke-HubcapDownloadWithProgress {
         [Parameter(Mandatory = $true)][int]$RequestTimeoutSeconds
     )
 
-    $maxAttempts = 2
+    $maxAttempts = 3
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         $request = [System.Net.HttpWebRequest]::Create($Url)
         $request.UserAgent = [string]$Headers["User-Agent"]
@@ -841,6 +868,10 @@ function Invoke-HubcapDownloadWithProgress {
         $request.AllowAutoRedirect = $true
         $request.Timeout = $RequestTimeoutSeconds * 1000
         $request.ReadWriteTimeout = $RequestTimeoutSeconds * 1000
+        # Never pick a socket back out of the connection pool: a pooled connection that the
+        # server, a NAT or a proxy already dropped comes back as "the underlying connection
+        # was closed" on the next send. A fresh socket per attempt avoids that failure mode.
+        $request.KeepAlive = $false
         $response = $null
         $responseStream = $null
         $fileStream = $null
@@ -871,15 +902,19 @@ function Invoke-HubcapDownloadWithProgress {
             if ($statusCode -eq 401) {
                 throw "Hubcap rejected the API Key while downloading. Run the game import again to replace the saved key."
             }
-            $retryable = ($statusCode -eq 0) -and (Test-HubcapTimeoutError -ErrorRecord $_)
+            # Retry the transport-level failures (no status code at all) plus the transient
+            # server answers. A 404 or 401 is final and must not be retried.
+            $isTransientServerError = ($statusCode -ge 500) -or ($statusCode -eq 408) -or ($statusCode -eq 429)
+            $retryable = (($statusCode -eq 0) -and (Test-HubcapRetryableError -ErrorRecord $_)) -or $isTransientServerError
             if ((-not $retryable) -or ($attempt -ge $maxAttempts)) {
                 if ($retryable) {
-                    throw "Hubcap did not answer within $RequestTimeoutSeconds s. The lua is built on demand; try again in a minute."
+                    throw ("Hubcap could not be reached after {0} attempts. The lua is built on demand and the link to hubcapmanifest.com dropped mid-request - {1} If a proxy or VPN is running, switch the node and try again." -f $maxAttempts, $_.Exception.Message)
                 }
                 throw
             }
-            Write-UiLog -Scope "hubcap" -Level WARN -Message ("no response in {0}s, retrying ({1}/{2})" -f $RequestTimeoutSeconds, ($attempt + 1), $maxAttempts)
-            Start-Sleep -Seconds 3
+            $backoffSeconds = [int][Math]::Pow(2, $attempt)
+            Write-UiLog -Scope "hubcap" -Level WARN -Message ("link dropped, retrying in {0}s ({1}/{2}): {3}" -f $backoffSeconds, ($attempt + 1), $maxAttempts, $_.Exception.Message)
+            Start-Sleep -Seconds $backoffSeconds
         } finally {
             if ($null -ne $fileStream) { $fileStream.Dispose() }
             if ($null -ne $responseStream) { $responseStream.Dispose() }
@@ -1008,6 +1043,7 @@ function Invoke-AddGame {
         Ensure-Directory -PathValue $tempRoot
         $lastDownloadError = $null
         $downloaded = $false
+        $notFound = $false
         foreach ($downloadUrl in $downloadUrls) {
             try {
                 Write-UiLog -Scope "hubcap" -Level INFO -Message ("requesting lua <- {0}" -f ($downloadUrl -replace '^https?://[^/]+/api/v1/', ''))
@@ -1020,10 +1056,22 @@ function Invoke-AddGame {
                 break
             } catch {
                 $lastDownloadError = $_
-                Write-UiLog -Scope "hubcap" -Level WARN -Message ("source failed ({0}): {1}" -f ($downloadUrl -replace '^https?://[^/]+/api/v1/', ''), $_.Exception.Message)
+                $sourceLabel = $downloadUrl -replace '^https?://[^/]+/api/v1/', ''
+                if ((Get-HttpStatusCode -ErrorRecord $_) -eq 404) {
+                    $notFound = $true
+                    Write-UiLog -Scope "hubcap" -Level WARN -Message ("source not found ({0})" -f $sourceLabel)
+                } else {
+                    Write-UiLog -Scope "hubcap" -Level WARN -Message ("source failed ({0}): {1}" -f $sourceLabel, $_.Exception.Message)
+                }
             }
         }
         if (-not $downloaded) {
+            # A 404 means the server answered and simply has no lua for this AppID. Demos,
+            # pre-release pages and delisted entries are the usual causes, so explain that
+            # instead of surfacing a raw .NET exception to the user.
+            if ($notFound -and ((Get-HttpStatusCode -ErrorRecord $lastDownloadError) -eq 404)) {
+                throw ("Hubcap has no lua for AppID {0}. Demos, pre-release pages and delisted games are not covered - use the full game's store link instead." -f $resolvedAppId)
+            }
             throw $lastDownloadError
         }
         Install-HubcapLuaDownload `
