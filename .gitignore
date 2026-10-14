@@ -15,7 +15,12 @@ cache-service/
 # main.ps1 通过 Get-OstTomlContent 从仓库下载它（首次部署且用户没有 toml 时）。
 # 不要加回忽略，否则下载路径 404、只能退回内嵌模板。
 # 注意：<Steam>/opensteamtool.toml 是运行时文件，部署流程只在用户【没有】它时才写。
-opensteamtool.example.toml
+#
+# opensteamtool.example.toml 已删除（2026-10-15）：它从未被 main.ps1 引用，
+# 内容是 mmxlyo 时代的 3 源版（url=wudrm、旧超时），而且注释里的 manifest.lua
+# 示例写的是"wudrm 优先"，与 lua/manifest.lua 实际的 manifestdex 优先相反。
+# opensteamtool.toml 本身就是那份"示例"，不再需要第二个名字。
+# 需要旧内容：git show b5fd34a^:opensteamtool.example.toml
 # 沙箱文件权限修复的备份与报告（本机一次性产物，含权限回滚脚本）
 /.acl-recovery/
 *.log
