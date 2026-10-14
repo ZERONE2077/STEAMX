@@ -2753,7 +2753,9 @@ function Invoke-DeployOst {
         $tomlPath = Get-OstConfigPath -Config $Config -SteamPath $steamPath
         $configExisted = Test-Path -LiteralPath $tomlPath -PathType Leaf
         $configRollbackBackup = if ($configExisted) { Backup-ExistingFile -SourceFile $tomlPath -BackupDir $RunContext.BackupDir } else { "" }
-        Set-OstManifestSourceInToml -TomlPath $tomlPath -Source ([string](Get-ConfigValue -Object (Get-ConfigValue -Object $Config -Name "manifest" -DefaultValue $null) -Name "source" -DefaultValue "wudrm"))
+        # Out-Null: the function returns a bool and PowerShell would otherwise echo it
+        # to the console as a stray "True" between the Deployed lines.
+        Set-OstManifestSourceInToml -TomlPath $tomlPath -Source ([string](Get-ConfigValue -Object (Get-ConfigValue -Object $Config -Name "manifest" -DefaultValue $null) -Name "source" -DefaultValue "wudrm")) | Out-Null
         $configRecord = [pscustomobject]@{
             path       = $tomlPath
             rollbackBackupPath = $configRollbackBackup
@@ -2833,7 +2835,7 @@ function Invoke-SetManifestSource {
         $backupPath = Backup-ExistingFile -SourceFile $tomlPath -BackupDir $RunContext.BackupDir
     }
     try {
-        Set-OstManifestSourceInToml -TomlPath $tomlPath -Source $Source
+        Set-OstManifestSourceInToml -TomlPath $tomlPath -Source $Source | Out-Null
         Write-Log -Message ("Manifest source set to: {0}" -f $Source) -Scope "ost" -LogFile $RunContext.LogFile
     } catch {
         if (-not [string]::IsNullOrWhiteSpace($backupPath) -and (Test-Path -LiteralPath $backupPath)) {
@@ -3065,7 +3067,17 @@ function Invoke-QuickStart {
                 $manualRemote = Get-LatestOstReleaseInfo -Config $Config -AllowFailure
                 if ($manualRemote.Available) { Add-OstHandledTag -Tag ([string]$manualRemote.Version) }
             } catch {
+                # TEMP DIAGNOSTIC (2026-10-15): a deploy that visibly succeeded still
+                # ended in "未能找到路径...run.log" from somewhere in the two calls
+                # above. Write-Log is already guarded, so the origin is unknown; report
+                # the type, the throwing statement and its line so the real site is
+                # identifiable. Remove once fixed.
                 Write-UiLog -Scope "steamx" -Level ERROR -Message $_.Exception.Message
+                Write-UiLog -Scope "diag" -Level WARN -Message ("type={0} line={1} cmd={2}" -f `
+                    $_.Exception.GetType().Name, `
+                    $_.InvocationInfo.ScriptLineNumber, `
+                    ([string]$_.InvocationInfo.Line).Trim())
+                Write-UiLog -Scope "diag" -Level WARN -Message ("stack={0}" -f (($_.ScriptStackTrace -split "`n") | Select-Object -First 4 | ForEach-Object { $_.Trim() }) -join ' <- ')
             }
             continue
         }
