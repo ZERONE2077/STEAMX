@@ -346,7 +346,7 @@ function New-DefaultConfig {
         ost        = [pscustomobject]@{
             sourceType                  = "github-release"
             sourcePath                  = "./ost"
-            githubRepo                  = "mmxlyo/OpenSteamTool"
+            githubRepo                  = "huanyuejue/OpenSteamTool"
             assetPattern                = "*Release.zip"
             assetNameTemplate           = "OpenSteamTool-{tag}-Release.zip"
             # Every mirror has bad days: an upstream outage, a rotated certificate,
@@ -639,7 +639,7 @@ function Get-LatestOstRelease {
 
     $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
     $networkConfig = Get-ConfigValue -Object $Config -Name "network" -DefaultValue $null
-    $repo = [string](Get-ConfigValue -Object $ostConfig -Name "githubRepo" -DefaultValue "mmxlyo/OpenSteamTool")
+    $repo = [string](Get-ConfigValue -Object $ostConfig -Name "githubRepo" -DefaultValue "huanyuejue/OpenSteamTool")
     $timeoutSeconds = [int](Get-ConfigValue -Object $networkConfig -Name "timeoutSeconds" -DefaultValue 30)
     if ($script:OstReleaseCache.ContainsKey($repo)) {
         return $script:OstReleaseCache[$repo]
@@ -1973,7 +1973,7 @@ function Get-OstSourceDirectoryFromGitHub {
 
     $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
     $networkConfig = Get-ConfigValue -Object $Config -Name "network" -DefaultValue $null
-    $repo = [string](Get-ConfigValue -Object $ostConfig -Name "githubRepo" -DefaultValue "mmxlyo/OpenSteamTool")
+    $repo = [string](Get-ConfigValue -Object $ostConfig -Name "githubRepo" -DefaultValue "huanyuejue/OpenSteamTool")
     $timeoutSeconds = [int](Get-ConfigValue -Object $networkConfig -Name "timeoutSeconds" -DefaultValue 30)
     $cacheRoot = Join-Path $RunContext.TransactionDir "opensteamtools"
     Ensure-Directory -PathValue $cacheRoot
