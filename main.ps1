@@ -3067,17 +3067,7 @@ function Invoke-QuickStart {
                 $manualRemote = Get-LatestOstReleaseInfo -Config $Config -AllowFailure
                 if ($manualRemote.Available) { Add-OstHandledTag -Tag ([string]$manualRemote.Version) }
             } catch {
-                # TEMP DIAGNOSTIC (2026-10-15): a deploy that visibly succeeded still
-                # ended in "未能找到路径...run.log" from somewhere in the two calls
-                # above. Write-Log is already guarded, so the origin is unknown; report
-                # the type, the throwing statement and its line so the real site is
-                # identifiable. Remove once fixed.
                 Write-UiLog -Scope "steamx" -Level ERROR -Message $_.Exception.Message
-                Write-UiLog -Scope "diag" -Level WARN -Message ("type={0} line={1} cmd={2}" -f `
-                    $_.Exception.GetType().Name, `
-                    $_.InvocationInfo.ScriptLineNumber, `
-                    ([string]$_.InvocationInfo.Line).Trim())
-                Write-UiLog -Scope "diag" -Level WARN -Message ("stack={0}" -f (($_.ScriptStackTrace -split "`n") | Select-Object -First 4 | ForEach-Object { $_.Trim() }) -join ' <- ')
             }
             continue
         }
