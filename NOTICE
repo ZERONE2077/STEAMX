@@ -5,7 +5,8 @@ It may reference, download, or interoperate with the following upstream
 projects at runtime or through user configuration.
 
 OpenSteamTool
-Repository: https://github.com/OpenSteam001/OpenSteamTool
+Repository: https://github.com/mmxlyo/OpenSteamTool
+Upstream:   https://github.com/OpenSteam001/OpenSteamTool
 License: GPL-3.0
 
 OpenSteamTool is not relicensed under this project's MIT License. If users

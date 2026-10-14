@@ -26,7 +26,7 @@
        older builds are swept on startup as well.
 
 .PARAMETER Repo
-    Upstream GitHub repository in owner/name form. Default: OpenSteam001/OpenSteamTool
+    Upstream GitHub repository in owner/name form. Default: mmxlyo/OpenSteamTool
 
 .PARAMETER SteamPath
     Steam install folder. Auto-detected (running process, registry, env var) when omitted.
@@ -57,7 +57,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Repo = 'OpenSteam001/OpenSteamTool',
+    [string]$Repo = 'mmxlyo/OpenSteamTool',
     [string]$AssetPattern = '*Release.zip',
     [string]$AssetNameTemplate = 'OpenSteamTool-{tag}-Release.zip',
     [string]$SteamPath = '',
