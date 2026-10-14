@@ -313,6 +313,7 @@ function New-DefaultConfig {
             targetPath                  = ""
             configPath                  = "opensteamtool.toml"
             files                       = @("dwmapi.dll", "xinput1_4.dll", "OpenSteamTool.dll")
+            autoUpdate                  = $true
             requireSteamClosed          = $true
             autoCloseSteam              = $true
             restartSteamAfterDeploy     = $true
@@ -1174,20 +1175,154 @@ function Get-OstLocalVersion {
     return [string]$version
 }
 
+function ConvertTo-ComparableVersion {
+    param([string]$VersionText)
+
+    # Fork releases carry a suffix tag ("1.4.8.15-fix2"). A plain `[version]` cast
+    # cannot express that, and stripping everything after the first non-numeric
+    # character silently collapsed "1.4.8.15-fix2" to "1.4.8.15" - which made
+    # 1.4.8.15 look equal to 1.4.8.15-fix2 and disabled update detection entirely.
+    # Fold the suffix back in as trailing numeric components so the comparison is
+    # monotonic: 1.4.8.15 < 1.4.8.15-fix1 < 1.4.8.15-fix2 < 1.4.8.16.
+    if ([string]::IsNullOrWhiteSpace($VersionText)) { return $null }
+    $text = $VersionText.Trim().TrimStart("vV")
+    $numericMatch = [regex]::Match($text, '^(\d+(?:\.\d+)*)')
+    if (-not $numericMatch.Success) { return $null }
+
+    $parts = @($numericMatch.Groups[1].Value.Split('.') | ForEach-Object { [int]$_ })
+
+    $suffix = $text.Substring($numericMatch.Length)
+    $rank = 0
+    if ($suffix -match '(?i)fix[\.\-_]?(\d+)') {
+        # A "-fixN" revision outranks the bare release, and N orders fixes.
+        $rank = [int]$Matches[1]
+    } elseif (-not [string]::IsNullOrWhiteSpace($suffix)) {
+        # Any other suffix (beta, rc, ...) still outranks a bare numeric release
+        # but sorts below an explicit fix revision of the same base.
+        $rank = 1
+    }
+
+    return [pscustomobject]@{
+        Parts = $parts
+        Rank  = $rank
+    }
+}
+
 function Test-VersionOlder {
     param(
         [string]$LocalVersion,
         [string]$RemoteVersion
     )
 
-    if ([string]::IsNullOrWhiteSpace($LocalVersion) -or [string]::IsNullOrWhiteSpace($RemoteVersion)) { return $false }
-    try {
-        $local = [version]($LocalVersion.TrimStart("vV") -replace '[^0-9\.].*$', '')
-        $remote = [version]($RemoteVersion.TrimStart("vV") -replace '[^0-9\.].*$', '')
-        return $local -lt $remote
-    } catch {
-        return $false
+    $local = ConvertTo-ComparableVersion -VersionText $LocalVersion
+    $remote = ConvertTo-ComparableVersion -VersionText $RemoteVersion
+    if ($null -eq $local -or $null -eq $remote) { return $false }
+
+    $maxParts = [Math]::Max($local.Parts.Count, $remote.Parts.Count)
+    for ($i = 0; $i -lt $maxParts; $i++) {
+        $localPart = if ($i -lt $local.Parts.Count) { $local.Parts[$i] } else { 0 }
+        $remotePart = if ($i -lt $remote.Parts.Count) { $remote.Parts[$i] } else { 0 }
+        if ($localPart -ne $remotePart) { return $localPart -lt $remotePart }
     }
+    return $local.Rank -lt $remote.Rank
+}
+
+function Test-OstUpdateAvailable {
+    param(
+        [Parameter(Mandatory = $true)]$KernelState,
+        [Parameter(Mandatory = $true)]$Remote
+    )
+
+    # Decides whether the installed OST kernel should be refreshed.
+    #
+    # The version number cannot be the primary signal: the OpenSteamTool.dll that
+    # ships in these release zips carries NO ProductVersion/FileVersion at all
+    # (verified on a real install), so Get-OstLocalVersion returns "" and any
+    # version comparison is structurally dead. The file date is the signal that
+    # actually exists, so the comparison is date-first and version is only a
+    # tie-breaker for the cases where a version IS present.
+    if (-not $Remote.Available) { return $false }
+    if (-not $KernelState.IsReady) { return $true }
+
+    $remotePublished = $null
+    try { $remotePublished = [DateTime]$Remote.PublishedDate } catch { $remotePublished = $null }
+    if ($null -eq $remotePublished) { return $false }
+
+    $localDate = $null
+    if (-not [string]::IsNullOrWhiteSpace($KernelState.FileDate)) {
+        try { $localDate = [DateTime]$KernelState.FileDate } catch { $localDate = $null }
+    }
+
+    if ($null -ne $localDate) {
+        # Compare on whole days. The local kernel is stamped by file LastWriteTimeUtc
+        # and the release by published_at, so a same-day release must NOT be treated
+        # as newer - otherwise every launch would re-download the current version.
+        if ($localDate.Date -lt $remotePublished.ToUniversalTime().Date) { return $true }
+        if ($localDate.Date -gt $remotePublished.ToUniversalTime().Date) { return $false }
+    }
+
+    # Same day (or no local date): fall back to the version, which only helps when
+    # the DLL actually reports one.
+    return (Test-VersionOlder -LocalVersion $KernelState.Version -RemoteVersion $Remote.Version)
+}
+
+function Get-OstAutoUpdateEnabled {
+    param([pscustomobject]$Config)
+
+    $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
+    if ($null -eq $ostConfig) { return $true }
+    $value = Get-ConfigValue -Object $ostConfig -Name "autoUpdate" -DefaultValue $true
+    if ($value -is [bool]) { return $value }
+    return ([string]$value).Trim() -notin @("0", "false", "False", "no")
+}
+
+function Test-OstUpdateAvailable {
+    param(
+        [Parameter(Mandatory = $true)]$KernelState,
+        [Parameter(Mandatory = $true)]$Remote
+    )
+
+    # Decides whether the installed OST kernel should be refreshed.
+    #
+    # The version number cannot be the primary signal: the OpenSteamTool.dll that
+    # ships in these release zips carries NO ProductVersion/FileVersion at all
+    # (verified on a real install), so Get-OstLocalVersion returns "" and any
+    # version comparison is structurally dead. The file date is the signal that
+    # actually exists, so the comparison is date-first and version is only a
+    # tie-breaker for the cases where a version IS present.
+    if (-not $Remote.Available) { return $false }
+    if (-not $KernelState.IsReady) { return $true }
+
+    $remotePublished = $null
+    try { $remotePublished = [DateTime]$Remote.PublishedDate } catch { $remotePublished = $null }
+    if ($null -eq $remotePublished) { return $false }
+
+    $localDate = $null
+    if (-not [string]::IsNullOrWhiteSpace($KernelState.FileDate)) {
+        try { $localDate = [DateTime]$KernelState.FileDate } catch { $localDate = $null }
+    }
+
+    if ($null -ne $localDate) {
+        # Compare on whole days. The local kernel is stamped by file LastWriteTimeUtc
+        # and the release by published_at, so a same-day release must NOT be treated
+        # as newer - otherwise every launch would re-download the current version.
+        if ($localDate.Date -lt $remotePublished.ToUniversalTime().Date) { return $true }
+        if ($localDate.Date -gt $remotePublished.ToUniversalTime().Date) { return $false }
+    }
+
+    # Same day (or no local date): fall back to the version, which only helps when
+    # the DLL actually reports one.
+    return (Test-VersionOlder -LocalVersion $KernelState.Version -RemoteVersion $Remote.Version)
+}
+
+function Get-OstAutoUpdateEnabled {
+    param([pscustomobject]$Config)
+
+    $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
+    if ($null -eq $ostConfig) { return $true }
+    $value = Get-ConfigValue -Object $ostConfig -Name "autoUpdate" -DefaultValue $true
+    if ($value -is [bool]) { return $value }
+    return ([string]$value).Trim() -notin @("0", "false", "False", "no")
 }
 
 function Get-SteamRelatedProcesses {
@@ -2348,6 +2483,38 @@ function Invoke-QuickStart {
         $runContext = New-RunContext -Config $Config
         Invoke-DeployOst -Config $Config -RunContext $runContext
         Write-UiLog -Scope "ost" -Message (ConvertFrom-Utf8Base64 "T1NUIOmDqOe9suWujOaIkO+8jOaOpeS4i+adpei+k+WFpea4uOaIjyBBcHBJRCDljbPlj6/lhaXlupPjgII=") -Level SUCCESS
+    } elseif (Get-OstAutoUpdateEnabled -Config $Config) {
+        # The kernel is present, so an update is optional: check, and when a newer
+        # release exists say so on screen (users asked to SEE that an update was
+        # found) before silently installing it. A failed check must never block
+        # startup - offline, or every mirror down, still has to reach the prompt.
+        $remoteCheck = Get-LatestOstReleaseInfo -Config $Config -AllowFailure
+        $updateNeeded = $false
+        try {
+            $updateNeeded = Test-OstUpdateAvailable -KernelState $kernelState -Remote $remoteCheck
+        } catch {
+            $updateNeeded = $false
+        }
+
+        if ($updateNeeded) {
+            $localDisplay = Format-VersionWithDate -Version $kernelState.Version -DateValue $kernelState.FileDate
+            $remoteDisplay = Format-VersionWithDate -Version $remoteCheck.Version -DateValue $remoteCheck.PublishedDate
+            Write-UiLine
+            Write-UiLog -Scope "ost" -Level WARN -Message (ConvertFrom-Utf8Base64 "5qOA5rWL5YiwIE9TVCDmlrDniYjmnKzvvIzmraPlnKjoh6rliqjmm7TmlrAuLi4=")
+            Write-UiLine -Text ("  {0} -> {1}" -f $localDisplay, $remoteDisplay) -ForegroundColor DarkGray
+            try {
+                $runContext = New-RunContext -Config $Config
+                Invoke-DeployOst -Config $Config -RunContext $runContext
+                $refreshed = Get-OstKernelState -Config $Config -SteamPath $steamPath
+                $refreshedDisplay = Format-VersionWithDate -Version $refreshed.Version -DateValue $refreshed.FileDate
+                Write-UiLog -Scope "ost" -Level SUCCESS -Message (ConvertFrom-Utf8Base64 "T1NUIOiHquWKqOabtOaWsOWujOaIkOOAgg==")
+                Write-UiLine -Text ("  {0}" -f $refreshedDisplay) -ForegroundColor DarkGray
+            } catch {
+                # Keep running on the version already installed.
+                Write-UiLog -Scope "ost" -Level WARN -Message (ConvertFrom-Utf8Base64 "T1NUIOabtOaWsOWksei0pe+8jOe7p+e7reS9v+eUqOacrOWcsOeJiOacrOOAgg==")
+                Write-UiLog -Scope "ost" -Level WARN -Message $_.Exception.Message
+            }
+        }
     }
 
     while ($true) {
