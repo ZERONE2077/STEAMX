@@ -29,6 +29,23 @@ $script:OstReleaseCache = @{}
 $script:SteamPathCache = ""
 $script:NetworkRegionCache = ""
 
+function Enable-ModernTls {
+    # PowerShell 5.1 inherits the CLR default (SSL3/TLS1.0) unless the process or a
+    # policy raised it. Every endpoint used here is on TLS 1.2, and a protocol
+    # mismatch surfaces as the same generic "could not create SSL/TLS secure
+    # channel" text as a certificate problem, so pin this once and let the real
+    # error surface instead of being masked by a downgraded handshake.
+    try {
+        $protocols = [System.Net.SecurityProtocolType]::Tls12
+        $tls13 = [System.Enum]::GetNames([System.Net.SecurityProtocolType]) -contains "Tls13"
+        if ($tls13) { $protocols = $protocols -bor [System.Net.SecurityProtocolType]::Tls13 }
+        [System.Net.ServicePointManager]::SecurityProtocol = $protocols
+    } catch {
+    }
+}
+
+Enable-ModernTls
+
 function ConvertFrom-Utf8Base64 {
     param([Parameter(Mandatory = $true)][string]$Value)
 
@@ -305,14 +322,32 @@ function New-DefaultConfig {
             githubRepo                  = "mmxlyo/OpenSteamTool"
             assetPattern                = "*Release.zip"
             assetNameTemplate           = "OpenSteamTool-{tag}-Release.zip"
-            # Prefer the official asset and retain the mirror as a fallback.
+            # Every mirror has bad days: an upstream outage, a rotated certificate,
+            # a proxy that dropped the route. This list used to hold a single mirror,
+            # so one certificate trust failure on ghfast.top threw the run onto the
+            # raw GitHub URL - the one host that is normally unreachable from CN -
+            # and the run then sat there until the timeout expired.
+            #
+            # Order is measured, not guessed: a 2026-10-08 scan confirmed every entry
+            # below returned the whole 1.4.8 asset with the exact release SHA-256, and
+            # the list is sorted by latency. The official URL stays in the pool as the
+            # last resort, and it is the asset download that carries the payload, so
+            # a bad mirror can never win: Assert-OstDownloadSha256 rejects it.
             downloadUrlTemplates        = @(
                 "{official}",
+                "https://gh-proxy.com/{official}",
+                "https://gh.monlor.com/{official}",
+                "https://hk.gh-proxy.com/{official}",
+                "https://gh.nxnow.top/{official}",
+                "https://ghproxy.net/{official}",
                 "https://ghfast.top/{official}"
             )
             targetPath                  = ""
             configPath                  = "opensteamtool.toml"
             files                       = @("dwmapi.dll", "xinput1_4.dll", "OpenSteamTool.dll")
+            # On startup, compare the installed kernel against the latest release and
+            # refresh it automatically when it is behind. Set to $false to pin the
+            # installed version (the check then never downloads anything).
             autoUpdate                  = $true
             requireSteamClosed          = $true
             autoCloseSteam              = $true
@@ -345,13 +380,73 @@ function New-RunContext {
 
     $scriptRoot = Get-ScriptRoot
     $operationId = "{0}-{1}" -f (Get-Timestamp), ([Guid]::NewGuid().ToString("N").Substring(0, 8))
+
+    # Staging and the run log are disposable, so %TEMP% is the right home for them.
     $transactionDir = Join-Path ([System.IO.Path]::GetTempPath()) ("STEAMX\transactions\{0}" -f $operationId)
+
+    # Backups are NOT disposable: BackupDir holds the only rollback copy of the
+    # original dwmapi.dll / xinput1_4.dll / OpenSteamTool.dll and of the user's Lua
+    # manifests, and uninstall reads them back. Keeping them under %TEMP% meant
+    # Windows storage clean-up could delete the only copy of a user's original files
+    # between a deploy and a later uninstall, leaving them unrestorable. %LOCALAPPDATA%
+    # is user-owned and never auto-purged, and matches where the cache/API key live
+    # (Get-HubcapCredentialPath, Get-ScriptRoot fallbacks). One directory per
+    # operation, so a new run can never overwrite a previous run's rollback data.
+    $localAppData = [Environment]::GetFolderPath("LocalApplicationData")
+    if ([string]::IsNullOrWhiteSpace($localAppData)) {
+        # Never lose the rollback path entirely: fall back to the transaction dir,
+        # which is at least guaranteed writable, rather than handing out a bad path.
+        $localAppData = [System.IO.Path]::GetTempPath()
+    }
+
+    # Create these here, at the moment the paths are handed out. Callers write into
+    # LogFile/BackupDir/TransactionDir long before they reach their own
+    # Ensure-Directory calls (uninstall logs at 2511 before ensuring at 2516, and
+    # Stop-SteamProcesses logs via LogFile), so a missing directory surfaced as a raw
+    # DirectoryNotFoundException ("未能找到路径...的一部分") instead of the intended
+    # message. Add-Content does not create parent directories, so ensure up front.
+    Ensure-Directory -PathValue $transactionDir
+
+    # Backups must never be the reason a run cannot start. %LOCALAPPDATA% can be
+    # redirected to a disconnected share, locked down by policy, or full, and a
+    # failure to create the backup directory used to be fatal here - which turned a
+    # degraded backup location into a tool that would not launch at all. Fall back to
+    # the transaction dir (disposable, but writable by construction, and this is the
+    # pre-existing behaviour) and carry on.
+    $backupDir = Join-Path $localAppData ("STEAMX\backups\{0}" -f $operationId)
+    try {
+        Ensure-Directory -PathValue $backupDir
+    } catch {
+        $backupDir = Join-Path $transactionDir "backup"
+        Ensure-Directory -PathValue $backupDir
+    }
+
+    # One backup directory per operation accumulates forever now that it no longer
+    # dies with TransactionDir, so keep only the most recent few. Uninstall reads the
+    # CURRENT run's backups, and the newest entries are the ones a user would need to
+    # recover from, so pruning by age is safe. Failures here must not block the run.
+    try {
+        $backupRoot = Split-Path -Parent $backupDir
+        $stale = @(Get-ChildItem -LiteralPath $backupRoot -Directory -Force -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -Skip 10)
+        foreach ($old in $stale) {
+            Remove-Item -LiteralPath $old.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+    }
 
     return [pscustomobject]@{
         ScriptRoot       = $scriptRoot
         OperationId      = $operationId
-        LogFile          = ""
-        BackupDir        = Join-Path $transactionDir "backup"
+        # Write-Log only persists a line when LogFile is non-empty. Leaving this as ""
+        # silently disabled file logging for every operation, so a failed run left no
+        # transaction log to inspect.
+        LogFile          = Join-Path $transactionDir "run.log"
+        # Lives outside TransactionDir on purpose. Every cleanup site deletes
+        # TransactionDir wholesale on success, so nesting backups inside it is what
+        # made rollback data disappear with the staging dir.
+        BackupDir        = $backupDir
         TransactionDir   = $transactionDir
     }
 }
@@ -490,6 +585,26 @@ function Get-HttpStatusCode {
         $exception = $exception.InnerException
     }
     return 0
+}
+
+function Test-CertificateTrustFailure {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    # A missing or rotated intermediate certificate makes the whole chain fail to
+    # build, and the CLR reports it only as the localized "could not establish
+    # trust relationship for the SSL/TLS secure channel" string. Windows pulls
+    # the missing intermediate down on its own (AIA fetch), so the same URL can
+    # fail once and succeed a moment later. Detect the condition by walking to
+    # the real WebException status instead of matching the localized text.
+    $exception = $ErrorRecord.Exception
+    while ($null -ne $exception) {
+        if ($exception -is [System.Net.WebException] -and
+            $exception.Status -eq [System.Net.WebExceptionStatus]::TrustFailure) {
+            return $true
+        }
+        $exception = $exception.InnerException
+    }
+    return $false
 }
 
 function Get-LatestOstRelease {
@@ -794,6 +909,11 @@ function Get-HubcapLuaUrl {
     # Every lua endpoint answers with plain text, so no depot manifest archive is needed:
     # OST fetches the manifests itself. "full" keeps the old /manifest zip as a fallback -
     # it carries the same lua, and the .manifest entries inside it are ignored.
+    #
+    # Hubcap is the only source. A STEAMX cache worker used to sit in front of it to
+    # save quota, but it needed a bundled access token and its own deployed service,
+    # so the client now talks to Hubcap directly. The candidate list is still an array
+    # because the caller walks it in order and falls through on failure.
     switch ($ResolvedVariant) {
         "full" {
             return @(
@@ -801,8 +921,12 @@ function Get-HubcapLuaUrl {
                 "https://hubcapmanifest.com/api/v1/manifest/$ResolvedAppId"
             )
         }
-        "basegame" { return @("https://hubcapmanifest.com/api/v1/lua/basegame/$ResolvedAppId") }
-        "dlc" { return @("https://hubcapmanifest.com/api/v1/lua/dlc/$ResolvedAppId") }
+        "basegame" {
+            return @("https://hubcapmanifest.com/api/v1/lua/basegame/$ResolvedAppId")
+        }
+        "dlc" {
+            return @("https://hubcapmanifest.com/api/v1/lua/dlc/$ResolvedAppId")
+        }
         default { throw "Unsupported Hubcap variant: $ResolvedVariant" }
     }
 }
@@ -896,7 +1020,9 @@ function Invoke-HubcapDownloadWithProgress {
                     Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Status ("{0} downloaded" -f (Format-FileSize $downloaded))
                 }
             }
-            Write-UiLog -Scope "hubcap" -Level SUCCESS -Message ("downloaded {0} <- {1}" -f (Format-FileSize $downloaded), ($Url -replace '^https?://[^/]+', ''))
+            # Strip any query string so the logged URL is the endpoint, not its parameters.
+            $logUrl = ($Url -replace '\?.*$', '') -replace '^https?://[^/]+', ''
+            Write-UiLog -Scope "hubcap" -Level SUCCESS -Message ("downloaded {0} <- {1}" -f (Format-FileSize $downloaded), $logUrl)
             return
         } catch {
             $statusCode = Get-HttpStatusCode -ErrorRecord $_
@@ -1047,7 +1173,7 @@ function Invoke-AddGame {
         $notFound = $false
         foreach ($downloadUrl in $downloadUrls) {
             try {
-                Write-UiLog -Scope "hubcap" -Level INFO -Message ("requesting lua <- {0}" -f ($downloadUrl -replace '^https?://[^/]+/api/v1/', ''))
+                Write-UiLog -Scope "hubcap" -Level INFO -Message ("requesting lua <- {0}" -f (($downloadUrl -replace '\?.*$', '') -replace '^https?://[^/]+/api/v1/', ''))
                 Invoke-HubcapDownloadWithProgress `
                     -Url $downloadUrl `
                     -Destination $tempDownload `
@@ -1057,7 +1183,7 @@ function Invoke-AddGame {
                 break
             } catch {
                 $lastDownloadError = $_
-                $sourceLabel = $downloadUrl -replace '^https?://[^/]+/api/v1/', ''
+                $sourceLabel = ($downloadUrl -replace '\?.*$', '') -replace '^https?://[^/]+/api/v1/', ''
                 if ((Get-HttpStatusCode -ErrorRecord $_) -eq 404) {
                     $notFound = $true
                     Write-UiLog -Scope "hubcap" -Level WARN -Message ("source not found ({0})" -f $sourceLabel)
@@ -1225,55 +1351,6 @@ function Test-VersionOlder {
         if ($localPart -ne $remotePart) { return $localPart -lt $remotePart }
     }
     return $local.Rank -lt $remote.Rank
-}
-
-function Test-OstUpdateAvailable {
-    param(
-        [Parameter(Mandatory = $true)]$KernelState,
-        [Parameter(Mandatory = $true)]$Remote
-    )
-
-    # Decides whether the installed OST kernel should be refreshed.
-    #
-    # The version number cannot be the primary signal: the OpenSteamTool.dll that
-    # ships in these release zips carries NO ProductVersion/FileVersion at all
-    # (verified on a real install), so Get-OstLocalVersion returns "" and any
-    # version comparison is structurally dead. The file date is the signal that
-    # actually exists, so the comparison is date-first and version is only a
-    # tie-breaker for the cases where a version IS present.
-    if (-not $Remote.Available) { return $false }
-    if (-not $KernelState.IsReady) { return $true }
-
-    $remotePublished = $null
-    try { $remotePublished = [DateTime]$Remote.PublishedDate } catch { $remotePublished = $null }
-    if ($null -eq $remotePublished) { return $false }
-
-    $localDate = $null
-    if (-not [string]::IsNullOrWhiteSpace($KernelState.FileDate)) {
-        try { $localDate = [DateTime]$KernelState.FileDate } catch { $localDate = $null }
-    }
-
-    if ($null -ne $localDate) {
-        # Compare on whole days. The local kernel is stamped by file LastWriteTimeUtc
-        # and the release by published_at, so a same-day release must NOT be treated
-        # as newer - otherwise every launch would re-download the current version.
-        if ($localDate.Date -lt $remotePublished.ToUniversalTime().Date) { return $true }
-        if ($localDate.Date -gt $remotePublished.ToUniversalTime().Date) { return $false }
-    }
-
-    # Same day (or no local date): fall back to the version, which only helps when
-    # the DLL actually reports one.
-    return (Test-VersionOlder -LocalVersion $KernelState.Version -RemoteVersion $Remote.Version)
-}
-
-function Get-OstAutoUpdateEnabled {
-    param([pscustomobject]$Config)
-
-    $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
-    if ($null -eq $ostConfig) { return $true }
-    $value = Get-ConfigValue -Object $ostConfig -Name "autoUpdate" -DefaultValue $true
-    if ($value -is [bool]) { return $value }
-    return ([string]$value).Trim() -notin @("0", "false", "False", "no")
 }
 
 function Test-OstUpdateAvailable {
@@ -1880,28 +1957,43 @@ function Get-OstSourceDirectoryFromGitHub {
             $downloaded = $false
             $errors = @()
             foreach ($downloadUrl in $downloadUrls) {
-                try {
-                    Write-Log -Message ("Downloading OST asset from: {0}" -f $downloadUrl) -Scope "ost" -LogFile $RunContext.LogFile
-                    Invoke-DownloadFileWithProgress -Url $downloadUrl -Destination $partialPath -TimeoutSeconds $timeoutSeconds
-                    if (-not (Test-Path -LiteralPath $partialPath -PathType Leaf) -or (Get-Item -LiteralPath $partialPath).Length -eq 0) {
-                        throw "Downloaded OST asset is empty."
+                # Trust failures are transient: the chain can be broken because an
+                # intermediate is still being fetched, or because a mirror rotated
+                # its certificate minutes ago. Retry the same URL once after a short
+                # pause before falling through to the next source.
+                $attempts = 2
+                for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+                    try {
+                        Write-Log -Message ("Downloading OST asset from: {0}" -f $downloadUrl) -Scope "ost" -LogFile $RunContext.LogFile
+                        Invoke-DownloadFileWithProgress -Url $downloadUrl -Destination $partialPath -TimeoutSeconds $timeoutSeconds
+                        if (-not (Test-Path -LiteralPath $partialPath -PathType Leaf) -or (Get-Item -LiteralPath $partialPath).Length -eq 0) {
+                            throw "Downloaded OST asset is empty."
+                        }
+                        Assert-OstDownloadSha256 `
+                            -DownloadedPath $partialPath `
+                            -DownloadUrl $downloadUrl `
+                            -OfficialUrl $officialDownloadUrl `
+                            -TimeoutSeconds $timeoutSeconds `
+                            -ExpectedSha256 $expectedSha256 `
+                            -LogFile $RunContext.LogFile
+                        $downloaded = $true
+                        break
+                    } catch {
+                        if (Test-Path -LiteralPath $partialPath) {
+                            Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue
+                        }
+                        $retryable = (Test-CertificateTrustFailure -ErrorRecord $_) -and ($attempt -lt $attempts)
+                        if ($retryable) {
+                            Write-Log -Message ("Certificate trust failure; retrying this source once: {0}" -f $downloadUrl) -Level "WARN" -Scope "ost" -LogFile $RunContext.LogFile
+                            Start-Sleep -Seconds 2
+                            continue
+                        }
+                        $errors += ("{0}: {1}" -f $downloadUrl, $_.Exception.Message)
+                        Write-Log -Message ("Download candidate failed: {0}" -f $_.Exception.Message) -Level "WARN" -Scope "ost" -LogFile $RunContext.LogFile
+                        break
                     }
-                    Assert-OstDownloadSha256 `
-                        -DownloadedPath $partialPath `
-                        -DownloadUrl $downloadUrl `
-                        -OfficialUrl $officialDownloadUrl `
-                        -TimeoutSeconds $timeoutSeconds `
-                        -ExpectedSha256 $expectedSha256 `
-                        -LogFile $RunContext.LogFile
-                    $downloaded = $true
-                    break
-                } catch {
-                    $errors += ("{0}: {1}" -f $downloadUrl, $_.Exception.Message)
-                    if (Test-Path -LiteralPath $partialPath) {
-                        Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue
-                    }
-                    Write-Log -Message ("Download candidate failed: {0}" -f $_.Exception.Message) -Level "WARN" -Scope "ost" -LogFile $RunContext.LogFile
                 }
+                if ($downloaded) { break }
             }
             if (-not $downloaded) {
                 throw ("Unable to download OST asset from any configured source. {0}" -f ($errors -join " | "))
@@ -1986,6 +2078,50 @@ function Backup-ExistingFile {
     return $backupPath
 }
 
+function Get-OstConfigTemplate {
+    param([Parameter(Mandatory = $true)][string]$Source)
+
+    # Written only when the user has no opensteamtool.toml yet, so this is the
+    # copy a mainland user ends up with. wudrm is the default because it is the
+    # only upstream on plain HTTP: no TLS handshake and no proxy needed, which is
+    # what actually decides whether a download starts. The timeouts are wide on
+    # purpose - a manifest request is under a kilobyte, so a dead request means
+    # the upstream refused it, never that the transfer was slow, and cutting a
+    # healthy request short on a bad line is the failure mode worth avoiding.
+    $line = 'url = "{0}"' -f $Source
+    return @(
+        "# opensteamtool.toml - OpenSteamTool configuration",
+        "# Place at: <Steam>/opensteamtool.toml",
+        "# Loaded at startup and hot-reloaded after changes.",
+        "",
+        "[log]",
+        "# Log verbosity for all log files (Debug build only).",
+        "# Valid: trace, debug, info, warn, error",
+        'level = "info"',
+        "",
+        "[manifest]",
+        "# Which upstream API to query for depot manifest request codes.",
+        '#   "wudrm"         -> http://gmrc.wudrm.com/manifest/{gid}',
+        "#                      plain HTTP, the only one reachable from CN",
+        '#   "steamrun"      -> https://manifest.steam.run/api/manifest/{gid}',
+        '#   "opensteamtool" -> https://manifest.opensteamtool.com/{gid}.wudrm',
+        "#",
+        "# Every one of them is flaky. Measured 2026-09-23 from a CN line: wudrm",
+        "# answers about half of all requests with a 503, steamrun with a 502, and",
+        "# the opensteamtool host refuses non-browser clients outright. The tool",
+        "# does not retry, and this key takes a single value, so the only way to",
+        "# make downloads survive is a manifest.lua in <Steam>/config/lua: Lua wins",
+        "# over this setting and can retry every upstream in turn.",
+        $line,
+        "",
+        "# HTTP timeouts for manifest requests (milliseconds).",
+        "timeout_resolve_ms = 8000",
+        "timeout_connect_ms = 8000",
+        "timeout_send_ms    = 10000",
+        "timeout_recv_ms    = 15000"
+    )
+}
+
 function Set-OstManifestSourceInToml {
     param(
         [Parameter(Mandatory = $true)][string]$TomlPath,
@@ -2003,14 +2139,14 @@ function Set-OstManifestSourceInToml {
     $line = 'url = "{0}"' -f $Source
 
     if (-not (Test-Path -LiteralPath $TomlPath)) {
-        Set-Content -LiteralPath $TomlPath -Encoding UTF8 -Value @(
-            "[manifest]",
-            $line,
-            "timeout_resolve_ms = 5000",
-            "timeout_connect_ms = 5000",
-            "timeout_send_ms    = 10000",
-            "timeout_recv_ms    = 10000"
-        )
+        # Every toml shipped in this repo (opensteamtool.toml, the example, docs) is
+        # UTF-8 without a BOM and CRLF. Set-Content -Encoding UTF8 would emit a BOM
+        # in Windows PowerShell 5.1, and strict TOML readers reject a leading BOM as
+        # an invalid statement at line 1 column 1 - so write the bytes explicitly
+        # instead of relying on the cmdlet default. CRLF matches the repo files and
+        # the branch below, which preserves whatever line endings an existing file has.
+        $template = ((Get-OstConfigTemplate -Source $Source) -join "`r`n") + "`r`n"
+        [System.IO.File]::WriteAllText($TomlPath, $template, (New-Object System.Text.UTF8Encoding $false))
         return $true
     }
 

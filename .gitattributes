@@ -8,6 +8,8 @@
 *.md     text eol=lf
 *.json   text eol=lf
 *.toml   text eol=lf
+*.mjs    text eol=lf
+*.sql    text eol=lf
 *.drawio text eol=lf
 
 # Never let git normalise these: a single byte swims out of place in a Windows

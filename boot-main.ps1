@@ -33,6 +33,7 @@ $errs = New-Object System.Collections.ArrayList
 $apis = New-Object System.Collections.ArrayList
 [void]$apis.Add('https://api.github.com/repos/' + $repo + '/commits/main')
 [void]$apis.Add('https://gh-proxy.com/https://api.github.com/repos/' + $repo + '/commits/main')
+[void]$apis.Add('https://hk.gh-proxy.com/https://api.github.com/repos/' + $repo + '/commits/main')
 foreach ($api in $apis) {
     try {
         $c = (Invoke-WebRequest -Uri $api -UseBasicParsing -Headers @{ 'User-Agent' = 'STEAMX' } -TimeoutSec 6).Content
@@ -44,7 +45,11 @@ foreach ($api in $apis) {
 
 # 2) fallbacks, in the order that is most likely to still be current
 [void]$urls.Add($raw)
+[void]$urls.Add('https://gh-proxy.com/' + $raw)
+[void]$urls.Add('https://gh.monlor.com/' + $raw)
+[void]$urls.Add('https://hk.gh-proxy.com/' + $raw)
 [void]$urls.Add('https://ghfast.top/' + $raw)
+[void]$urls.Add('https://ghproxy.net/' + $raw)
 [void]$urls.Add($jsd + 'latest/' + $rel)
 
 $src = $null
@@ -62,7 +67,7 @@ foreach ($u in $urls) {
 if (-not $src) {
     Write-Host ''
     Write-Host ('  STEAMX start failed: ' + ($errs -join ' / ')) -ForegroundColor Red
-    Write-Host '  source order: GitHub API -> jsDelivr(sha) -> raw -> ghfast -> latest' -ForegroundColor DarkGray
+    Write-Host '  source order: GitHub API -> jsDelivr(sha) -> raw -> 3 mirrors -> latest' -ForegroundColor DarkGray
     Write-Host '  usual causes: offline / CDN blocked / security software' -ForegroundColor DarkGray
     if ([Environment]::UserInteractive -and -not $env:STEAMX_NO_PAUSE) {
         Write-Host '  press Enter to close ...' -ForegroundColor DarkGray
