@@ -341,7 +341,15 @@ function New-DefaultConfig {
             hubcapTimeoutSeconds = 180
         }
         manifest   = [pscustomobject]@{
-            source = "wudrm"
+            # Fallback source written into the deployed <Steam>/opensteamtool.toml.
+            # Measured 2026-10-15 (5 rounds, gid=10542579308): manifestdex answered
+            # 200 on every attempt, while wudrm flipped between 200/403/503 and
+            # steamrun 502'd half the time. "wudrm" was picked here when it was the
+            # only plain-HTTP source, but a deploy would then rewrite a user's
+            # manifestdex back to the flakier one. The Lua hook in
+            # <Steam>/config/lua/manifest.lua runs before this url anyway, so this
+            # only decides the fallback.
+            source = "manifestdex"
         }
         ost        = [pscustomobject]@{
             sourceType                  = "github-release"
