@@ -31,16 +31,43 @@ $script:NetworkRegionCache = ""
 
 function Enable-ModernTls {
     # PowerShell 5.1 inherits the CLR default (SSL3/TLS1.0) unless the process or a
-    # policy raised it. Every endpoint used here is on TLS 1.2, and a protocol
-    # mismatch surfaces as the same generic "could not create SSL/TLS secure
-    # channel" text as a certificate problem, so pin this once and let the real
-    # error surface instead of being masked by a downgraded handshake.
+    # policy raised it, so pin TLS 1.2 explicitly. Every endpoint used here serves
+    # TLS 1.2, and a protocol mismatch would otherwise surface as the same generic
+    # "could not create SSL/TLS secure channel" text as a certificate problem.
+    #
+    # TLS 1.3 is deliberately NOT requested. This used to OR in Tls13 whenever the
+    # enum exposed the name, but that name comes from the installed .NET, not from
+    # whether the machine can actually negotiate TLS 1.3 (older Windows 10, older
+    # .NET, or a group policy that disables it). On those machines the handshake was
+    # attempted at a version Schannel refuses and the whole connection died with
+    # "基础连接已关闭" / "The underlying connection was closed" - which is why the
+    # failure only appeared on some users' PCs and never on a machine new enough to
+    # support TLS 1.3. Nothing here needs 1.3, so ask for 1.2 and stay uniform.
     try {
-        $protocols = [System.Net.SecurityProtocolType]::Tls12
-        $tls13 = [System.Enum]::GetNames([System.Net.SecurityProtocolType]) -contains "Tls13"
-        if ($tls13) { $protocols = $protocols -bor [System.Net.SecurityProtocolType]::Tls13 }
-        [System.Net.ServicePointManager]::SecurityProtocol = $protocols
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
     } catch {
+    }
+}
+
+function Wait-BeforeExit {
+    # The console window dies the instant the process ends, so anything that exits
+    # early - a startup crash in the shortcut path, an explicit exit - would take
+    # the error text with it before it could be read. Hold the window open, and
+    # do it on every path that leaves the process, not just the -File one.
+    if ($env:STEAMX_NO_PAUSE) { return }
+    try { if (-not [Environment]::UserInteractive) { return } } catch { }
+
+    try {
+        # Redirected stdin can never answer Read-Host, so do not block on it.
+        if ([Console]::IsInputRedirected) { Start-Sleep -Seconds 5; return }
+    } catch {
+    }
+
+    try {
+        Write-UiLine
+        [void](Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5Ye66ZSZ77yM5oyJ5Zue6L2m6ZSu5YWz6Zet56qX5Y+j"))
+    } catch {
+        Start-Sleep -Seconds 5
     }
 }
 
@@ -617,6 +644,41 @@ function Get-LatestOstRelease {
     if ($script:OstReleaseCache.ContainsKey($repo)) {
         return $script:OstReleaseCache[$repo]
     }
+
+    # Both tiers below are cheap metadata reads, so a transport-level failure is worth
+    # retrying before it reaches the user: this runs on every launch, and a single
+    # dropped socket used to abort startup with the raw WebException text. Only the
+    # transport failures are retried - a real 404 (repo or release gone) is final.
+    $maxAttempts = 3
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            return Get-LatestOstReleaseOnce -Config $Config -OstConfig $ostConfig -Repo $repo -TimeoutSeconds $timeoutSeconds
+        } catch {
+            $lastError = $_
+            $retryable = if ($null -ne $lastError.Exception) {
+                (Test-HubcapRetryableError -ErrorRecord $lastError)
+            } else {
+                $false
+            }
+            if ((-not $retryable) -or ($attempt -ge $maxAttempts)) { break }
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
+    throw $lastError
+}
+
+function Get-LatestOstReleaseOnce {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject]$Config,
+        [Parameter(Mandatory = $true)]$OstConfig,
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    $repo = $Repo
+    $ostConfig = $OstConfig
+    $timeoutSeconds = $TimeoutSeconds
 
     $apiUrl = "https://api.github.com/repos/{0}/releases/latest" -f $repo
     try {
@@ -2747,8 +2809,48 @@ if ($MyInvocation.InvocationName -ne ".") {
         }
 
     } catch {
+        # A crash here is exactly the case that cannot be seen: the console window
+        # closes with the message still on screen for a few milliseconds. Print the
+        # real error plus the failing line, persist it to a file, then hold the
+        # window open so the text can actually be read.
+        Write-UiLine
         Write-UiLog -Scope "steamx" -Level ERROR -Message $_.Exception.Message
-        Wait-LauncherExit
+
+        try {
+            if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) {
+                Write-UiLine -Text ("  at main.ps1 line {0}" -f $_.InvocationInfo.ScriptLineNumber) -ForegroundColor DarkGray
+                $offending = ([string]$_.InvocationInfo.Line).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($offending)) {
+                    Write-UiLine -Text ("  " + $offending) -ForegroundColor DarkGray
+                }
+            }
+        } catch {
+        }
+
+        $errorLog = Join-Path ([System.IO.Path]::GetTempPath()) "STEAMX-startup-error.log"
+        try {
+            $detail = @(
+                "time    : " + (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                "command : " + $Command
+                "message : " + $_.Exception.Message
+                "type    : " + $_.Exception.GetType().FullName
+                "at      : " + $(if ($_.InvocationInfo) { "line " + $_.InvocationInfo.ScriptLineNumber } else { "unknown" })
+                ""
+                $_.Exception.ToString()
+                ""
+                $_.ScriptStackTrace
+            ) -join [Environment]::NewLine
+            Set-Content -LiteralPath $errorLog -Value $detail -Encoding UTF8
+            Write-UiLine -Text ("  details written to: " + $errorLog) -ForegroundColor DarkGray
+        } catch {
+        }
+
+        Wait-BeforeExit
         exit 1
     }
+
+    # Reaching this line means the run ended on its own (q / Enter / finished).
+    # The -File launch (the shortcut users double-click) holds the window here so
+    # the last screen of output does not vanish.
+    Wait-LauncherExit
 }
