@@ -14,5 +14,7 @@ cache-service/
 # OST 配置属于运行时文件（拷进 Steam 根目录用），仓库不跟踪
 opensteamtool.toml
 opensteamtool.example.toml
+# 沙箱文件权限修复的备份与报告（本机一次性产物，含权限回滚脚本）
+/.acl-recovery/
 *.log
 *.tmp
