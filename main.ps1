@@ -497,7 +497,16 @@ function Write-Log {
     Write-UiLog -Message $Message -Level $Level -Scope $Scope
     if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
         $line = "{0} [{1}] {2} {3}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Scope, $Message
-        Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
+        # File logging is a convenience, never the operation itself. A deploy deletes
+        # TransactionDir in its finally block and only THEN writes its success line, so
+        # this path can legitimately be gone by the time we get here - and an unguarded
+        # Add-Content then threw DirectoryNotFoundException, which the caller reported
+        # as "OST update failed" on an update that had already fully succeeded.
+        # The console line above is already written, so failing here loses nothing.
+        try {
+            Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8 -ErrorAction Stop
+        } catch {
+        }
     }
 }
 
@@ -2545,6 +2554,11 @@ function Invoke-DeployOst {
 
     $steamPath = Get-SteamPath -Config $Config
     $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
+    # Read the restart preference up front so the success line can be written inside
+    # the finally block, before the transaction dir holding run.log is deleted.
+    $restartSteamAfterDeploy = [bool](Get-ConfigValue -Object $ostConfig -Name "restartSteamAfterDeploy" -DefaultValue $true)
+    # Flipped only after every file has landed; the finally block logs success from it.
+    $deploySucceeded = $false
     $package = Get-OstSourceDirectory -Config $Config -RunContext $RunContext
     $sourcePath = $package.SourcePath
     $files = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
@@ -2640,6 +2654,9 @@ function Invoke-DeployOst {
         if (-not $kernelState.IsReady) {
             throw ("OST validation failed. Missing: {0}" -f ($kernelState.Missing -join ", "))
         }
+        # Every file verified and the kernel validates: the finally block may now
+        # report success before it deletes the transaction dir.
+        $deploySucceeded = $true
 
     } catch {
         Write-Log -Message ("Deployment failed; rolling back: {0}" -f $_.Exception.Message) -Level "ERROR" -Scope "ost" -LogFile $RunContext.LogFile
@@ -2663,6 +2680,18 @@ function Invoke-DeployOst {
         }
         throw
     } finally {
+        # Log the success line BEFORE the transaction dir (which holds run.log) is
+        # removed. It used to be written after this block, so the line was always
+        # lost and the write threw on the deleted path - which surfaced as a bogus
+        # "OST update failed" on an update that had already completed.
+        if ($deploySucceeded) {
+            $finalMessage = if ($restartSteamAfterDeploy) {
+                ConvertFrom-Utf8Base64 "T1NUIOmDqOe9suaIkOWKn++8jFN0ZWFtIOato+WcqOiHquWKqOWQr+WKqOOAgg=="
+            } else {
+                ConvertFrom-Utf8Base64 "T1NUIOmDqOe9suaIkOWKn+OAgg=="
+            }
+            Write-Log -Message $finalMessage -Level "SUCCESS" -Scope "ost" -LogFile $RunContext.LogFile
+        }
         if (Test-Path -LiteralPath $RunContext.TransactionDir) {
             Remove-Item -LiteralPath $RunContext.TransactionDir -Recurse -Force -ErrorAction SilentlyContinue
         }
@@ -2672,12 +2701,6 @@ function Invoke-DeployOst {
     if ($restartSteam) {
         Start-Steam -RunContext $RunContext -SteamPath $steamPath
     }
-    $successMessage = if ($restartSteam) {
-        ConvertFrom-Utf8Base64 "T1NUIOmDqOe9suaIkOWKn++8jFN0ZWFtIOato+WcqOiHquWKqOWQr+WKqOOAgg=="
-    } else {
-        ConvertFrom-Utf8Base64 "T1NUIOmDqOe9suaIkOWKn+OAgg=="
-    }
-    Write-Log -Message $successMessage -Level "SUCCESS" -Scope "ost" -LogFile $RunContext.LogFile
 }
 
 function Invoke-SetManifestSource {
