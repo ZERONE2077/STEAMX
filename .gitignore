@@ -11,8 +11,10 @@ patch/
 cache-service/
 # 清单包源：只留在开发机上，不上传仓库（31 个 zip 约 141MB）
 /manifest/
-# OST 配置属于运行时文件（拷进 Steam 根目录用），仓库不跟踪
-opensteamtool.toml
+# opensteamtool.toml 现在【被跟踪】：它是本项目发布给用户的配置，
+# main.ps1 通过 Get-OstTomlContent 从仓库下载它（首次部署且用户没有 toml 时）。
+# 不要加回忽略，否则下载路径 404、只能退回内嵌模板。
+# 注意：<Steam>/opensteamtool.toml 是运行时文件，部署流程只在用户【没有】它时才写。
 opensteamtool.example.toml
 # 沙箱文件权限修复的备份与报告（本机一次性产物，含权限回滚脚本）
 /.acl-recovery/

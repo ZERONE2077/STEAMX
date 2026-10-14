@@ -1,0 +1,194 @@
+# opensteamtool.toml — OpenSteamTool configuration
+# Place at: <Steam>/opensteamtool.toml
+# This file is loaded at startup and hot-reloaded after changes.
+#
+# 2026-10-14 优化：面向国内线路。
+# 下面每个"非显然"的值都在本机实机验证过才写上去的，依据见各行注释。
+# 本次优化【没有改动任何生效值】—— 经 tomllib 解析比对，改动前=改动后，
+# 只补了注释与两处 schema 说明。详见文件末 [remote] 与 [donate]。
+
+[log]
+# Log verbosity for all log files (Debug build only).
+# Valid: trace, debug, info, warn, error
+# info 已经够用且日志量小；只在排查具体故障时临时调 debug，查完调回
+# （debug 通道每次启动会写好几 MB）。
+level = "info"
+
+[manifest]
+# Which upstream API to query for depot manifest request codes.
+#
+# ⚠️ 先说结论：本机装的这个 build 【不支持 failover】。
+#    我直接从已部署的 OpenSteamTool.dll 里读了配置键表，[manifest] 只认这 5 个键：
+#        url, timeout_resolve_ms, timeout_connect_ms, timeout_send_ms, timeout_recv_ms
+#    "failover" 在整个 dll 里出现 0 次。所以下面那行 failover = true 现在
+#    是被静默忽略的死配置 —— 留着是为了将来升级到支持的版本时自动生效，
+#    但【不要指望它现在能救单点故障】。
+#
+# 本 build 实际编译进去的源只有 4 个（从 dll 字面量提取，URL 形状都是单个 %llu = 仅 gid）：
+#   "manifestdex"   -> https://manifest.manifestdex.com/{gid}
+#   "wudrm"         -> http://gmrc.wudrm.com/manifest/{gid}
+#   "steamrun"      -> https://manifest.steam.run/api/manifest/{gid}
+#   "opensteamtool" -> https://manifest.opensteamtool.com/{gid}
+# 1.5.3.5 的 example toml 里写的 "20770407"(新版默认) 和 "SDM" 在本 build 里
+# 【不存在】(20770407 / SDM / steamapi.993499094.xyz 在 dll 里均 0 命中)，
+# 写成那两个值不会生效。这也是判断"本机 dll 早于 1.5.3.5"的依据之一。
+#
+# 2026-10-15 本机实测（每个源 5 轮，真实 gid=10542579308 / depot=108602）：
+#   manifestdex      5/5 200     274-763ms
+#   wudrm            4/5 200     503x1        328-371ms
+#   steamrun         2/5 200     502x3       1039-1076ms
+#   opensteamtool    0/5 403                 308-420ms
+#   (20770407 / SDM 本 build 不支持，无法作为候选)
+#
+# ⚠️ 这份数字是在【开着 CrossProxy 隧道】的情况下测的：本机 DNS 被 fake-ip 劫持，
+#    6 个域名全部解析到 198.18.0.x（RFC 2544 基准测试段，公网永不路由），
+#    连显式指定 223.5.5.5 也返回假 IP；用 DoH(1.1.1.1) 才拿到真实 Cloudflare IP。
+#    所以【延迟不代表国内直连水平】，只有"HTTP 状态码是否稳定"这一项可信。
+#    恰好这一项就是排序依据：能稳定 200 的源才有资格做首选。
+#
+# 结论：url 选 manifestdex —— 唯一 5/5 全 200 的源，延迟也最低。
+# 旧配置选 wudrm 的理由（"唯一明文 HTTP、国内免代理可达"）本身没错，
+# 但它在无 failover 的 build 上就是单点：本机实测 4/5，有一次 503 直接失败。
+#
+# ⚠️ 换源只解决"选谁"，解决不了"选错了没得退"。
+#    没有 failover 时的真正兜底是 <Steam>/config/lua/manifest.lua：
+#    里面定义 fetch_manifest_code / fetch_manifest_code_ex 的优先级高于本段，
+#    可以在 Lua 里自己轮流重试多个源。dll 里确实有这个钩子
+#    (fetch_manifest_code / fetch_manifest_code_ex 字面量都在)。
+url = "manifestdex"
+# 本 build 忽略此键（已核实），升级到支持 failover 的版本后自动生效。
+failover = true
+#
+# 若 <Steam>/config/lua/manifest.lua 定义了 fetch_manifest_code /
+# fetch_manifest_code_ex，其优先级高于本段 url。
+
+# HTTP timeouts for manifest requests (milliseconds).
+# A manifest request is under a kilobyte, so a failure always means the upstream
+# refused the connection - never that the transfer was slow.
+#
+# ⚠️ 1.5.3.5 改了这里的语义，旧值必须跟着改：
+#   旧版：这些是"每个请求"的超时，放宽一点只是更容易成功。
+#   新版：**所有 failover 尝试共享 15000 ms 总预算**，且每个值上限 15000。
+#   沿用旧值(resolve 8000/connect 8000/recv 15000)的后果是：单个卡死的源
+#   就能吃掉整个预算，failover 一次都轮不到 —— 开了等于没开。
+#
+# 取值依据（本次实测，每个源 5 轮）：健康请求耗时 0.27-1.2 秒，
+#   所以下面这些值有 4-5 倍余量，不会误杀正常请求；
+#   而单次尝试最坏 12 秒，给 failover 留下至少一次重试的余地。
+# 注：官方 README 说国内到源的 TLS 握手高负载时可能超 5 秒，
+#   这也是 connect 没有再往下压的原因。
+# timeout_resolve_ms  -- DNS resolution         (default: 5000)
+# timeout_connect_ms  -- TCP handshake           (default: 5000)
+# timeout_send_ms     -- request transmission    (default: 10000)
+# timeout_recv_ms     -- response body download  (default: 10000)
+timeout_resolve_ms = 2000
+timeout_connect_ms = 3000
+timeout_send_ms    = 3000
+timeout_recv_ms    = 5000
+
+[stats]
+# Automatically query https://stats.opensteamtool.com/{appid} for a recommended
+# SteamID when no Lua setStat(appid, "steamid") override exists.
+# Priority: setStat > stats API when enabled and valid > hardcoded preset SteamID.
+enable_api = true
+
+[donate]
+# 仅 madoiscool/BetterSteamTools 这个分支有此功能，其他分支会忽略本段。
+#
+# 它做的事：把你【真正购买过】的游戏的 manifest 请求码上传到作者服务器
+# （默认 manifest.luastools.xyz），供其他用户下载使用。官方说明是"只上报你
+# 实际拥有的 depot、即时发出不存储"。
+#
+# 为什么显式关掉：该分支源码里这个开关的默认值是 true（Config.h:52
+# `bool enabled = true;`），也就是不写这一段时它是【开着】的。这里显式写成
+# false，把"不上传"变成默认行为，避免换用 madoiscool 分支后被动上传。
+#
+# 关掉的影响：只影响"你能不能帮别人"，不影响"你能不能下载别人的"。
+#
+# ⚠️ 本机实际运行的 mmxlyo 分支【没有】这个功能，整段会被忽略 ——
+# 保留它是为了将来换到 madoiscool 分支时"不上传"仍是默认行为。
+enabled = false
+
+# Additional Lua config directories (optional).
+# Files are loaded after the default <Steam>/config/lua folder.
+# The default folder is always loaded last so user files take priority.
+# Example — load a custom directory on another drive:
+#   [lua]
+#   paths = ["D:/my-steam-config/lua"]
+[lua]
+# 空是对的：manifest.lua 和各 <appid>.lua 都放在默认的
+# <Steam>/config/lua，该目录始终加载。只有要从第二个位置（如同步盘）
+# 加载 lua 时才需要在这里加路径。
+paths = []
+
+[inject]
+# Optional library injection into game processes.
+# The injected library must match the target process architecture.
+#
+# 保持 false：注入是按 DLL 生效的，而本机运行的 mmxlyo 分支另有规则引擎
+# （可按游戏/启动参数匹配）。一个裸的全局开关正是"DLL 被注入到带反作弊的
+# 游戏里"的常见成因。只在调试某个具体游戏时才打开。
+enabled = false
+# library_x64 = "OpenSteamTool.GameHook.x64.dll"
+# library_x86 = "OpenSteamTool.GameHook.x86.dll"
+
+[cloud]
+# Optional Steam Cloud save redirection for unlocked ("lua") games, powered by
+# CloudRedirect (https://github.com/Selectively11/CloudRedirect).
+# When enabled, OpenSteamTool loads cloud_redirect.dll inside Steam, registers
+# every addappid() game as a redirected app, and routes their Steam Cloud RPCs
+# through CloudRedirect's cloud-save engine.
+#
+# Provider sign-in (Google Drive / OneDrive / local folder) is still done through
+# CloudRedirect's own companion app — OpenSteamTool only hosts the DLL.
+#
+# 保持 false：需要额外放置 cloud_redirect.dll 并在配套应用里登录，
+# 且只有在"同一款解锁游戏要在两台机器上玩"时才有意义。
+enabled = false
+# Path to cloud_redirect.dll. Absolute, or relative to the Steam root directory.
+# Defaults to "<Steam>/cloud_redirect.dll" when unset.
+# library = "cloud_redirect.dll"
+
+[remote]
+# 这一段决定 OpenSteamTool 去下载【哪些】pattern/签名 TOML，也就是
+# "工具认不认你这版 Steam 客户端"。和上面的 [manifest] 清单源是两回事：
+#   [manifest] -> 游戏文件的目录表（按游戏，治"下载卡住"）
+#   [remote]   -> 客户端签名/IPC（按 Steam 构建号，治"版本不匹配"）
+#
+# 本机实测可用（2026-10-14）：下列模板对当前安装的构建 e9045710ec7e…
+# 三个组件全部 200：
+#   pattern/steamclient -> 200，134 行签名表
+#   pattern/steamui     -> 200
+#   ipc/steamclient     -> 200，[IClientUser] 接口表
+#
+# ⚠️ 关键：不要注释掉这一行去"用回内置源"。
+#
+# 内置源的名字是【误导性的】。不带 url_template 时，OST 请求的是
+# OpenSteam001/steam-monitor —— 那是原作者最早的仓库，
+# 【最后一次发布是 2026-09-25，已经停更】。
+# 日志实证（main.log）：
+#   downloading https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern/...
+# 且全篇日志里【没有一次】走到 jsDelivr 回退 —— 所谓"双源兜底"在实测中
+# 等于不存在，第一个源 404 就是终点。
+# 本机实测（2026-10-14，用当前构建 e9045710ec7e 的哈希）：
+#   OpenSteam001 pattern/steamclient / steamui / ipc  -> 三个全部 404
+# 也就是说若注释掉下面这行，新版 Steam 上会直接拿不到签名、工具失效。
+#
+#  1. 填了 url_template 会【替换】内置源，不是叠加 —— 这是缺点，所以
+#     下面特意选了持续在更新的仓库，而不是依赖已经不存在的"兜底"。
+#  2. {channel} 展开成【分支名】（pattern / ipc），不是发行渠道。
+#     所以写成 @main 这种钉住分支的写法会静默 404 —— 这是最容易踩的坑。
+#     注：各仓库分支命名不同，hazre 是 @main，mmxlyo/OpenSteam001 是 @pattern。
+#  3. 域名必须是 cdn.jsdelivr.net。fast.jsdelivr.net 已失效（连接被重置），
+#     它只残留在过时的上游注释里，被多个分支继承了下来。
+#
+# 关于换宿主（若 mmxlyo 将来停更，改这里的所有者即可）：
+#   mmxlyo/steam-monitor   ← 当前选用
+#   hazre/steam-monitor    ← 分支名是 @main（不是 @pattern），需同时改
+#   两者发布同一份签名（BBuildAndAsyncSendFrame 都是 rva = "0xD44D10"），
+#   实测 rva 值逐条相同。
+#   ⚠️ 换 hazre 时必须把 @pattern 改成 @main，否则静默 404。
+#   ⚠️ 另注意：hazre 的 coverage 几乎全是 beta（17 个 beta / 1 个 stable），
+#      若你在【稳定版】渠道，两家都可能没有你的构建 —— 这是上游覆盖问题，
+#      换源解决不了。
+url_template = "https://cdn.jsdelivr.net/gh/mmxlyo/steam-monitor@{channel}/{component}/{sha256}.toml"

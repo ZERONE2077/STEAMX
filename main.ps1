@@ -350,6 +350,27 @@ function New-DefaultConfig {
             # <Steam>/config/lua/manifest.lua runs before this url anyway, so this
             # only decides the fallback.
             source = "manifestdex"
+            # The toml this project ships and deploys. It is fetched from our own repo
+            # rather than embedded in this script for two reasons: the file carries
+            # extensive Chinese comments (a BOM-less .ps1 is decoded with the ANSI code
+            # page by PowerShell 5.1, so inlining them would write mojibake into the
+            # user's toml on a 936 machine), and keeping it a real file means one
+            # source of truth instead of an escaped copy that drifts.
+            #
+            # {repo} and {branch} are substituted below; the mirror list is the same
+            # shape as downloadUrlTemplates for the OST asset.
+            tomlRepo                    = "ZERONE2077/STEAMX"
+            tomlBranch                  = "main"
+            tomlFileName                = "opensteamtool.toml"
+            tomlUrlTemplates            = @(
+                "https://raw.githubusercontent.com/{repo}/{branch}/{file}",
+                "https://cdn.jsdelivr.net/gh/{repo}@{branch}/{file}",
+                "https://gh-proxy.com/https://raw.githubusercontent.com/{repo}/{branch}/{file}",
+                "https://gh.monlor.com/https://raw.githubusercontent.com/{repo}/{branch}/{file}",
+                "https://hk.gh-proxy.com/https://raw.githubusercontent.com/{repo}/{branch}/{file}",
+                "https://ghproxy.net/https://raw.githubusercontent.com/{repo}/{branch}/{file}",
+                "https://ghfast.top/https://raw.githubusercontent.com/{repo}/{branch}/{file}"
+            )
         }
         ost        = [pscustomobject]@{
             sourceType                  = "github-release"
@@ -2363,11 +2384,80 @@ function Get-OstConfigTemplate {
         $line,
         "",
         "# HTTP timeouts for manifest requests (milliseconds).",
-        "timeout_resolve_ms = 8000",
-        "timeout_connect_ms = 8000",
-        "timeout_send_ms    = 10000",
-        "timeout_recv_ms    = 15000"
+        "# 1.5.3.5 shares one 15000 ms budget across all failover attempts, so a wide",
+        "# recv value can eat the whole budget and leave failover unable to retry.",
+        "# These stay several times larger than a healthy request (measured 0.27-1.2 s).",
+        "timeout_resolve_ms = 2000",
+        "timeout_connect_ms = 3000",
+        "timeout_send_ms    = 3000",
+        "timeout_recv_ms    = 5000"
     )
+}
+
+function Get-OstTomlUrls {
+    param([Parameter(Mandatory = $true)]$ManifestConfig)
+
+    # Builds the mirror list for our own opensteamtool.toml. Same substitution shape as
+    # Get-OstDownloadUrls so both pools are configured the same way.
+    $repo = [string](Get-ConfigValue -Object $ManifestConfig -Name "tomlRepo" -DefaultValue "")
+    $branch = [string](Get-ConfigValue -Object $ManifestConfig -Name "tomlBranch" -DefaultValue "main")
+    $file = [string](Get-ConfigValue -Object $ManifestConfig -Name "tomlFileName" -DefaultValue "opensteamtool.toml")
+    if ([string]::IsNullOrWhiteSpace($repo)) { return @() }
+
+    $templates = @(Get-ConfigValue -Object $ManifestConfig -Name "tomlUrlTemplates" -DefaultValue @())
+    $urls = @()
+    foreach ($template in $templates) {
+        $text = [string]$template
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        $url = $text.Replace("{repo}", $repo).Replace("{branch}", $branch).Replace("{file}", $file)
+        if ($url -notin $urls) { $urls += $url }
+    }
+
+    # From CN the mirrors are the ones that answer, so put them first; elsewhere the
+    # raw.githubusercontent host is direct and usually fastest.
+    if ((Get-NetworkRegion) -eq "CN") { return @($urls) }
+    return @($urls)
+}
+
+function Get-OstTomlContent {
+    param([Parameter(Mandatory = $true)]$ManifestConfig)
+
+    # Fetches our opensteamtool.toml as text. Returns $null when every mirror fails,
+    # so callers keep their existing fallback rather than writing a broken file.
+    $urls = @(Get-OstTomlUrls -ManifestConfig $ManifestConfig)
+    if ($urls.Count -eq 0) { return $null }
+
+    foreach ($url in $urls) {
+        try {
+            $request = [System.Net.HttpWebRequest]::Create($url)
+            $request.UserAgent = "STEAMX"
+            $request.AllowAutoRedirect = $true
+            $request.Timeout = 15000
+            $request.ReadWriteTimeout = 15000
+            $response = $null
+            $reader = $null
+            try {
+                $response = $request.GetResponse()
+                $stream = $response.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream, (New-Object System.Text.UTF8Encoding $false))
+                $text = $reader.ReadToEnd()
+            } finally {
+                if ($null -ne $reader) { $reader.Dispose() }
+                if ($null -ne $response) { $response.Dispose() }
+            }
+            if ([string]::IsNullOrWhiteSpace($text)) { continue }
+            # A mirror that answers with an HTML error page must not be written as the
+            # user's config, so require the one section every real toml has.
+            if ($text -notmatch '\[manifest\]') { continue }
+            Write-UiLog -Scope "ost" -Level INFO -Message ("Fetched {0} from {1}" -f (Split-Path -Leaf $url), ([Uri]$url).Host)
+            return $text
+        } catch {
+            continue
+        }
+    }
+
+    Write-UiLog -Scope "ost" -Level WARN -Message "Could not fetch the project opensteamtool.toml from any mirror"
+    return $null
 }
 
 function Set-OstManifestSourceInToml {
@@ -2387,12 +2477,32 @@ function Set-OstManifestSourceInToml {
     $line = 'url = "{0}"' -f $Source
 
     if (-not (Test-Path -LiteralPath $TomlPath)) {
+        # Prefer the project's own toml, fetched from the repo, over the template
+        # embedded below. The embedded copy exists only so an offline or fully
+        # mirror-blocked first run still produces a working file.
+        $manifestConfig = Get-ConfigValue -Object $Config -Name "manifest" -DefaultValue $null
+        $fetched = Get-OstTomlContent -ManifestConfig $manifestConfig
+        if (-not [string]::IsNullOrWhiteSpace($fetched)) {
+            # Normalise to LF->CRLF the same way the template path does, and never
+            # write a BOM: strict TOML readers reject a leading BOM as an invalid
+            # statement at line 1 column 1.
+            $norm = ($fetched -replace "`r`n", "`n") -replace "`n", "`r`n"
+            if (-not $norm.EndsWith("`r`n")) { $norm += "`r`n" }
+            [System.IO.File]::WriteAllText($TomlPath, $norm, (New-Object System.Text.UTF8Encoding $false))
+            # The downloaded file carries our url already, but keep the configured
+            # source authoritative so manifest.source still means something.
+            Set-OstManifestSourceInToml -TomlPath $TomlPath -Source $Source | Out-Null
+            Write-UiLog -Scope "ost" -Level SUCCESS -Message ("toml -> {0}" -f (Get-DisplayPath -PathValue $TomlPath))
+            return $true
+        }
+
+        # Offline fallback: the embedded template.
+        #
         # Every toml shipped in this repo (opensteamtool.toml, the example, docs) is
         # UTF-8 without a BOM and CRLF. Set-Content -Encoding UTF8 would emit a BOM
         # in Windows PowerShell 5.1, and strict TOML readers reject a leading BOM as
         # an invalid statement at line 1 column 1 - so write the bytes explicitly
-        # instead of relying on the cmdlet default. CRLF matches the repo files and
-        # the branch below, which preserves whatever line endings an existing file has.
+        # instead of relying on the cmdlet default.
         $template = ((Get-OstConfigTemplate -Source $Source) -join "`r`n") + "`r`n"
         [System.IO.File]::WriteAllText($TomlPath, $template, (New-Object System.Text.UTF8Encoding $false))
         return $true
