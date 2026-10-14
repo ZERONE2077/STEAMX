@@ -1415,6 +1415,126 @@ function Test-VersionOlder {
     return $local.Rank -lt $remote.Rank
 }
 
+function ConvertTo-IsoUtcString {
+    param([Parameter(Mandatory = $false)]$Value)
+
+    # Renders a release timestamp as an unambiguous ISO-8601 UTC string.
+    #
+    # A plain [string] cast on the DateTime that Invoke-RestMethod produces loses the
+    # "Z" while keeping the UTC clock reading, which is the worst of both worlds: the
+    # value looks like local time and re-parses as Kind=Unspecified. Formatting with
+    # "o" after normalising to UTC keeps the instant explicit.
+    if ($null -eq $Value) { return "" }
+    if ($Value -is [datetime]) {
+        $dt = [datetime]$Value
+        if ($dt.Kind -eq [System.DateTimeKind]::Unspecified) {
+            # An unspecified value from JSON already carries the UTC reading; stamping
+            # it Utc is the correct interpretation and avoids a double shift.
+            $dt = [datetime]::SpecifyKind($dt, [System.DateTimeKind]::Utc)
+        } else {
+            $dt = $dt.ToUniversalTime()
+        }
+        return $dt.ToString("o")
+    }
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return "" }
+
+    $parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParse(
+            $text,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind,
+            [ref]$parsed)) {
+        return $text
+    }
+    if ($parsed.Kind -eq [System.DateTimeKind]::Unspecified) {
+        $parsed = [datetime]::SpecifyKind($parsed, [System.DateTimeKind]::Utc)
+    } else {
+        $parsed = $parsed.ToUniversalTime()
+    }
+    return $parsed.ToString("o")
+}
+
+function ConvertTo-UtcDateTime {
+    param([Parameter(Mandatory = $false)]$Value)
+
+    # Normalises a release timestamp to a real UTC instant for comparison.
+    #
+    # GitHub returns published_at as an ISO-8601 UTC instant ("2026-10-14T12:44:35Z").
+    # Invoke-RestMethod parses it to Kind=Utc, but a [string] cast (and any JSON
+    # round-trip) can leave it Kind=Unspecified with the same clock reading. Treating
+    # that as local time and calling ToUniversalTime() shifts it by the host offset
+    # (-8h in CN), which made a release published after the local kernel look older.
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) {
+        $dt = [datetime]$Value
+        if ($dt.Kind -eq [System.DateTimeKind]::Utc) { return $dt }
+        if ($dt.Kind -eq [System.DateTimeKind]::Local) { return $dt.ToUniversalTime() }
+        # Unspecified: the clock already reads UTC; only the marker is missing.
+        return [datetime]::SpecifyKind($dt, [System.DateTimeKind]::Utc)
+    }
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+    $parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParse(
+            $text,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind,
+            [ref]$parsed)) {
+        return $null
+    }
+    if ($parsed.Kind -eq [System.DateTimeKind]::Utc) { return $parsed }
+    if ($parsed.Kind -eq [System.DateTimeKind]::Local) { return $parsed.ToUniversalTime() }
+    return [datetime]::SpecifyKind($parsed, [System.DateTimeKind]::Utc)
+}
+
+function Get-OstUpdateStatePath {
+    # Remembers which release tags have already been offered, so the same release is
+    # never re-downloaded. Lives beside the backups/credential for the same reason:
+    # %LOCALAPPDATA% is user-owned and never auto-purged.
+    $localAppData = [Environment]::GetFolderPath("LocalApplicationData")
+    if ([string]::IsNullOrWhiteSpace($localAppData)) { $localAppData = [System.IO.Path]::GetTempPath() }
+    return (Join-Path $localAppData "STEAMX\ost-update-state.json")
+}
+
+function Get-OstHandledTags {
+    $path = Get-OstUpdateStatePath
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    try {
+        $data = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($null -eq $data) { return @() }
+        return @($data.handledTags | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    } catch {
+        # A corrupt latch must not block startup; treat it as empty.
+        return @()
+    }
+}
+
+function Add-OstHandledTag {
+    param([Parameter(Mandatory = $true)][string]$Tag)
+
+    if ([string]::IsNullOrWhiteSpace($Tag)) { return }
+    $tags = @(Get-OstHandledTags)
+    if ($tags -contains $Tag) { return }
+    $tags += $Tag
+
+    # Bounded: this is a latch, not a log. Keep the most recent entries only.
+    if ($tags.Count -gt 20) { $tags = @($tags | Select-Object -Last 20) }
+
+    $path = Get-OstUpdateStatePath
+    try {
+        Ensure-Directory -PathValue (Split-Path -Parent $path)
+        [pscustomobject]@{ handledTags = $tags } |
+            ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath $path -Encoding UTF8 -NoNewline
+    } catch {
+        # Best effort: failing to persist the latch must never break an update.
+    }
+}
+
 function Test-OstUpdateAvailable {
     param(
         [Parameter(Mandatory = $true)]$KernelState,
@@ -1426,31 +1546,55 @@ function Test-OstUpdateAvailable {
     # The version number cannot be the primary signal: the OpenSteamTool.dll that
     # ships in these release zips carries NO ProductVersion/FileVersion at all
     # (verified on a real install), so Get-OstLocalVersion returns "" and any
-    # version comparison is structurally dead. The file date is the signal that
-    # actually exists, so the comparison is date-first and version is only a
-    # tie-breaker for the cases where a version IS present.
+    # version comparison is structurally dead.
+    #
+    # The file timestamp is the signal that actually exists, and it is compared at
+    # full precision rather than by calendar day. Upstream ships several releases
+    # per day (2026-09-15: 1.5.1 at 15:08Z and 1.5.1.1 at 15:37Z, 28 minutes
+    # apart), so a day-granular comparison hid every same-day update. The install
+    # time is trustworthy because extraction writes the payload with FileMode.Create
+    # and never copies the archive entry's timestamp, so LastWriteTimeUtc is the
+    # moment the file was written locally.
+    #
+    # Re-download safety comes from the handled-tag latch, not from coarsening the
+    # clock: a tag that has already been installed (or explicitly skipped) is never
+    # offered again even while its file timestamps stay older than published_at.
     if (-not $Remote.Available) { return $false }
     if (-not $KernelState.IsReady) { return $true }
 
-    $remotePublished = $null
-    try { $remotePublished = [DateTime]$Remote.PublishedDate } catch { $remotePublished = $null }
-    if ($null -eq $remotePublished) { return $false }
-
-    $localDate = $null
-    if (-not [string]::IsNullOrWhiteSpace($KernelState.FileDate)) {
-        try { $localDate = [DateTime]$KernelState.FileDate } catch { $localDate = $null }
+    $remoteTag = [string]$Remote.Version
+    if (-not [string]::IsNullOrWhiteSpace($remoteTag)) {
+        if (@(Get-OstHandledTags) -contains $remoteTag) { return $false }
     }
 
-    if ($null -ne $localDate) {
-        # Compare on whole days. The local kernel is stamped by file LastWriteTimeUtc
-        # and the release by published_at, so a same-day release must NOT be treated
-        # as newer - otherwise every launch would re-download the current version.
-        if ($localDate.Date -lt $remotePublished.ToUniversalTime().Date) { return $true }
-        if ($localDate.Date -gt $remotePublished.ToUniversalTime().Date) { return $false }
+    # Normalise to real UTC instants before comparing. published_at arrives as a
+    # JSON-parsed Unspecified DateTime whose offset has already been folded in by the
+    # caller, so a plain ToUniversalTime() here would shift it a second time.
+    $remotePublished = ConvertTo-UtcDateTime -Value $Remote.PublishedDate
+
+    $localTimestamp = ConvertTo-UtcDateTime -Value $KernelState.FileTimestampUtc
+
+    if (($null -ne $remotePublished) -and ($null -ne $localTimestamp)) {
+        # Genuinely newer: the release was published after this kernel was written.
+        if ($remotePublished -gt $localTimestamp) { return $true }
+        return $false
     }
 
-    # Same day (or no local date): fall back to the version, which only helps when
-    # the DLL actually reports one.
+    # No comparable timestamp (an unparseable date, or a kernel whose files could
+    # not be stat'd): fall back to the version, which only helps when the DLL
+    # actually reports one. A day-granular guard keeps a missing timestamp from
+    # causing a re-download loop.
+    if ($null -ne $remotePublished) {
+        $localDate = $null
+        if (-not [string]::IsNullOrWhiteSpace($KernelState.FileDate)) {
+            try { $localDate = [DateTime]$KernelState.FileDate } catch { $localDate = $null }
+        }
+        if ($null -ne $localDate) {
+            if ($localDate.Date -lt $remotePublished.Date) { return $true }
+            if ($localDate.Date -gt $remotePublished.Date) { return $false }
+        }
+    }
+
     return (Test-VersionOlder -LocalVersion $KernelState.Version -RemoteVersion $Remote.Version)
 }
 
@@ -1535,7 +1679,12 @@ function Get-LatestOstReleaseInfo {
         return [pscustomobject]@{
             Available     = $true
             Version       = [string]$release.tag_name
-            PublishedDate = [string]$release.published_at
+            # Keep the ISO-8601 form, not a bare [string] cast. Invoke-RestMethod hands
+            # back a Kind=Utc DateTime, and [string] renders it as "10/14/2026 12:44:35"
+            # - the same clock reading as UTC but with no "Z", so re-parsing yields
+            # Kind=Unspecified and any later ToUniversalTime() shifts it by the host's
+            # offset. Formatting with "o" preserves the offset marker and the instant.
+            PublishedDate = ConvertTo-IsoUtcString -Value $release.published_at
             Error         = ""
         }
     } catch {
@@ -1565,14 +1714,31 @@ function Get-OstKernelState {
     }
 
     $localVersion = Get-OstLocalVersion -SteamPath $SteamPath
-    $fileDates = @(
+    # Two views of the same install time are kept on purpose.
+    #
+    # FileDate stays a "yyyy-MM-dd" string: other call sites (the -Check report and
+    # Format-VersionWithDate) print it, and a bare date is what a human wants there.
+    #
+    # FileTimestampUtc is the full-precision round-trip used by the update decision.
+    # The old code took .Date here, which collapsed every install on a given day to
+    # 00:00:00 and made a same-day comparison structurally impossible - upstream
+    # ships several releases per day (2026-09-15: 1.5.1 and 1.5.1.1, 28 minutes
+    # apart), so day granularity silently hid real updates.
+    $fileTimestamps = @(
         foreach ($fileName in $present) {
             $target = Join-Path $SteamPath $fileName
-            try { (Get-Item -LiteralPath $target).LastWriteTimeUtc.Date } catch { }
+            try { (Get-Item -LiteralPath $target).LastWriteTimeUtc } catch { }
         }
     )
-    $localFileDate = if ($fileDates.Count -gt 0) {
-        ($fileDates | Sort-Object -Descending | Select-Object -First 1).ToString("yyyy-MM-dd")
+    $localFileDate = if ($fileTimestamps.Count -gt 0) {
+        ($fileTimestamps | Sort-Object -Descending | Select-Object -First 1).ToString("yyyy-MM-dd")
+    } else {
+        ""
+    }
+    $localFileTimestamp = if ($fileTimestamps.Count -gt 0) {
+        # Round-trip through ISO-8601 so the value survives the pscustomobject intact
+        # and is parsed back the same way regardless of the machine's locale.
+        ($fileTimestamps | Sort-Object -Descending | Select-Object -First 1).ToString("o")
     } else {
         ""
     }
@@ -1591,13 +1757,14 @@ function Get-OstKernelState {
     }
 
     return [pscustomobject]@{
-        Present      = $present
-        Missing      = $missing
-        IsReady      = ($missing.Count -eq 0)
-        Version      = $localVersion
-        FileDate     = $localFileDate
-        Status       = $status
-        LegacyPaths  = @($legacyPaths)
+        Present          = $present
+        Missing          = $missing
+        IsReady          = ($missing.Count -eq 0)
+        Version          = $localVersion
+        FileDate         = $localFileDate
+        FileTimestampUtc = $localFileTimestamp
+        Status           = $status
+        LegacyPaths      = @($legacyPaths)
     }
 }
 
@@ -2082,7 +2249,9 @@ function Get-OstSourceDirectoryFromGitHub {
     return [pscustomobject]@{
         SourcePath    = $extractRoot
         Version       = $tagName
-        PublishedDate = [string]$release.published_at
+        # Same ISO-8601 normalisation as Get-LatestOstReleaseInfo; this path usually
+        # has no published_at at all, so an empty string is the common result.
+        PublishedDate = ConvertTo-IsoUtcString -Value $release.published_at
         AssetName     = [string]$asset.name
         Source        = "github-release"
     }
@@ -2306,7 +2475,16 @@ function Invoke-Check {
     } else {
         "None"
     }
-    if ($kernelState.Status -eq "Ready" -and $remote.Available -and (Test-VersionOlder -LocalVersion $kernelState.Version -RemoteVersion $remote.Version)) {
+    # Reuse the launcher's decision instead of a version-only test: the shipped DLL
+    # reports no version, so Test-VersionOlder alone could never reach
+    # "UpdateAvailable" here and the report disagreed with what startup actually did.
+    $reportUpdateNeeded = $false
+    try {
+        $reportUpdateNeeded = Test-OstUpdateAvailable -KernelState $kernelState -Remote $remote
+    } catch {
+        $reportUpdateNeeded = $false
+    }
+    if ($kernelState.Status -eq "Ready" -and $reportUpdateNeeded) {
         $kernelState.Status = "UpdateAvailable"
     }
     if ([string]::IsNullOrWhiteSpace($kernelState.Version) -and $remote.Available -and
@@ -2703,6 +2881,9 @@ function Invoke-QuickStart {
             try {
                 $runContext = New-RunContext -Config $Config
                 Invoke-DeployOst -Config $Config -RunContext $runContext
+                # Latch the tag only after a verified install: a failed deploy must
+                # stay offerable on the next launch.
+                Add-OstHandledTag -Tag ([string]$remoteCheck.Version)
                 $refreshed = Get-OstKernelState -Config $Config -SteamPath $steamPath
                 $refreshedDisplay = Format-VersionWithDate -Version $refreshed.Version -DateValue $refreshed.FileDate
                 Write-UiLog -Scope "ost" -Level SUCCESS -Message (ConvertFrom-Utf8Base64 "T1NUIOiHquWKqOabtOaWsOWujOaIkOOAgg==")
@@ -2739,6 +2920,9 @@ function Invoke-QuickStart {
             Write-UiLog -Scope "ost" -Level INFO -Message (ConvertFrom-Utf8Base64 "5q2j5Zyo6YOo572yIE9TVCDnjq/looPigKY=")
             try {
                 Invoke-DeployOst -Config $Config -RunContext $runContext
+                # A manual redeploy of the current latest also satisfies the offer.
+                $manualRemote = Get-LatestOstReleaseInfo -Config $Config -AllowFailure
+                if ($manualRemote.Available) { Add-OstHandledTag -Tag ([string]$manualRemote.Version) }
             } catch {
                 Write-UiLog -Scope "steamx" -Level ERROR -Message $_.Exception.Message
             }
