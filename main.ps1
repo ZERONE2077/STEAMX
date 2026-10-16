@@ -400,7 +400,16 @@ function New-DefaultConfig {
             )
             targetPath                  = ""
             configPath                  = "opensteamtool.toml"
-            files                       = @("dwmapi.dll", "xinput1_4.dll", "OpenSteamTool.dll")
+            # Files this tool owns in the Steam directory, used to recognise an
+            # install (Get-OstKernelState) and to know what to remove on uninstall.
+            # NOT a deployment gate: Invoke-DeployOst deploys every DLL the package
+            # carries and ignores this list, so an upstream file-set change cannot
+            # make a valid release look broken.
+            #
+            # Both shim generations are listed because upstream renamed one: 1.5.3.6
+            # ships version.dll and no longer ships dwmapi.dll. Listing the older
+            # name keeps uninstall able to clean up installs made by earlier builds.
+            files                       = @("dwmapi.dll", "version.dll", "xinput1_4.dll", "OpenSteamTool.dll")
             # On startup, compare the installed kernel against the latest release and
             # refresh it automatically when it is behind. Set to $false to pin the
             # installed version (the check then never downloads anything).
@@ -1213,7 +1222,7 @@ function Invoke-AddGame {
     # that still answers: the example shipped with OST defaults to "opensteamtool", and that
     # one is dead. Align the source before downloading, otherwise a lua-only install is useless.
     $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
-    $ostFiles = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
+    $ostFiles = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "version.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
     $ostInstalled = $false
     foreach ($ostFileName in $ostFiles) {
         if (Test-Path -LiteralPath (Join-Path $steamPath $ostFileName)) { $ostInstalled = $true; break }
@@ -1538,39 +1547,169 @@ function Get-OstUpdateStatePath {
     return (Join-Path $localAppData "STEAMX\ost-update-state.json")
 }
 
-function Get-OstHandledTags {
+function Get-OstUpdateState {
+    # Reads the whole update latch as one object. Both fields are normalised so
+    # every caller can assume arrays, never $null:
+    #   handledTags - tags already installed, or explicitly given up on.
+    #   failedTags  - tags whose package is known-bad, with the reason kept for
+    #                 the message shown on the next launch.
+    # A state file written by an older build has no failedTags field at all, and
+    # a hand-edited or half-written file may hold anything; neither may break
+    # startup, so every read failure degrades to "nothing remembered".
+    $empty = [pscustomobject]@{ handledTags = @(); failedTags = @() }
     $path = Get-OstUpdateStatePath
-    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    if (-not (Test-Path -LiteralPath $path)) { return $empty }
     try {
         $data = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($null -eq $data) { return @() }
-        return @($data.handledTags | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($null -eq $data) { return $empty }
+        $handled = @($data.handledTags | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $failed = @(
+            foreach ($entry in @($data.failedTags)) {
+                if ($null -eq $entry) { continue }
+                $tag = [string](Get-ObjectPropertyValue -Object $entry -Name "tag" -DefaultValue "")
+                if ([string]::IsNullOrWhiteSpace($tag)) { continue }
+                [pscustomobject]@{
+                    tag    = $tag
+                    reason = [string](Get-ObjectPropertyValue -Object $entry -Name "reason" -DefaultValue "")
+                    kind   = [string](Get-ObjectPropertyValue -Object $entry -Name "kind" -DefaultValue "Unknown")
+                    at     = [string](Get-ObjectPropertyValue -Object $entry -Name "at" -DefaultValue "")
+                }
+            }
+        )
+        return [pscustomobject]@{ handledTags = $handled; failedTags = $failed }
     } catch {
         # A corrupt latch must not block startup; treat it as empty.
-        return @()
+        return $empty
     }
+}
+
+function Save-OstUpdateState {
+    param(
+        [string[]]$HandledTags = @(),
+        [object[]]$FailedTags = @()
+    )
+
+    # Bounded: this is a latch, not a log. Keep the most recent entries only.
+    $handled = @($HandledTags | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($handled.Count -gt 20) { $handled = @($handled | Select-Object -Last 20) }
+    $failed = @($FailedTags | Where-Object { $null -ne $_ })
+    if ($failed.Count -gt 20) { $failed = @($failed | Select-Object -Last 20) }
+
+    $path = Get-OstUpdateStatePath
+    try {
+        Ensure-Directory -PathValue (Split-Path -Parent $path)
+        [pscustomobject]@{ handledTags = $handled; failedTags = $failed } |
+            ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath $path -Encoding UTF8 -NoNewline
+    } catch {
+        # Best effort: failing to persist the latch must never break an update.
+    }
+}
+
+function Get-OstHandledTags {
+    return @((Get-OstUpdateState).handledTags)
+}
+
+function Get-OstFailedTag {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Tag)
+
+    # Returns the recorded failure for one tag, or $null when the tag is not
+    # known to be bad. An empty tag can never match.
+    if ([string]::IsNullOrWhiteSpace($Tag)) { return $null }
+    foreach ($entry in @((Get-OstUpdateState).failedTags)) {
+        if ([string]$entry.tag -eq $Tag) { return $entry }
+    }
+    return $null
+}
+
+function Get-OstFailureKind {
+    param([AllowEmptyString()][string]$Message)
+
+    # Splits a deploy failure into the two cases that must be handled differently.
+    #
+    # "Transient" failures are the ones worth retrying on the next launch: a mirror
+    # was down, DNS failed, TLS was broken, the box was offline. Nothing about the
+    # release itself is wrong, so it must stay offerable.
+    #
+    # Everything else is deterministic: the same download would fail the same way
+    # forever. An incomplete package (upstream shipped a zip missing a payload
+    # file), an archive that cannot be extracted, or a payload that will not
+    # deploy. Retrying these on every startup only burns a full download each time
+    # and never succeeds, so they are latched as failed and skipped.
+    #
+    # Unknown messages are treated as deterministic on purpose: the cost of
+    # skipping a release that might have been retryable is one manual redeploy
+    # (the user presses 1), while the cost of mis-classifying the other way is an
+    # unbounded download loop on every launch.
+    $text = [string]$Message
+    if ([string]::IsNullOrWhiteSpace($text)) { return "Unknown" }
+
+    # Checked first: an incomplete package is often reported alongside a download
+    # URL, and must not be mistaken for a network error.
+    if ($text -match 'package is incomplete|validation failed|Missing:\s*\S') { return "ContentDefect" }
+
+    if ($text -match 'SHA-256|hash mismatch|does not match the official asset|integrity') { return "IntegrityMismatch" }
+
+    if ($text -match 'invalid or cannot be extracted|contains an unsafe path|archive') { return "ArchiveDefect" }
+
+    if ($text -match 'Unable to download|Unable to fetch|timed out|timeout|SSL|TLS|certificate|connection|network|offline|no such host|name or service not known|remote name could not be resolved|temporary failure in name resolution|503|502|504') { return "Transient" }
+
+    return "Unknown"
+}
+
+function Test-OstFailureRetryable {
+    param([AllowEmptyString()][string]$Kind)
+
+    # Only transient failures keep the release offerable.
+    return ([string]$Kind -eq "Transient")
 }
 
 function Add-OstHandledTag {
     param([Parameter(Mandatory = $true)][string]$Tag)
 
     if ([string]::IsNullOrWhiteSpace($Tag)) { return }
-    $tags = @(Get-OstHandledTags)
+    $state = Get-OstUpdateState
+    $tags = @($state.handledTags)
     if ($tags -contains $Tag) { return }
     $tags += $Tag
+    # A tag that is now installed (or explicitly given up on) is no longer failed.
+    $failed = @($state.failedTags | Where-Object { [string]$_.tag -ne $Tag })
+    Save-OstUpdateState -HandledTags $tags -FailedTags $failed
+}
 
-    # Bounded: this is a latch, not a log. Keep the most recent entries only.
-    if ($tags.Count -gt 20) { $tags = @($tags | Select-Object -Last 20) }
+function Add-OstFailedTag {
+    param(
+        [Parameter(Mandatory = $true)][string]$Tag,
+        [AllowEmptyString()][string]$Reason = "",
+        [AllowEmptyString()][string]$Kind = "Unknown"
+    )
 
-    $path = Get-OstUpdateStatePath
-    try {
-        Ensure-Directory -PathValue (Split-Path -Parent $path)
-        [pscustomobject]@{ handledTags = $tags } |
-            ConvertTo-Json -Depth 4 |
-            Set-Content -LiteralPath $path -Encoding UTF8 -NoNewline
-    } catch {
-        # Best effort: failing to persist the latch must never break an update.
+    # Records a deterministic deploy failure so the next launch does not repeat a
+    # download that cannot succeed, and so it can explain why instead of silently
+    # staying on the old version.
+    if ([string]::IsNullOrWhiteSpace($Tag)) { return }
+    $state = Get-OstUpdateState
+    $failed = @($state.failedTags | Where-Object { [string]$_.tag -ne $Tag })
+    $failed += [pscustomobject]@{
+        tag    = $Tag
+        reason = $Reason
+        kind   = $Kind
+        at     = (Get-Date).ToUniversalTime().ToString("o")
     }
+    Save-OstUpdateState -HandledTags @($state.handledTags) -FailedTags $failed
+}
+
+function Clear-OstFailedTag {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Tag)
+
+    # Called when the user explicitly retries (presses 1). A manual retry is the
+    # escape hatch for a package that was fixed by hand, so the failure record
+    # must not keep blocking it.
+    if ([string]::IsNullOrWhiteSpace($Tag)) { return }
+    $state = Get-OstUpdateState
+    $failed = @($state.failedTags | Where-Object { [string]$_.tag -ne $Tag })
+    if ($failed.Count -eq $state.failedTags.Count) { return }
+    Save-OstUpdateState -HandledTags @($state.handledTags) -FailedTags $failed
 }
 
 function Test-OstUpdateAvailable {
@@ -1597,6 +1736,12 @@ function Test-OstUpdateAvailable {
     # Re-download safety comes from the handled-tag latch, not from coarsening the
     # clock: a tag that has already been installed (or explicitly skipped) is never
     # offered again even while its file timestamps stay older than published_at.
+    #
+    # A tag whose package is known-bad is skipped for the same reason, but for the
+    # opposite outcome: retrying it cannot succeed, so offering it again would only
+    # repeat a full download on every launch. That distinction lives in the state
+    # file (failedTags) and is applied by the caller, which also has the reason
+    # string needed to tell the user why the update is being skipped.
     if (-not $Remote.Available) { return $false }
     if (-not $KernelState.IsReady) { return $true }
 
@@ -1743,7 +1888,7 @@ function Get-OstKernelState {
     )
 
     $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
-    $files = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
+    $files = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "version.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
     $present = @()
     $missing = @()
     foreach ($fileName in $files) {
@@ -1784,10 +1929,37 @@ function Get-OstKernelState {
         (Join-Path $SteamPath "config\st-plugin"),
         (Join-Path $SteamPath "config\stplug-in")
     ) | Where-Object { Test-Path -LiteralPath $_ }
-    $status = if ($present.Count -eq 0) {
+
+    # IsReady answers "is a kernel installed here", not "does the install match
+    # ost.files exactly".
+    #
+    # Those were the same question while the client treated the configured list as
+    # a required manifest, and the difference is what caused a startup loop: a
+    # release that deployed successfully but shipped a different file set left
+    # Missing non-empty, so IsReady stayed false, Invoke-QuickStart took the
+    # "not installed, deploy now" branch, and every launch re-downloaded and
+    # re-deployed the same files. The install was fine; only the expectation was
+    # wrong.
+    #
+    # OpenSteamTool.dll is the payload - it is what gets loaded, and it is already
+    # the sole basis for Get-OstLocalVersion. A present payload means a kernel is
+    # installed. The configured names stay meaningful for uninstall, which needs
+    # to know which files belong to us, and is surfaced separately as IsComplete
+    # for display rather than used to veto a completed deploy.
+    #
+    # Note the shim names are upstream's to change: 1.5.3.6 dropped dwmapi.dll in
+    # favour of version.dll. That is why readiness keys off the payload, whose name
+    # is the tool's own, and never off the configurable list. A stale ost.files
+    # therefore shows up as IsComplete=false (and a Missing entry) rather than as
+    # a broken install.
+    $payloadPresent = Test-Path -LiteralPath (Join-Path $SteamPath "OpenSteamTool.dll") -PathType Leaf
+    $isReady = if ($payloadPresent) { $true } else { ($present.Count -gt 0 -and $missing.Count -eq 0) }
+
+    $status = if (-not $isReady) {
         "NotInstalled"
     } elseif ($missing.Count -gt 0) {
-        "Incomplete"
+        # Installed and usable, but not matching the configured file list.
+        "Partial"
     } elseif ([string]::IsNullOrWhiteSpace($localVersion)) {
         "VersionUnknown"
     } else {
@@ -1797,7 +1969,8 @@ function Get-OstKernelState {
     return [pscustomobject]@{
         Present          = $present
         Missing          = $missing
-        IsReady          = ($missing.Count -eq 0)
+        IsReady          = $isReady
+        IsComplete       = ($missing.Count -eq 0)
         Version          = $localVersion
         FileDate         = $localFileDate
         FileTimestampUtc = $localFileTimestamp
@@ -1840,15 +2013,36 @@ function Assert-OstSourceFiles {
         [Parameter(Mandatory = $true)][string]$SourcePath
     )
 
-    $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
-    $files = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
-    $missing = @()
-    foreach ($fileName in $files) {
-        $sourceFile = Get-ChildItem -LiteralPath $SourcePath -Recurse -File -Filter $fileName -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -eq $sourceFile) { $missing += $fileName }
+    # Only checks that the source holds *something* to deploy.
+    #
+    # This used to demand the exact file set from ost.files (dwmapi.dll,
+    # xinput1_4.dll, OpenSteamTool.dll) and throw when any one was absent. That
+    # made the client the authority on what upstream is allowed to ship, and it
+    # broke in the way that assumption always breaks: a release whose zip verifies
+    # against GitHub's own digest but does not carry a file this build expects was
+    # declared "incomplete" and refused. Upstream owns the package layout - it may
+    # rename a shim, drop one it no longer needs, or change the injection method
+    # entirely - and none of that is detectable from here.
+    #
+    # What is still worth rejecting is an archive that yields no DLL at all: a
+    # truncated download that somehow passed the digest step, or a package whose
+    # payload lives in a nested archive. Deploying that would report success while
+    # installing nothing, and the kernel check would then happily agree. Non-DLL
+    # build leftovers (lua_static.lib, *.exp, ...) do not satisfy this check -
+    # Invoke-DeployOst deliberately skips them, so a package made only of those
+    # has nothing this tool can install.
+    #
+    # The real verification happens where it can be trusted: SHA-256 against the
+    # release metadata (Assert-OstDownloadSha256), a safe-path scan of the archive
+    # (Assert-SafeZipArchive), and a per-file hash check after each copy
+    # (Invoke-DeployOst). The zip being intact and carrying at least one DLL is
+    # the whole contract.
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Container)) {
+        throw "OST source directory not found: $SourcePath"
     }
-    if ($missing.Count -gt 0) {
-        throw ("OST package is incomplete. Missing: {0}" -f ($missing -join ", "))
+    $anyDll = Get-ChildItem -LiteralPath $SourcePath -Recurse -File -Filter "*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $anyDll) {
+        throw "OST package contains no DLL after extraction: $SourcePath"
     }
 }
 
@@ -2611,7 +2805,7 @@ function Invoke-Check {
     } catch {
         $reportUpdateNeeded = $false
     }
-    if ($kernelState.Status -eq "Ready" -and $reportUpdateNeeded) {
+    if ($kernelState.Status -in @("Ready", "Partial") -and $reportUpdateNeeded) {
         $kernelState.Status = "UpdateAvailable"
     }
     if ([string]::IsNullOrWhiteSpace($kernelState.Version) -and $remote.Available -and
@@ -2636,7 +2830,12 @@ function Invoke-Check {
     } else {
         Format-VersionWithDate -Version $remote.Version -DateValue $remote.PublishedDate
     }
-    $localOstLevel = if ($kernelState.Status -in @("Ready", "ReadyByDate")) {
+    # Partial means a working kernel whose files do not match the configured list
+    # exactly - the payload is installed and loadable, upstream just ships a
+    # different file set than this build expects. That is a healthy install and is
+    # reported as SUCCESS; calling it a warning would flag every machine as broken
+    # the moment upstream changes packaging. IsComplete carries the detail.
+    $localOstLevel = if ($kernelState.Status -in @("Ready", "ReadyByDate", "Partial")) {
         "SUCCESS"
     } elseif ($kernelState.Status -eq "UpdateAvailable") {
         "WARN"
@@ -2671,7 +2870,7 @@ function Invoke-DeployOst {
     $deploySucceeded = $false
     $package = Get-OstSourceDirectory -Config $Config -RunContext $RunContext
     $sourcePath = $package.SourcePath
-    $files = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
+    $files = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "version.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
     $targetPathValue = [string](Get-ConfigValue -Object $ostConfig -Name "targetPath" -DefaultValue "")
     $targetPath = if ([string]::IsNullOrWhiteSpace($targetPathValue)) {
         $steamPath
@@ -2683,12 +2882,64 @@ function Invoke-DeployOst {
     Ensure-Directory -PathValue $RunContext.BackupDir
     Ensure-Directory -PathValue $RunContext.TransactionDir
 
+    # Stage the DLLs the package carries, and only those.
+    #
+    # ost.files is no longer a gate. It used to drive this loop as a required list,
+    # so a verified release missing one entry was rejected outright - the client
+    # deciding what upstream may ship. That broke on 1.5.3.6, whose zip matched
+    # GitHub's digest but replaced dwmapi.dll with version.dll.
+    #
+    # The release zips are not clean build outputs, though: 1.5.3.6 shipped
+    # lua_static.lib, version.lib, version.exp, xinput1_4.lib and xinput1_4.exp
+    # alongside the DLLs - roughly 1.2 MB of static libraries and export tables,
+    # which are link-time artifacts with no role at run time. Copying them into
+    # the Steam directory litters the install with files Steam never loads and
+    # that uninstall then has to reason about. OST loads DLLs; anything else in
+    # the archive is a build leftover, so the deployment keeps *.dll and skips
+    # the rest with a log line rather than failing.
+    #
+    # The config list keeps two real jobs elsewhere and is deliberately not
+    # removed: Get-OstKernelState uses it to decide whether a kernel is installed,
+    # and Invoke-UninstallOst uses it to identify which files to remove. Here it
+    # only sets staging order, so the payload DLL is staged before the shims that
+    # depend on it.
+    #
+    # A package with no DLL at all is an error: it would otherwise report a
+    # successful install of nothing, and upstream switching to a non-DLL payload
+    # needs a human to notice rather than this code to guess.
+    $allSourceFiles = @(Get-ChildItem -LiteralPath $sourcePath -Recurse -File -ErrorAction SilentlyContinue)
+    $sourceFiles = @($allSourceFiles | Where-Object { $_.Extension -eq ".dll" })
+    $skippedFiles = @($allSourceFiles | Where-Object { $_.Extension -ne ".dll" })
+    foreach ($skipped in $skippedFiles) {
+        Write-Log -Message ("Skipped non-DLL package file: {0}" -f $skipped.Name) -Scope "ost" -LogFile $RunContext.LogFile
+    }
+
     $stagedFiles = @()
+    $stagedNames = @{}
+
+    $orderedFiles = @()
     foreach ($fileName in $files) {
-        $sourceFile = Get-ChildItem -LiteralPath $sourcePath -Recurse -File -Filter $fileName -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -eq $sourceFile) {
-            throw "Required OST file not found in source: $fileName"
+        $match = $sourceFiles | Where-Object { $_.Name -eq $fileName } | Select-Object -First 1
+        if ($null -ne $match) {
+            $orderedFiles += $match
+            $stagedNames[$match.Name] = $true
         }
+    }
+    foreach ($file in $sourceFiles) {
+        if (-not $stagedNames.ContainsKey($file.Name)) {
+            $orderedFiles += $file
+            $stagedNames[$file.Name] = $true
+        }
+    }
+
+    if ($orderedFiles.Count -eq 0) {
+        $skippedNames = @($skippedFiles | Select-Object -ExpandProperty Name)
+        $detail = if ($skippedNames.Count -gt 0) { " (non-DLL files present: {0})" -f ($skippedNames -join ", ") } else { "" }
+        throw ("OST package contains no DLL to deploy: {0}{1}" -f $sourcePath, $detail)
+    }
+
+    foreach ($sourceFile in $orderedFiles) {
+        $fileName = $sourceFile.Name
         $stagedFile = Join-Path $RunContext.TransactionDir $fileName
         Copy-Item -LiteralPath $sourceFile.FullName -Destination $stagedFile -Force
         if ((Get-FileSha256 -PathValue $sourceFile.FullName) -ne (Get-FileSha256 -PathValue $stagedFile)) {
@@ -2762,9 +3013,32 @@ function Invoke-DeployOst {
             sha256     = Get-FileSha256 -PathValue $tomlPath
         }
 
-        $kernelState = Get-OstKernelState -Config $Config -SteamPath $steamPath
-        if (-not $kernelState.IsReady) {
-            throw ("OST validation failed. Missing: {0}" -f ($kernelState.Missing -join ", "))
+        # Verify what this run actually deployed, not a fixed name list.
+        #
+        # The old check re-ran Get-OstKernelState and threw when ost.files was not
+        # fully present. That made a successfully deployed release fail validation
+        # whenever upstream shipped a different file set - which is exactly the
+        # case that started this: a release whose zip matched GitHub's digest but
+        # did not contain dwmapi.dll was installed, then immediately declared
+        # invalid, rolled back, and retried on the next launch forever.
+        #
+        # The contract worth enforcing here is that every file this run staged has
+        # landed at its target with the right bytes. That is checkable and true
+        # regardless of what the package chose to contain. Whether the result is
+        # usable as a kernel is a separate question, answered by Get-OstKernelState
+        # for status display - it must not be able to veto an install that
+        # completed exactly as specified.
+        $missingAfterDeploy = @(
+            foreach ($item in $stagedFiles) {
+                if (-not (Test-Path -LiteralPath $item.TargetPath -PathType Leaf)) {
+                    $item.Name
+                } elseif ((Get-FileSha256 -PathValue $item.TargetPath) -ne (Get-FileSha256 -PathValue $item.StagedPath)) {
+                    $item.Name
+                }
+            }
+        )
+        if ($missingAfterDeploy.Count -gt 0) {
+            throw ("OST validation failed. Not deployed correctly: {0}" -f ($missingAfterDeploy -join ", "))
         }
         # Every file verified and the kernel validates: the finally block may now
         # report success before it deletes the transaction dir.
@@ -2887,7 +3161,7 @@ function Invoke-UninstallOst {
     }
 
     $legacyFileRecords = @()
-    $configuredFiles = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
+    $configuredFiles = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "version.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
     foreach ($fileName in $configuredFiles) {
         $targetFile = Join-Path $steamPath $fileName
         if (-not (Test-Path -LiteralPath $targetFile -PathType Leaf)) { continue }
@@ -3015,6 +3289,26 @@ function Invoke-QuickStart {
             $updateNeeded = $false
         }
 
+        # A release whose package was already proven bad is not downloaded again.
+        # Without this the run re-fetched the same broken zip on every launch: the
+        # deploy failed at the content check, the tag was never latched (by design,
+        # so a transient failure stays retryable), and the next launch saw the same
+        # "newer release" and repeated the whole download. The failure record is
+        # what breaks that cycle, and it carries the reason so this can explain
+        # itself instead of silently doing nothing.
+        if ($updateNeeded) {
+            $failedRecord = Get-OstFailedTag -Tag ([string]$remoteCheck.Version)
+            if ($null -ne $failedRecord) {
+                Write-UiLine
+                Write-UiLog -Scope "ost" -Level WARN -Message (ConvertFrom-Utf8Base64 "T1NUIOaWsOeJiOacrOWMheaciee8uumZt++8jOW3sui3s+i/h+iHquWKqOabtOaUoe+8mg==")
+                if (-not [string]::IsNullOrWhiteSpace($failedRecord.reason)) {
+                    Write-UiLog -Scope "ost" -Level WARN -Message ((ConvertFrom-Utf8Base64 "5Y6f5Zug77ya") + " " + $failedRecord.reason)
+                }
+                Write-UiLog -Scope "ost" -Level INFO -Message (ConvertFrom-Utf8Base64 "5aaC6ZyA5by65Yi26YeN6K+V77yM6K+35oyJIDEg5omL5Yqo6YeN5paw6YOo572y44CC")
+                $updateNeeded = $false
+            }
+        }
+
         if ($updateNeeded) {
             $localDisplay = Format-VersionWithDate -Version $kernelState.Version -DateValue $kernelState.FileDate
             $remoteDisplay = Format-VersionWithDate -Version $remoteCheck.Version -DateValue $remoteCheck.PublishedDate
@@ -3035,6 +3329,20 @@ function Invoke-QuickStart {
                 # Keep running on the version already installed.
                 Write-UiLog -Scope "ost" -Level WARN -Message (ConvertFrom-Utf8Base64 "T1NUIOabtOaWsOWksei0pe+8jOe7p+e7reS9v+eUqOacrOWcsOeJiOacrOOAgg==")
                 Write-UiLog -Scope "ost" -Level WARN -Message $_.Exception.Message
+
+                # A deterministic failure (an incomplete package, a broken archive,
+                # a hash that does not match) reproduces identically forever, so
+                # latching it as failed is what stops the next launch from spending
+                # another full download to reach the same exception. Transient
+                # failures - a mirror down, TLS broken, the box offline - stay
+                # unlatch and therefore retryable.
+                $failureKind = Get-OstFailureKind -Message $_.Exception.Message
+                if (-not (Test-OstFailureRetryable -Kind $failureKind)) {
+                    Add-OstFailedTag `
+                        -Tag ([string]$remoteCheck.Version) `
+                        -Reason $_.Exception.Message `
+                        -Kind $failureKind
+                }
             }
         }
     }
@@ -3065,7 +3373,15 @@ function Invoke-QuickStart {
                 Invoke-DeployOst -Config $Config -RunContext $runContext
                 # A manual redeploy of the current latest also satisfies the offer.
                 $manualRemote = Get-LatestOstReleaseInfo -Config $Config -AllowFailure
-                if ($manualRemote.Available) { Add-OstHandledTag -Tag ([string]$manualRemote.Version) }
+                if ($null -eq $manualRemote) { $manualRemote = [pscustomobject]@{ Available = $false; Version = "" } }
+                if ($manualRemote.Available) {
+                    # A successful manual deploy clears any recorded defect for that
+                    # tag: the user may have dropped the missing file in by hand, or
+                    # upstream may have re-cut the release. Both are the escape hatch
+                    # this record exists to preserve.
+                    Clear-OstFailedTag -Tag ([string]$manualRemote.Version)
+                    Add-OstHandledTag -Tag ([string]$manualRemote.Version)
+                }
             } catch {
                 Write-UiLog -Scope "steamx" -Level ERROR -Message $_.Exception.Message
             }
