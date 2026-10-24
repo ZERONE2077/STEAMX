@@ -177,18 +177,20 @@ enabled = false
 #  1. 填了 url_template 会【替换】内置源，不是叠加 —— 这是缺点，所以
 #     下面特意选了持续在更新的仓库，而不是依赖已经不存在的"兜底"。
 #  2. {channel} 展开成【分支名】（pattern / ipc），不是发行渠道。
-#     所以写成 @main 这种钉住分支的写法会静默 404 —— 这是最容易踩的坑。
-#     注：各仓库分支命名不同，hazre 是 @main，mmxlyo/OpenSteam001 是 @pattern。
-#  3. 域名必须是 cdn.jsdelivr.net。fast.jsdelivr.net 已失效（连接被重置），
-#     它只残留在过时的上游注释里，被多个分支继承了下来。
+#     这是 raw.githubusercontent.com 的路径，不要写成 @main / @pattern。
+#     注：各仓库分支命名不同，mmxlyo 有 pattern / ipc，hazre 只有 main。
+#  3. 这里走 gh-proxy.com 代理 raw.githubusercontent.com，国内可直连。
+#     不要写 @pattern / @main：{channel} 本身就会展开成 pattern 或 ipc。
+#     2026-10-24 实测 mmxlyo 的 pattern/steamclient 与 ipc/steamclient
+#     经该代理均返回 200，内容与 raw.githubusercontent.com 一致。
 #
-# 关于换宿主（若 mmxlyo 将来停更，改这里的所有者即可）：
+# 关于换宿主（若 mmxlyo 将来停更）：
 #   mmxlyo/steam-monitor   ← 当前选用
-#   hazre/steam-monitor    ← 分支名是 @main（不是 @pattern），需同时改
+#   hazre/steam-monitor    ← 只有 main 分支；换它时把 {channel} 字面改成 main
 #   两者发布同一份签名（BBuildAndAsyncSendFrame 都是 rva = "0xD44D10"），
 #   实测 rva 值逐条相同。
-#   ⚠️ 换 hazre 时必须把 @pattern 改成 @main，否则静默 404。
+#   ⚠️ 换 hazre 时不能保留 {channel}，它会展开成 pattern / ipc 而 404。
 #   ⚠️ 另注意：hazre 的 coverage 几乎全是 beta（17 个 beta / 1 个 stable），
 #      若你在【稳定版】渠道，两家都可能没有你的构建 —— 这是上游覆盖问题，
 #      换源解决不了。
-url_template = "https://cdn.jsdelivr.net/gh/mmxlyo/steam-monitor@{channel}/{component}/{sha256}.toml"
+url_template = "https://gh-proxy.com/https://raw.githubusercontent.com/mmxlyo/steam-monitor/{channel}/{component}/{sha256}.toml"
