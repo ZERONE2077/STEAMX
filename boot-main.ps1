@@ -1,8 +1,8 @@
 # ---------------------------------------------------------------------------
 # STEAMX  main.ps1 bootstrap
 #
-# Job: on every launch, resolve the newest commit of the repo, fetch main.ps1
-#      from that exact commit and run it.
+# Job: on every launch, fetch the current main.ps1 through a domestic mirror
+#      and run it.
 #
 # Why this is a separate file instead of an inline -Command in the shortcut:
 #   * Microsoft Defender flags shortcuts whose command line downloads and runs
