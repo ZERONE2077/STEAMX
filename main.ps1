@@ -3453,35 +3453,34 @@ function Invoke-UninstallOst {
     $steamPath = Get-SteamPath -Config $Config
     $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
 
-    # Uninstall by NAME match: remove the OST files by their known names from
-    # the Steam dir. We no longer require a validated cache package (that forced
-    # a strict SHA match and failed outright when the cache was absent, e.g. a
-    # re-imaged cybercafe box or after switching machines). Any file whose name
-    # is on the list and exists in the Steam dir is backed up then removed; a
-    # stale cache, if present, is used only as an optional extra hint.
-    $configuredFiles = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "version.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
-    # Only OST core names; deliberately excludes steam.cfg / cons / cdk.exe / f1.exe
-    # which belong to other tools or are config we must not delete here.
-    $coreNames = @()
-    foreach ($n in $configuredFiles) { if (-not [string]::IsNullOrWhiteSpace($n)) { $coreNames += $n } }
-    foreach ($n in @("SDL3_voder.dll","xinput1_4.dll","dwmapi.dll","version.dll","versions.dll","hid.dll","core.dll","user32.dll","diversion.dll","winmm.dll","zlib1.dll","7z.dll","OpenSteamTool.dll","steamclient_loader.dll","xinput9_1_0.dll","dinput8.dll","msimg32.dll","dbghelp.dll")) {
-        if ($coreNames -notcontains $n) { $coreNames += $n }
+    # Uninstall = restore vanilla Steam: remove every non-official (injected) file
+    # this tool or other tools leave behind. The known residue list is the single
+    # source of truth; ost.files is merged in for completeness. Files and dirs are
+    # both handled (a dir entry is removed recursively).
+    $removeTargets = New-Object System.Collections.Generic.List[string]
+    foreach ($n in @(Get-OstStaleResiduePaths)) {
+        if (-not [string]::IsNullOrWhiteSpace($n)) { $removeTargets.Add($n) }
     }
-    $coreNames = @($coreNames | Select-Object -Unique)
+    foreach ($n in @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @())) {
+        if (-not [string]::IsNullOrWhiteSpace($n) -and -not $removeTargets.Contains($n)) { $removeTargets.Add($n) }
+    }
 
+    # Never touch Steam's own core files even if a name somehow collides.
+    $protected = @("steam.exe","steamclient.dll","steamclient64.dll","steamui.dll","steamwebhelper.exe","gameoverlayrenderer.dll","gameoverlayrenderer64.dll","steamservice.exe","steamerrorreporter.exe","bin","config","steamapps","userdata","logs","package","appcache","depotcache","music","steamapps")
     $legacyFileRecords = @()
-    foreach ($fileName in $coreNames) {
-        $targetFile = Join-Path $steamPath $fileName
-        if (-not (Test-Path -LiteralPath $targetFile -PathType Leaf)) { continue }
+    foreach ($rel in $removeTargets) {
+        if ($protected -contains $rel) { continue }
+        $fullPath = Join-Path $steamPath $rel
+        if (-not (Test-Path -LiteralPath $fullPath)) { continue }
         $legacyFileRecords += [pscustomobject]@{
-            relativePath = $fileName
-            targetPath   = $targetFile
+            relativePath = $rel
+            targetPath   = $fullPath
             sha256       = ""
             existed      = $false
         }
     }
     if ($legacyFileRecords.Count -eq 0) {
-        throw "No OST files were found in the Steam directory to uninstall."
+        throw "No non-official files were found in the Steam directory to uninstall."
     }
     $uninstallPlan = [pscustomobject]@{
         files = @($legacyFileRecords)
@@ -3502,13 +3501,20 @@ function Invoke-UninstallOst {
     $warnings = @()
 
     foreach ($fileRecord in @($uninstallPlan.files)) {
-        $targetFile = [string]$fileRecord.targetPath
-        if (-not (Test-Path -LiteralPath $targetFile -PathType Leaf)) { continue }
-        # Name matched: back up the existing file then remove it. No SHA gate, so
-        # an externally updated DLL is still removed (its bytes are in the backup).
-        [void](Backup-ExistingFile -SourceFile $targetFile -BackupDir $RunContext.BackupDir)
-        Remove-Item -LiteralPath $targetFile -Force
-        Write-Log -Message ("Removed: {0}" -f $targetFile) -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
+        $target = [string]$fileRecord.targetPath
+        if (-not (Test-Path -LiteralPath $target)) { continue }
+        $item = Get-Item -LiteralPath $target -Force
+        if ($item.PSIsContainer) {
+            # A non-official directory (e.g. Core, diversion): back up then remove.
+            $bakDir = Join-Path $RunContext.BackupDir ([string]$fileRecord.relativePath)
+            try { Copy-Item -LiteralPath $target -Destination $bakDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+            Remove-Item -LiteralPath $target -Recurse -Force
+            Write-Log -Message ("Removed dir: {0}" -f $target) -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
+        } else {
+            [void](Backup-ExistingFile -SourceFile $target -BackupDir $RunContext.BackupDir)
+            Remove-Item -LiteralPath $target -Force
+            Write-Log -Message ("Removed: {0}" -f $target) -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
+        }
     }
 
     if ($RemoveLua) {
