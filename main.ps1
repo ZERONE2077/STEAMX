@@ -2971,8 +2971,29 @@ function Remove-OstStaleResidue {
     if (-not $rootItem.PSIsContainer) {
         throw ("Steam path is not a directory: {0}" -f $rootPath)
     }
+    # A cybercafe/game-arcade commonly exposes the Steam dir as a junction
+    # (e.g. C:\STEAM -> D:\Games\Steam). Refusing outright breaks those installs.
+    # Resolve the root junction to its real target and clean there instead. Only
+    # the ROOT is dereferenced; every path segment below is still checked for
+    # reparse points as before, so a nested link still aborts cleanup.
     if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw ("Refusing residue cleanup through a reparse point: {0}" -f $rootPath)
+        $realTarget = $null
+        try { $realTarget = $rootItem.Target } catch { }
+        # Target can be a string or string[] depending on the link type
+        if ($realTarget -is [array]) { $realTarget = $realTarget[0] }
+        if ([string]::IsNullOrWhiteSpace($realTarget)) {
+            throw ("Steam path is a reparse point with no resolvable target: {0}" -f $rootPath)
+        }
+        $resolvedPath = [System.IO.Path]::GetFullPath($realTarget)
+        $resolvedItem = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
+        if (-not $resolvedItem.PSIsContainer) {
+            throw ("Steam reparse target is not a directory: {0} (from {1})" -f $resolvedPath, $rootPath)
+        }
+        if (($resolvedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw ("Steam reparse target is itself a reparse point: {0}" -f $resolvedPath)
+        }
+        Write-Log -Message ("Steam path is a reparse point; cleaning through real target: {0} -> {1}" -f $rootPath, $resolvedPath) -Scope "residue" -LogFile $LogFile
+        $rootPath = $resolvedPath
     }
 
     $rootPrefix = $rootPath.TrimEnd("\") + "\"
