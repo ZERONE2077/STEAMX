@@ -1,7 +1,8 @@
-# Keep this entry script ASCII-only, UTF-8 without BOM, LF endings.
-# Run.Local.lnk starts it with `powershell.exe -File`, and PowerShell 5.1 decodes a
-# BOM-less .ps1 with the system ANSI code page (936 here), so any non-ASCII byte in
-# code or comments can break parsing. Chinese UI text must go through ConvertFrom-Utf8Base64.
+﻿# This entry script is UTF-8 with BOM, LF endings. BOM makes PowerShell 5.1 decode
+# it as UTF-8 regardless of the system ANSI code page, so Chinese text is written
+# directly in the source. Console input/output are pinned to UTF-8 below.
+# It is distributed by boot-main.ps1 which downloads it to a local file and runs it
+# with -File (BOM survives a byte-for-byte download), never via irm|iex on the body.
 [CmdletBinding()]
 param(
     [ValidateSet("Start", "Check", "EnableUnlockMode", "AddGame", "DeployOst", "SetManifestSource", "UninstallOst", "UninstallOstAndLua")]
@@ -40,7 +41,7 @@ function Enable-ModernTls {
     # whether the machine can actually negotiate TLS 1.3 (older Windows 10, older
     # .NET, or a group policy that disables it). On those machines the handshake was
     # attempted at a version Schannel refuses and the whole connection died with
-    # "基础连接已关闭" / "The underlying connection was closed" - which is why the
+    # "鍩虹杩炴帴宸插叧闂? / "The underlying connection was closed" - which is why the
     # failure only appeared on some users' PCs and never on a machine new enough to
     # support TLS 1.3. Nothing here needs 1.3, so ask for 1.2 and stay uniform.
     try {
@@ -65,7 +66,7 @@ function Wait-BeforeExit {
 
     try {
         Write-UiLine
-        [void](Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5Ye66ZSZ77yM5oyJ5Zue6L2m6ZSu5YWz6Zet56qX5Y+j"))
+        [void](Read-UiInput -Prompt "出错，按回车键关闭窗口")
     } catch {
         Start-Sleep -Seconds 5
     }
@@ -102,6 +103,48 @@ function Read-UiInput {
     return Read-Host $Prompt
 }
 
+function Read-UiInputBox {
+    # Plain prompt, no box drawing. Read-Host cannot render a reliably closed
+    # box: it blocks and returns a newline, so any border drawn around the input
+    # line drifts or vanishes once the user types (especially with wide/CJK
+    # characters). A bare "> " prefix is stable on every terminal.
+    #
+    # The prompt is written manually instead of using Read-Host -Prompt because
+    # -Prompt appends ": " (turning ">" into ">: "), which looks wrong here.
+    param([string]$Label = ">")
+
+    Write-Host ($Label + " ") -NoNewline
+    return (Read-Host)
+}
+
+function Get-UiDisplayWidth {
+    # Terminal display width: CJK/fullwidth chars occupy 2 columns, everything
+    # else 1. Used only to align menu shortcut keys under mixed CN/EN text.
+    param([string]$Text)
+
+    $w = 0
+    foreach ($ch in $Text.ToCharArray()) {
+        $c = [int]$ch
+        if (($c -ge 0x1100 -and $c -le 0x115F) -or
+            ($c -ge 0x2E80 -and $c -le 0xA4CF) -or
+            ($c -ge 0xAC00 -and $c -le 0xD7A3) -or
+            ($c -ge 0xF900 -and $c -le 0xFAFF) -or
+            ($c -ge 0xFE30 -and $c -le 0xFE4F) -or
+            ($c -ge 0xFF00 -and $c -le 0xFF60) -or
+            ($c -ge 0xFFE0 -and $c -le 0xFFE6)) { $w += 2 } else { $w += 1 }
+    }
+    return $w
+}
+
+function Format-UiMenuRow {
+    # Left text padded to KeyColumn (by display width), then the shortcut key.
+    param([string]$Text, [string]$Key, [int]$KeyColumn = 28)
+
+    $pad = $KeyColumn - (Get-UiDisplayWidth -Text $Text)
+    if ($pad -lt 1) { $pad = 1 }
+    return ($Text + (" " * $pad) + $Key)
+}
+
 function Test-LauncherSession {
     # True when the script was started as a file (shortcut / double click), where the
     # console window disappears the moment the script ends.
@@ -126,7 +169,7 @@ function Wait-LauncherExit {
     }
     try {
         Write-UiLine
-        [void](Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "5oyJ5Zue6L2m6ZSu5YWz6Zet56qX5Y+j"))
+        [void](Read-UiInput -Prompt "按回车键关闭窗口")
     } catch {
         Start-Sleep -Seconds 5
     }
@@ -468,7 +511,7 @@ function New-RunContext {
     # LogFile/BackupDir/TransactionDir long before they reach their own
     # Ensure-Directory calls (uninstall logs at 2511 before ensuring at 2516, and
     # Stop-SteamProcesses logs via LogFile), so a missing directory surfaced as a raw
-    # DirectoryNotFoundException ("未能找到路径...的一部分") instead of the intended
+    # DirectoryNotFoundException ("鏈兘鎵惧埌璺緞...鐨勪竴閮ㄥ垎") instead of the intended
     # message. Add-Content does not create parent directories, so ensure up front.
     Ensure-Directory -PathValue $transactionDir
 
@@ -1545,6 +1588,26 @@ function Get-OstUpdateStatePath {
     $localAppData = [Environment]::GetFolderPath("LocalApplicationData")
     if ([string]::IsNullOrWhiteSpace($localAppData)) { $localAppData = [System.IO.Path]::GetTempPath() }
     return (Join-Path $localAppData "STEAMX\ost-update-state.json")
+}
+
+function Get-OstStartupCleanupMarkerPath {
+    $localAppData = [Environment]::GetFolderPath("LocalApplicationData")
+    if ([string]::IsNullOrWhiteSpace($localAppData)) { $localAppData = [System.IO.Path]::GetTempPath() }
+    return (Join-Path $localAppData "STEAMX\ost-startup-cleanup-v1.done")
+}
+
+function Test-OstStartupCleanupCompleted {
+    return (Test-Path -LiteralPath (Get-OstStartupCleanupMarkerPath) -PathType Leaf)
+}
+
+function Set-OstStartupCleanupCompleted {
+    $path = Get-OstStartupCleanupMarkerPath
+    try {
+        Ensure-Directory -PathValue (Split-Path -Parent $path)
+        Set-Content -LiteralPath $path -Value (Get-Date).ToUniversalTime().ToString("o") -Encoding ASCII -NoNewline
+    } catch {
+        # A successful deployment must still succeed if the marker cannot be written.
+    }
 }
 
 function Get-OstUpdateState {
@@ -2855,6 +2918,139 @@ function Invoke-Check {
     }
 }
 
+function Get-OstStaleResiduePaths {
+    # These are intentional pre-deploy deletions, not rollback-managed files.
+    return @(
+        "SDL3_voder.dll",
+        "xinput1_4.dll",
+        "dwmapi.dll",
+        "version.dll",
+        "versions.dll",
+        "hid.dll",
+        "core.dll",
+        "user32.dll",
+        "diversion.dll",
+        "winmm.dll",
+        "zlib1.dll",
+        "7z.dll",
+        "OpenSteamTool.dll",
+        "steamclient_loader.dll",
+        "GameOverlayRenderer64.bak",
+        "xinput9_1_0.dll",
+        "dinput8.dll",
+        "msimg32.dll",
+        "dbghelp.dll",
+        "Core",
+        "CoreBeta",
+        "diversion",
+        "bin\diversion.dll",
+        "bin\diversion",
+        "steam.cfg",
+        "cons",
+        "cdk.exe",
+        "f1.exe",
+        "steam_emu.ini",
+        "emu.cfg",
+        "local.vdf.bak",
+        "package\beta"
+    )
+}
+
+function Remove-OstStaleResidue {
+    param(
+        [Parameter(Mandatory = $true)][string]$SteamPath,
+        [AllowEmptyString()][string]$LogFile = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SteamPath)) {
+        throw "Steam path is required for residue cleanup."
+    }
+
+    $rootPath = [System.IO.Path]::GetFullPath($SteamPath)
+    $rootItem = Get-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer) {
+        throw ("Steam path is not a directory: {0}" -f $rootPath)
+    }
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw ("Refusing residue cleanup through a reparse point: {0}" -f $rootPath)
+    }
+
+    $rootPrefix = $rootPath.TrimEnd("\") + "\"
+    $rootParts = @($rootPath.Substring([System.IO.Path]::GetPathRoot($rootPath).Length).Split("\", [System.StringSplitOptions]::RemoveEmptyEntries))
+    $removedPaths = New-Object System.Collections.Generic.List[string]
+
+    foreach ($relativePath in @(Get-OstStaleResiduePaths)) {
+        if ([string]::IsNullOrWhiteSpace($relativePath)) {
+            throw "Empty residue path is not allowed."
+        }
+        if ($relativePath -notmatch '^[A-Za-z0-9._ -]+(\\[A-Za-z0-9._ -]+)*$') {
+            throw ("Unsafe residue path: {0}" -f $relativePath)
+        }
+        if ([System.IO.Path]::IsPathRooted($relativePath)) {
+            throw ("Rooted residue path is not allowed: {0}" -f $relativePath)
+        }
+
+        $relativeParts = @($relativePath.Split("\", [System.StringSplitOptions]::RemoveEmptyEntries))
+        foreach ($segment in $relativeParts) {
+            if ($segment -eq "." -or $segment -eq ".." -or $segment.EndsWith(".") -or $segment.EndsWith(" ")) {
+                throw ("Unsafe residue path segment: {0}" -f $relativePath)
+            }
+        }
+
+        $targetPath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($rootPath, $relativePath))
+        if (-not $targetPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw ("Residue path escapes the Steam directory: {0}" -f $relativePath)
+        }
+        if ($targetPath.TrimEnd("\").Equals($rootPath.TrimEnd("\"), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw ("Residue path resolves to the Steam directory: {0}" -f $relativePath)
+        }
+
+        $currentPath = [System.IO.Path]::GetPathRoot($rootPath)
+        foreach ($segment in @($rootParts) + @($relativeParts)) {
+            if ([string]::IsNullOrWhiteSpace($segment)) { continue }
+            $currentPath = Join-Path $currentPath $segment
+            if (-not (Test-Path -LiteralPath $currentPath)) { continue }
+            $currentItem = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
+            if (($currentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw ("Refusing residue cleanup through a reparse point: {0}" -f $currentPath)
+            }
+        }
+
+        if (-not (Test-Path -LiteralPath $targetPath)) { continue }
+        $targetItem = Get-Item -LiteralPath $targetPath -Force -ErrorAction Stop
+
+        if ($targetItem.PSIsContainer) {
+            $stack = New-Object System.Collections.Generic.Stack[string]
+            $stack.Push($targetPath)
+            while ($stack.Count -gt 0) {
+                $directoryPath = $stack.Pop()
+                foreach ($childPath in @([System.IO.Directory]::GetFileSystemEntries($directoryPath))) {
+                    $childAttributes = [System.IO.File]::GetAttributes($childPath)
+                    if (($childAttributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                        throw ("Refusing recursive residue cleanup through a reparse point: {0}" -f $childPath)
+                    }
+                    if (($childAttributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+                        $stack.Push($childPath)
+                    }
+                }
+            }
+            Remove-Item -LiteralPath $targetPath -Recurse -Force -ErrorAction Stop
+        } else {
+            Remove-Item -LiteralPath $targetPath -Force -ErrorAction Stop
+        }
+
+        if (Test-Path -LiteralPath $targetPath) {
+            throw ("Residue cleanup did not remove: {0}" -f $targetPath)
+        }
+        $removedPaths.Add($relativePath)
+        Write-Log -Message ("Removed stale residue: {0}" -f $targetPath) -Scope "residue" -LogFile $LogFile
+    }
+
+    if ($removedPaths.Count -gt 0) {
+        Write-Log -Message ("Removed {0} stale residue target(s)." -f $removedPaths.Count) -Scope "residue" -LogFile $LogFile
+    }
+}
+
 function Invoke-DeployOst {
     param(
         [pscustomobject]$Config,
@@ -2966,6 +3162,8 @@ function Invoke-DeployOst {
     $steamCfgRenamedThisRun = $false
     $configRecord = $null
     try {
+        Remove-OstStaleResidue -SteamPath $steamPath -LogFile $RunContext.LogFile | Out-Null
+
         $steamCfg = Join-Path $steamPath "steam.cfg"
         $steamCfgBak = Join-Path $steamPath "steam.cfg.bak"
         if ((Test-Path -LiteralPath $steamCfg) -and (Test-Path -LiteralPath $steamCfgBak)) {
@@ -3043,6 +3241,7 @@ function Invoke-DeployOst {
         # Every file verified and the kernel validates: the finally block may now
         # report success before it deletes the transaction dir.
         $deploySucceeded = $true
+        Set-OstStartupCleanupCompleted
 
     } catch {
         Write-Log -Message ("Deployment failed; rolling back: {0}" -f $_.Exception.Message) -Level "ERROR" -Scope "ost" -LogFile $RunContext.LogFile
@@ -3072,9 +3271,9 @@ function Invoke-DeployOst {
         # "OST update failed" on an update that had already completed.
         if ($deploySucceeded) {
             $finalMessage = if ($restartSteamAfterDeploy) {
-                ConvertFrom-Utf8Base64 "T1NUIOmDqOe9suaIkOWKn++8jFN0ZWFtIOato+WcqOiHquWKqOWQr+WKqOOAgg=="
+                "OST 部署成功，Steam 正在自动启动。"
             } else {
-                ConvertFrom-Utf8Base64 "T1NUIOmDqOe9suaIkOWKn+OAgg=="
+                "OST 部署成功。"
             }
             Write-Log -Message $finalMessage -Level "SUCCESS" -Scope "ost" -LogFile $RunContext.LogFile
         }
@@ -3272,10 +3471,21 @@ function Invoke-QuickStart {
     $kernelState = Get-OstKernelState -Config $Config -SteamPath $steamPath
     if (-not $kernelState.IsReady) {
         Write-UiLine
-        Write-UiLog -Scope "ost" -Message (ConvertFrom-Utf8Base64 "5pyq5qOA5rWL5Yiw6Kej6ZSB5YaF5qC477yM5q2j5Zyo6Ieq5Yqo6YOo572yIE9TVOKApg==") -Level WARN
+        Write-UiLog -Scope "ost" -Message "未检测到解锁内核，正在自动部署 OST…" -Level WARN
         $runContext = New-RunContext -Config $Config
         Invoke-DeployOst -Config $Config -RunContext $runContext
-        Write-UiLog -Scope "ost" -Message (ConvertFrom-Utf8Base64 "T1NUIOmDqOe9suWujOaIkO+8jOaOpeS4i+adpei+k+WFpea4uOaIjyBBcHBJRCDljbPlj6/lhaXlupPjgII=") -Level SUCCESS
+        Write-UiLog -Scope "ost" -Message "OST 部署完成，接下来输入游戏 AppID 即可入库。" -Level SUCCESS
+    } elseif (-not (Test-OstStartupCleanupCompleted)) {
+        Write-UiLine
+        Write-UiLog -Scope "ost" -Level WARN -Message "首次运行，正在清理残留并重新部署 OST…"
+        try {
+            $runContext = New-RunContext -Config $Config
+            Invoke-DeployOst -Config $Config -RunContext $runContext
+            Write-UiLog -Scope "ost" -Level SUCCESS -Message "首次清理与部署完成。"
+        } catch {
+            Write-UiLog -Scope "ost" -Level WARN -Message "首次部署失败，继续使用本地版本。"
+            Write-UiLog -Scope "ost" -Level WARN -Message $_.Exception.Message
+        }
     } elseif (Get-OstAutoUpdateEnabled -Config $Config) {
         # The kernel is present, so an update is optional: check, and when a newer
         # release exists say so on screen (users asked to SEE that an update was
@@ -3300,11 +3510,11 @@ function Invoke-QuickStart {
             $failedRecord = Get-OstFailedTag -Tag ([string]$remoteCheck.Version)
             if ($null -ne $failedRecord) {
                 Write-UiLine
-                Write-UiLog -Scope "ost" -Level WARN -Message (ConvertFrom-Utf8Base64 "T1NUIOaWsOeJiOacrOWMheaciee8uumZt++8jOW3sui3s+i/h+iHquWKqOabtOaUoe+8mg==")
+                Write-UiLog -Scope "ost" -Level WARN -Message "OST 新版本包有缺陷，已跳过自动更攡："
                 if (-not [string]::IsNullOrWhiteSpace($failedRecord.reason)) {
-                    Write-UiLog -Scope "ost" -Level WARN -Message ((ConvertFrom-Utf8Base64 "5Y6f5Zug77ya") + " " + $failedRecord.reason)
+                    Write-UiLog -Scope "ost" -Level WARN -Message ("原因：" + " " + $failedRecord.reason)
                 }
-                Write-UiLog -Scope "ost" -Level INFO -Message (ConvertFrom-Utf8Base64 "5aaC6ZyA5by65Yi26YeN6K+V77yM6K+35oyJIDEg5omL5Yqo6YeN5paw6YOo572y44CC")
+                Write-UiLog -Scope "ost" -Level INFO -Message "如需强制重试，请按 1 手动重新部署。"
                 $updateNeeded = $false
             }
         }
@@ -3313,7 +3523,7 @@ function Invoke-QuickStart {
             $localDisplay = Format-VersionWithDate -Version $kernelState.Version -DateValue $kernelState.FileDate
             $remoteDisplay = Format-VersionWithDate -Version $remoteCheck.Version -DateValue $remoteCheck.PublishedDate
             Write-UiLine
-            Write-UiLog -Scope "ost" -Level WARN -Message (ConvertFrom-Utf8Base64 "5qOA5rWL5YiwIE9TVCDmlrDniYjmnKzvvIzmraPlnKjoh6rliqjmm7TmlrAuLi4=")
+            Write-UiLog -Scope "ost" -Level WARN -Message "检测到 OST 新版本，正在自动更新..."
             Write-UiLine -Text ("  {0} -> {1}" -f $localDisplay, $remoteDisplay) -ForegroundColor DarkGray
             try {
                 $runContext = New-RunContext -Config $Config
@@ -3323,11 +3533,11 @@ function Invoke-QuickStart {
                 Add-OstHandledTag -Tag ([string]$remoteCheck.Version)
                 $refreshed = Get-OstKernelState -Config $Config -SteamPath $steamPath
                 $refreshedDisplay = Format-VersionWithDate -Version $refreshed.Version -DateValue $refreshed.FileDate
-                Write-UiLog -Scope "ost" -Level SUCCESS -Message (ConvertFrom-Utf8Base64 "T1NUIOiHquWKqOabtOaWsOWujOaIkOOAgg==")
+                Write-UiLog -Scope "ost" -Level SUCCESS -Message "OST 自动更新完成。"
                 Write-UiLine -Text ("  {0}" -f $refreshedDisplay) -ForegroundColor DarkGray
             } catch {
                 # Keep running on the version already installed.
-                Write-UiLog -Scope "ost" -Level WARN -Message (ConvertFrom-Utf8Base64 "T1NUIOabtOaWsOWksei0pe+8jOe7p+e7reS9v+eUqOacrOWcsOeJiOacrOOAgg==")
+                Write-UiLog -Scope "ost" -Level WARN -Message "OST 更新失败，继续使用本地版本。"
                 Write-UiLog -Scope "ost" -Level WARN -Message $_.Exception.Message
 
                 # A deterministic failure (an incomplete package, a broken archive,
@@ -3347,28 +3557,43 @@ function Invoke-QuickStart {
         }
     }
 
+    # If stdin is redirected (parent process piped/closed it), Read-Host returns
+    # EOF immediately and the loop would treat that as "user pressed Enter" and
+    # exit silently. Detect it up front and tell the user why, so an abnormal
+    # launch does not look like the tool crashing after the prompt.
+    if ([Console]::IsInputRedirected) {
+        Write-UiLine
+        Write-UiLine -Text "当前窗口无法交互输入（stdin 被重定向）。请双击 STEAMX 快捷方式，或单独打开一个 PowerShell 窗口运行。" -ForegroundColor Yellow
+        return
+    }
+
     while ($true) {
         Write-UiLine
-        $rawInput = [string](Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "6K+36L6T5YWl5ri45oiPIEFwcElEIOaIliBTdGVhbSDllYblupfpk77mjqXvvIgxIOmDqOe9su+8jDAg5Y246L2977yMaCDluK7liqnvvIzlm57ovabpgIDlh7rvvIk="))
+        Write-UiLine -Text "开启/部署/修复游戏入库   1"
+        Write-UiLine -Text "卸载                    0"
+        Write-UiLine -Text "更多帮助                ?"
+        Write-UiLine
+        Write-UiLine -Text "输入游戏 AppID 或商店链接"
+        $rawInput = [string](Read-UiInputBox -Label ">")
         $value = $rawInput.Trim()
         if ([string]::IsNullOrWhiteSpace($value)) { return }
         if ($value -match '^(?i)(q|quit|exit)$') { return }
 
         if ($value -match '^(?i)(h|help|\?)$') {
             Write-UiLine
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "5Y+v55So5ZG95Luk")
+            Write-UiLine -Text "可用命令"
             Write-UiLine
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "PEFwcElEIOaIliBTdGVhbSDpk77mjqU+ICAg5ri45oiP5YWl5bqT")
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "MSAgICDpg6jnvbIgLyDph43mlrDpg6jnvbIgT1NU")
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "MCAgICDljbjovb0gT1NU77yIMSDku4UgT1NUIC8gMiDov57muIXljZXvvIk=")
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "aCAgICDmmL7npLrmnKzluK7liqk=")
-            Write-UiLine -Text (ConvertFrom-Utf8Base64 "cSAvIOWbnui9piAgICDpgIDlh7o=")
+            Write-UiLine -Text "<AppID 或 Steam 链接>   游戏入库"
+            Write-UiLine -Text "1    部署 / 重新部署 OST"
+            Write-UiLine -Text "0    卸载 OST（1 仅 OST / 2 连清单）"
+            Write-UiLine -Text "h    显示本帮助"
+            Write-UiLine -Text "q / 回车    退出"
             continue
         }
 
         if ($value -eq "1") {
             $runContext = New-RunContext -Config $Config
-            Write-UiLog -Scope "ost" -Level INFO -Message (ConvertFrom-Utf8Base64 "5q2j5Zyo6YOo572yIE9TVCDnjq/looPigKY=")
+            Write-UiLog -Scope "ost" -Level INFO -Message "正在部署 OST 环境…"
             try {
                 Invoke-DeployOst -Config $Config -RunContext $runContext
                 # A manual redeploy of the current latest also satisfies the offer.
@@ -3389,21 +3614,24 @@ function Invoke-QuickStart {
         }
 
         if ($value -match '^(?i)(0|u|uninstall)$') {
-            $uninstallChoice = [string](Read-UiInput -Prompt (ConvertFrom-Utf8Base64 "6L6T5YWlIDEg5LuF5Y246L29IE9TVO+8m+i+k+WFpSAyIOWNuOi9vSBPU1Qg5bm25riF55CG5ri45oiP5riF5Y2V77yb5Zue6L2m5Y+W5raI"))
+            Write-UiLine
+            Write-UiLine -Text "卸载选项"
+            Write-UiLine -Text ("  " + "1 仅卸载 OST   2 卸载 OST 并清理游戏清单   回车取消") -ForegroundColor DarkGray
+            $uninstallChoice = [string](Read-UiInputBox -Label ">")
             $runContext = New-RunContext -Config $Config
             if ($uninstallChoice.Trim() -eq "1") {
                 Invoke-UninstallOst -Config $Config -RunContext $runContext
             } elseif ($uninstallChoice.Trim() -eq "2") {
                 Invoke-UninstallOst -Config $Config -RunContext $runContext -RemoveLua
             } else {
-                Write-UiLog -Scope "steamx" -Message (ConvertFrom-Utf8Base64 "5bey5Y+W5raI44CC") -Level WARN
+                Write-UiLog -Scope "steamx" -Message "已取消。" -Level WARN
             }
             continue
         }
 
         # Single digits other than 0/1 are reserved command slots, not AppIDs.
         if ($value -match '^\d$') {
-            Write-UiLog -Scope "steamx" -Level WARN -Message (ConvertFrom-Utf8Base64 "5peg5pWI6L6T5YWl44CC5Y+v6L6T5YWlIEFwcElEIC8gU3RlYW0g6ZO+5o6l77yM5oiWIDHjgIEw44CBaOOAgXE=")
+            Write-UiLog -Scope "steamx" -Level WARN -Message "无效输入。可输入 AppID / Steam 链接，或 1、0、h、q"
             continue
         }
 

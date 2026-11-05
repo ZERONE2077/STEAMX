@@ -1,21 +1,23 @@
 # ---------------------------------------------------------------------------
 # STEAMX  main.ps1 bootstrap
 #
-# Job: on every launch, fetch the current main.ps1 through a domestic mirror
-#      and run it.
+# Job: on every launch, download the current main.ps1 to a temp file and run it
+#      with -File. Download is byte-for-byte (iwr -OutFile), so the file's UTF-8
+#      BOM survives and PowerShell 5.1 decodes the Chinese text correctly. This
+#      is the same shape other Steam tools use (iwr -OutFile + -File) and it is
+#      why main.ps1 can carry Chinese directly instead of base64.
 #
-# Why this is a separate file instead of an inline -Command in the shortcut:
-#   * Microsoft Defender flags shortcuts whose command line downloads and runs
-#     a script (Trojan:Win32/ClickFix.DAC!MTB / Trojan:Win32/Commando.A!ml).
-#     Called through `iex (irm <url>)` the command line stays short and the
-#     fetch logic lives in a file, which Defender leaves alone.
-#   * jsDelivr is unreachable for some users, so the entry points and the
-#     bootstrap's first fetch both use gh-proxy.com. Branch URLs through the
-#     proxy were measured at max-age=60 on 2026-10-24, fresh enough for boot.
+# Why download-to-file instead of `iex (irm <url>)`:
+#   * irm decodes the response body as a String using the HTTP charset. jsDelivr
+#     serves .ps1 as application/octet-stream, which 5.1 decodes as ISO-8859-1,
+#     so any non-ASCII byte comes out mangled. Writing bytes to a file avoids
+#     that decode step entirely.
+#   * A file with a BOM is always read as UTF-8 by 5.1, so Chinese is safe.
+#   * Running the saved file with -File also makes main.ps1's own Wait-BeforeExit
+#     see -File on its command line and hold the window open (as before).
 #
-# ASCII only on purpose: this file is pulled through `iex (irm '<url>')`, and
-# jsDelivr serves .ps1 as application/octet-stream, which Invoke-RestMethod
-# decodes as ISO-8859-1. Any non-ASCII byte would come out mangled.
+# ASCII only on purpose: this file is pulled through `iex (irm '<url>')`, and that
+# path is the one that mangles non-ASCII. Keep it pure ASCII.
 # ---------------------------------------------------------------------------
 
 $repo = 'ZERONE2077/STEAMX'
@@ -36,19 +38,32 @@ $errs = New-Object System.Collections.ArrayList
 # 2) keep a jsDelivr path for networks where GitHub and those mirrors are blocked
 [void]$urls.Add($jsd + 'latest/' + $rel)
 
-$src = $null
+# Download to a temp file, byte-for-byte. Validate by size and by reading its
+# first bytes back as UTF-8 (BOM or the known header comment).
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('STEAMX-main-' + [Guid]::NewGuid().ToString('N') + '.ps1')
+$got = $false
 foreach ($u in $urls) {
     try {
-        $r = Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec 20
-        $t = [Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()).TrimStart([char]0xFEFF)
-        if ($t.Length -gt 50000 -and $t.Contains('# Keep this entry script ASCII-only')) { $src = $t; break }
-        [void]$errs.Add('incomplete body from ' + $u.Substring(0, 40))
+        Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec 20 -OutFile $tmp
+        if (-not (Test-Path -LiteralPath $tmp)) { continue }
+        $bytes = [System.IO.File]::ReadAllBytes($tmp)
+        if ($bytes.Length -lt 50000) {
+            [void]$errs.Add('incomplete body from ' + $u.Substring(0, [Math]::Min(40, $u.Length)))
+            continue
+        }
+        $head = [Text.Encoding]::UTF8.GetString($bytes)
+        if ($head.Contains('# Keep this entry script') -or $head.Contains('main.ps1') -and $head.Contains('STEAMX')) {
+            $got = $true
+            break
+        }
+        [void]$errs.Add('unexpected body from ' + $u.Substring(0, [Math]::Min(40, $u.Length)))
     } catch {
         [void]$errs.Add($_.Exception.Message)
     }
 }
 
-if (-not $src) {
+if (-not $got) {
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     Write-Host ''
     Write-Host ('  STEAMX start failed: ' + ($errs -join ' / ')) -ForegroundColor Red
     Write-Host '  source order: gh-proxy -> hk.gh-proxy -> ghfast -> ghproxy -> raw -> jsDelivr' -ForegroundColor DarkGray
@@ -60,13 +75,11 @@ if (-not $src) {
     exit 7
 }
 
-# run it, forwarding whatever arguments we were given, so a caller can do
+# Run the downloaded file with -File and forward our arguments, so a caller can do
 #   powershell -NoProfile -ExecutionPolicy Bypass -File boot-main.ps1 -Command Check
-# The try/catch exists because main.ps1 only keeps the window open when it was
-# started with -File, and a shortcut launched through `iex (irm ...)` does not
-# have -File on its command line.
 try {
-    & ([scriptblock]::Create($src)) @args
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmp @args
+    $code = $LASTEXITCODE
 } catch {
     Write-Host ''
     Write-Host ('  STEAMX failed: ' + $_.Exception.Message) -ForegroundColor Red
@@ -75,5 +88,9 @@ try {
         Write-Host '  press Enter to close ...' -ForegroundColor DarkGray
         [void][Console]::ReadLine()
     }
-    exit 1
+    $code = 1
+} finally {
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
+
+exit $code
