@@ -2251,13 +2251,13 @@ function Invoke-DownloadFileWithProgress {
                 $percent = 0
                 $status = "{0} downloaded" -f (Format-FileSize $downloaded)
             }
-            Write-Progress -Id 1 -Activity "Downloading OpenSteamTool" -Status $status -PercentComplete $percent
+            Write-UiProgress -Percent ([int]($percent * 0.2)) -Status ("下载核心 " + $status)
         }
     } finally {
         if ($null -ne $fileStream) { $fileStream.Dispose() }
         if ($null -ne $responseStream) { $responseStream.Dispose() }
         if ($null -ne $response) { $response.Dispose() }
-        Write-Progress -Id 1 -Activity "Downloading OpenSteamTool" -Completed
+        Write-UiProgress -Percent 20 -Status "下载核心"
     }
 }
 
@@ -2458,7 +2458,7 @@ function Expand-ZipArchiveWithProgress {
             }
 
             $percent = [int]((($index + 1) * 100) / $total)
-            Write-Progress -Id 2 -Activity "Extracting OpenSteamTool" -Status $relativePath -PercentComplete $percent
+            Write-UiProgress -Percent (20 + [int]($percent * 0.2)) -Status "解压核心"
             if ([string]::IsNullOrEmpty($entry.Name)) {
                 Ensure-Directory -PathValue $targetPath
                 continue
@@ -2478,7 +2478,7 @@ function Expand-ZipArchiveWithProgress {
         }
     } finally {
         $archive.Dispose()
-        Write-Progress -Id 2 -Activity "Extracting OpenSteamTool" -Completed
+        Write-UiProgress -Percent 40 -Status "解压完成"
     }
 }
 
