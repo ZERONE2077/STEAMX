@@ -3323,7 +3323,7 @@ function Invoke-DeployOst {
         $deploySucceeded = $true
         Write-UiProgress -Percent 90 -Status "写入配置"
         Set-OstStartupCleanupCompleted
-        Write-UiProgress -Complete -Status "部署完成"
+        Write-UiProgress -Complete -Status (([char]0x2705) + " 已更新到新版本核心")
 
     } catch {
         Write-Log -Message ("Deployment failed; rolling back: {0}" -f $_.Exception.Message) -Level "ERROR" -Scope "ost" -LogFile $RunContext.LogFile
@@ -3357,7 +3357,7 @@ function Invoke-DeployOst {
             } else {
                 "OST 部署成功。"
             }
-            Write-Log -Message $finalMessage -Level "SUCCESS" -Scope "ost" -LogFile $RunContext.LogFile
+            Write-Log -Message $finalMessage -Level "SUCCESS" -Scope "ost" -LogFile $RunContext.LogFile -OnlyFile
         }
         if (Test-Path -LiteralPath $RunContext.TransactionDir) {
             Remove-Item -LiteralPath $RunContext.TransactionDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -3553,17 +3553,17 @@ function Invoke-QuickStart {
     $kernelState = Get-OstKernelState -Config $Config -SteamPath $steamPath
     if (-not $kernelState.IsReady) {
         Write-UiLine
-        Write-UiLog -Scope "ost" -Message "未检测到解锁内核，正在自动部署 OST…" -Level WARN
+        # (suppressed; the progress bar already shows the deploy starting)
         $runContext = New-RunContext -Config $Config
         Invoke-DeployOst -Config $Config -RunContext $runContext
-        Write-UiLog -Scope "ost" -Message "OST 部署完成，接下来输入游戏 AppID 即可入库。" -Level SUCCESS
+        Write-UiLine -Text "输入游戏 AppID 即可入库。" -ForegroundColor DarkGray
     } elseif (-not (Test-OstStartupCleanupCompleted)) {
         Write-UiLine
-        Write-UiLog -Scope "ost" -Level WARN -Message "首次运行，正在清理残留并重新部署 OST…"
+        # (suppressed; the progress bar already shows the deploy starting)
         try {
             $runContext = New-RunContext -Config $Config
             Invoke-DeployOst -Config $Config -RunContext $runContext
-            Write-UiLog -Scope "ost" -Level SUCCESS -Message "首次清理与部署完成。"
+            Write-Log -Scope "ost" -Level SUCCESS -Message "首次清理与部署完成。" -LogFile $RunContext.LogFile -OnlyFile
         } catch {
             Write-UiLog -Scope "ost" -Level WARN -Message "首次部署失败，继续使用本地版本。"
             Write-UiLog -Scope "ost" -Level WARN -Message $_.Exception.Message
