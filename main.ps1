@@ -3322,6 +3322,24 @@ function Invoke-DeployOst {
         # report success before it deletes the transaction dir.
         $deploySucceeded = $true
         Write-UiProgress -Percent 90 -Status "写入配置"
+        # Persist the verified package into ./cache/opensteamtools/<version>/extracted so
+        # Invoke-UninstallOst can later identify and hash-check the files this run
+        # installed. Without this the deploy cache lives only in the transient
+        # TransactionDir and is deleted on completion, so uninstall reported
+        # 'No validated OST cache was found'.
+        try {
+            $persistRoot = Resolve-LocalPath -PathValue './cache/opensteamtools' -BasePath $RunContext.ScriptRoot
+            $pkgDir = Join-Path $persistRoot ([string]$package.Version)
+            $pkgExtract = Join-Path $pkgDir 'extracted'
+            if (Test-Path -LiteralPath $pkgExtract) { Remove-Item -LiteralPath $pkgExtract -Recurse -Force -ErrorAction SilentlyContinue }
+            Ensure-Directory -PathValue $pkgExtract
+            Copy-Item -Path (Join-Path $package.SourcePath '*') -Destination $pkgExtract -Recurse -Force -ErrorAction Stop
+            $meta = [pscustomobject]@{ version = [string]$package.Version; publishedDate = [string]$package.PublishedDate; assetName = [string]$package.AssetName }
+            ($meta | ConvertTo-Json) | Set-Content -LiteralPath (Join-Path $pkgDir 'metadata.json') -Encoding UTF8
+            Get-ChildItem -LiteralPath $persistRoot -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 1 | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Log -Message ('Could not persist OST cache for uninstall: {0}' -f $_.Exception.Message) -Level 'WARN' -Scope 'ost' -LogFile $RunContext.LogFile -OnlyFile
+        }
         Set-OstStartupCleanupCompleted
         Write-UiProgress -Complete -Status (([char]0x2705) + " 已更新到新版本核心")
 
