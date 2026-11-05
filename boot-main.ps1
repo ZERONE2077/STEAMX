@@ -44,7 +44,11 @@ $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('STEAMX-main-' + [Guid]::New
 $got = $false
 foreach ($u in $urls) {
     try {
-        Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec 20 -OutFile $tmp
+        # Cache-bust: gh-proxy/CDN caches the raw file for ~60s, so a fresh push
+        # would otherwise be invisible until the TTL expires. Send no-cache and a
+        # unique query token so the mirror revalidates against GitHub every run.
+        $bustUrl = $u + $(if ($u.Contains('?')) { '&' } else { '?' }) + 't=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        Invoke-WebRequest -Uri $bustUrl -UseBasicParsing -TimeoutSec 20 -OutFile $tmp -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' }
         if (-not (Test-Path -LiteralPath $tmp)) { continue }
         $bytes = [System.IO.File]::ReadAllBytes($tmp)
         if ($bytes.Length -lt 50000) {
@@ -52,7 +56,7 @@ foreach ($u in $urls) {
             continue
         }
         $head = [Text.Encoding]::UTF8.GetString($bytes)
-        if ($head.Contains('# Keep this entry script') -or $head.Contains('main.ps1') -and $head.Contains('STEAMX')) {
+        if ($head.Contains('main.ps1') -and ($head.Contains('STEAMX') -or $head.Contains('STEAMX  main.ps1'))) {
             $got = $true
             break
         }
