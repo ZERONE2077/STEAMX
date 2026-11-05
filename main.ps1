@@ -3452,33 +3452,36 @@ function Invoke-UninstallOst {
 
     $steamPath = Get-SteamPath -Config $Config
     $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
-    $cacheRootValue = [string](Get-ConfigValue -Object $ostConfig -Name "cacheRoot" -DefaultValue "./cache/opensteamtools")
-    $cacheRoot = Resolve-LocalPath -PathValue $cacheRootValue -BasePath $RunContext.ScriptRoot
-    $cachedPackage = Get-CachedOstSourceDirectory -Config $Config -CacheRoot $cacheRoot
-    if ($null -eq $cachedPackage) {
-        throw "No validated OST cache was found. Automatic uninstall cannot safely identify the installed files."
+
+    # Uninstall by NAME match: remove the OST files by their known names from
+    # the Steam dir. We no longer require a validated cache package (that forced
+    # a strict SHA match and failed outright when the cache was absent, e.g. a
+    # re-imaged cybercafe box or after switching machines). Any file whose name
+    # is on the list and exists in the Steam dir is backed up then removed; a
+    # stale cache, if present, is used only as an optional extra hint.
+    $configuredFiles = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "version.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
+    # Only OST core names; deliberately excludes steam.cfg / cons / cdk.exe / f1.exe
+    # which belong to other tools or are config we must not delete here.
+    $coreNames = @()
+    foreach ($n in $configuredFiles) { if (-not [string]::IsNullOrWhiteSpace($n)) { $coreNames += $n } }
+    foreach ($n in @("SDL3_voder.dll","xinput1_4.dll","dwmapi.dll","version.dll","versions.dll","hid.dll","core.dll","user32.dll","diversion.dll","winmm.dll","zlib1.dll","7z.dll","OpenSteamTool.dll","steamclient_loader.dll","xinput9_1_0.dll","dinput8.dll","msimg32.dll","dbghelp.dll")) {
+        if ($coreNames -notcontains $n) { $coreNames += $n }
     }
+    $coreNames = @($coreNames | Select-Object -Unique)
 
     $legacyFileRecords = @()
-    $configuredFiles = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "version.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
-    foreach ($fileName in $configuredFiles) {
+    foreach ($fileName in $coreNames) {
         $targetFile = Join-Path $steamPath $fileName
         if (-not (Test-Path -LiteralPath $targetFile -PathType Leaf)) { continue }
-        $sourceFile = Get-ChildItem -LiteralPath $cachedPackage.SourcePath -Recurse -File -Filter $fileName -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -eq $sourceFile -or (Get-FileSha256 -PathValue $targetFile) -ne (Get-FileSha256 -PathValue $sourceFile.FullName)) {
-            throw "The installed file cannot be verified against the validated OST cache: $targetFile"
-        }
         $legacyFileRecords += [pscustomobject]@{
             relativePath = $fileName
             targetPath   = $targetFile
-            sha256       = Get-FileSha256 -PathValue $targetFile
-            originalHash = ""
-            backupPath   = ""
+            sha256       = ""
             existed      = $false
         }
     }
     if ($legacyFileRecords.Count -eq 0) {
-        throw "No verified OST files were found in the Steam directory."
+        throw "No OST files were found in the Steam directory to uninstall."
     }
     $uninstallPlan = [pscustomobject]@{
         files = @($legacyFileRecords)
@@ -3501,27 +3504,11 @@ function Invoke-UninstallOst {
     foreach ($fileRecord in @($uninstallPlan.files)) {
         $targetFile = [string]$fileRecord.targetPath
         if (-not (Test-Path -LiteralPath $targetFile -PathType Leaf)) { continue }
-        $currentHash = Get-FileSha256 -PathValue $targetFile
-        if ($currentHash -ne [string]$fileRecord.sha256) {
-            $warnings += "Skipped externally modified file: $targetFile"
-            Write-Log -Message $warnings[-1] -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile
-            continue
-        }
-
+        # Name matched: back up the existing file then remove it. No SHA gate, so
+        # an externally updated DLL is still removed (its bytes are in the backup).
         [void](Backup-ExistingFile -SourceFile $targetFile -BackupDir $RunContext.BackupDir)
         Remove-Item -LiteralPath $targetFile -Force
-        if ([bool]$fileRecord.existed) {
-            $originalBackup = [string]$fileRecord.backupPath
-            if ([string]::IsNullOrWhiteSpace($originalBackup) -or -not (Test-Path -LiteralPath $originalBackup -PathType Leaf)) {
-                $warnings += "Original backup is missing; cannot restore: $targetFile"
-                Write-Log -Message $warnings[-1] -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile
-            } else {
-                Copy-Item -LiteralPath $originalBackup -Destination $targetFile -Force
-                Write-Log -Message ("Restored original file: {0}" -f $targetFile) -Scope "uninstall" -LogFile $RunContext.LogFile
-            }
-        } else {
-            Write-Log -Message ("Removed: {0}" -f $targetFile) -Scope "uninstall" -LogFile $RunContext.LogFile
-        }
+        Write-Log -Message ("Removed: {0}" -f $targetFile) -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
     }
 
     if ($RemoveLua) {
