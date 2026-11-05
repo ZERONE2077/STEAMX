@@ -3684,6 +3684,10 @@ function Invoke-QuickStart {
     }
 
     while ($true) {
+        # Clear and re-draw the header each turn so repeated deploys do not stack
+        # duplicate menus on screen; every interaction starts from one clean screen.
+        Clear-Host
+        Write-SteampXLogo
         Write-UiLine
         Write-UiLine -Text "开启/部署/修复游戏入库   1"
         Write-UiLine -Text "卸载                    0"
