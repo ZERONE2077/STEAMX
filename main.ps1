@@ -124,15 +124,18 @@ function Write-UiProgress {
 
     if (Test-UiVirtualTerminal) {
         Write-Host ("`r" + $render) -NoNewline
+        $script:UiProgressActive = -not $Complete
     } else {
         # Non-VT terminals: carriage return still works on a real console, but a
         # redirected/piped stdout has no cursor; only emit on completion then.
         if ($Complete -or -not [Console]::IsOutputRedirected) {
             Write-Host ("`r" + $render) -NoNewline
         }
+        $script:UiProgressActive = $false
     }
     if ($Complete) {
         Write-Host ""
+        $script:UiProgressActive = $false
     }
 }
 
@@ -253,6 +256,13 @@ function Write-UiLog {
         [ValidateSet("DEBUG", "INFO", "SUCCESS", "WARN", "ERROR")][string]$Level = "INFO",
         [string]$Scope = "steamx"
     )
+
+    # If a progress bar is currently drawn on this line, finish it with a newline
+    # before printing a normal log line, otherwise the two would run together.
+    if ($script:UiProgressActive) {
+        Write-Host ""
+        $script:UiProgressActive = $false
+    }
 
     $style = $script:UiLogLevelStyle[$Level]
     $timestamp = (Get-Date).ToString("HH:mm:ss")
@@ -1922,7 +1932,7 @@ function Stop-SteamProcesses {
     $processes = @(Get-SteamRelatedProcesses)
     if ($processes.Count -eq 0) { return }
 
-    Write-Log -Message ("Steam is running; closing related processes before continuing: {0}" -f (Get-SteamRunningSummary)) -Level "INFO" -Scope "steam" -LogFile $RunContext.LogFile
+    Write-Log -Message ("Steam is running; closing related processes before continuing: {0}" -f (Get-SteamRunningSummary)) -Level "INFO" -Scope "steam" -LogFile $RunContext.LogFile -OnlyFile
     foreach ($process in $processes) {
         try {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
@@ -1956,7 +1966,7 @@ function Start-Steam {
     }
 
     Start-Process -FilePath $steamExe -WorkingDirectory $SteamPath | Out-Null
-    Write-Log -Message "Steam restarted." -Scope "steam" -LogFile $RunContext.LogFile
+    Write-Log -Message "Steam restarted." -Scope "steam" -LogFile $RunContext.LogFile -OnlyFile
 }
 
 function Get-LatestOstReleaseInfo {
@@ -2272,7 +2282,7 @@ function Get-OstDownloadUrls {
 
     $networkRegion = Get-NetworkRegion
     if ($networkRegion -eq "CN") {
-        Write-UiLog -Scope "net" -Level INFO -Message "region CN, mirror download sources have priority"
+        # (region note moved off-console)
         return @(
             @($urls | Where-Object { $_ -ne $OfficialUrl })
             $OfficialUrl
@@ -2397,7 +2407,7 @@ function Assert-OstDownloadSha256 {
         if ($downloadedSha256 -ne $ExpectedSha256.ToLowerInvariant()) {
             throw ("OST SHA-256 mismatch. Expected {0}, received {1}." -f $ExpectedSha256, $downloadedSha256)
         }
-        Write-Log -Message ("OST SHA-256 verified against GitHub release metadata: {0}" -f $downloadedSha256) -Scope "ost" -LogFile $LogFile
+        Write-Log -Message ("OST SHA-256 verified against GitHub release metadata: {0}" -f $downloadedSha256) -Scope "ost" -LogFile $LogFile -OnlyFile
         return
     }
 
@@ -2417,7 +2427,7 @@ function Assert-OstDownloadSha256 {
         if ($downloadedSha256 -ne $officialSha256) {
             throw ("Mirror OST SHA-256 does not match the official asset. Mirror {0}, official {1}." -f $downloadedSha256, $officialSha256)
         }
-        Write-Log -Message ("OST SHA-256 verified against the official asset: {0}" -f $downloadedSha256) -Scope "ost" -LogFile $LogFile
+        Write-Log -Message ("OST SHA-256 verified against the official asset: {0}" -f $downloadedSha256) -Scope "ost" -LogFile $LogFile -OnlyFile
     } finally {
         if (Test-Path -LiteralPath $officialVerificationPath) {
             Remove-Item -LiteralPath $officialVerificationPath -Force -ErrorAction SilentlyContinue
@@ -2486,7 +2496,7 @@ function Get-OstSourceDirectoryFromGitHub {
     Ensure-Directory -PathValue $cacheRoot
 
     $apiUrl = "https://api.github.com/repos/{0}/releases/latest" -f $repo
-    Write-Log -Message ("Resolving latest OST release: {0}" -f $repo) -Scope "ost" -LogFile $RunContext.LogFile
+    Write-Log -Message ("Resolving latest OST release: {0}" -f $repo) -Scope "ost" -LogFile $RunContext.LogFile -OnlyFile
     try {
         $release = Get-LatestOstRelease -Config $Config
     } catch {
@@ -2533,7 +2543,7 @@ function Get-OstSourceDirectoryFromGitHub {
                 $attempts = 2
                 for ($attempt = 1; $attempt -le $attempts; $attempt++) {
                     try {
-                        Write-Log -Message ("Downloading OST asset from: {0}" -f $downloadUrl) -Scope "ost" -LogFile $RunContext.LogFile
+                        Write-Log -Message ("Downloading OST asset from: {0}" -f $downloadUrl) -Scope "ost" -LogFile $RunContext.LogFile -OnlyFile
                         Invoke-DownloadFileWithProgress -Url $downloadUrl -Destination $partialPath -TimeoutSeconds $timeoutSeconds
                         if (-not (Test-Path -LiteralPath $partialPath -PathType Leaf) -or (Get-Item -LiteralPath $partialPath).Length -eq 0) {
                             throw "Downloaded OST asset is empty."
@@ -3037,7 +3047,7 @@ function Remove-OstStaleResidue {
         if (($resolvedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw ("Steam reparse target is itself a reparse point: {0}" -f $resolvedPath)
         }
-        Write-Log -Message ("Steam path is a reparse point; cleaning through real target: {0} -> {1}" -f $rootPath, $resolvedPath) -Scope "residue" -LogFile $LogFile
+        Write-Log -Message ("Steam path is a reparse point; cleaning through real target: {0} -> {1}" -f $rootPath, $resolvedPath) -Scope "residue" -LogFile $LogFile -OnlyFile
         $rootPath = $resolvedPath
     }
 
@@ -3109,11 +3119,11 @@ function Remove-OstStaleResidue {
             throw ("Residue cleanup did not remove: {0}" -f $targetPath)
         }
         $removedPaths.Add($relativePath)
-        Write-Log -Message ("Removed stale residue: {0}" -f $targetPath) -Scope "residue" -LogFile $LogFile
+        Write-Log -Message ("Removed stale residue: {0}" -f $targetPath) -Scope "residue" -LogFile $LogFile -OnlyFile
     }
 
     if ($removedPaths.Count -gt 0) {
-        Write-Log -Message ("Removed {0} stale residue target(s)." -f $removedPaths.Count) -Scope "residue" -LogFile $LogFile
+        Write-Log -Message ("Removed {0} stale residue target(s)." -f $removedPaths.Count) -Scope "residue" -LogFile $LogFile -OnlyFile
     }
 }
 
@@ -3381,7 +3391,7 @@ function Invoke-SetManifestSource {
     }
     try {
         Set-OstManifestSourceInToml -TomlPath $tomlPath -Source $Source | Out-Null
-        Write-Log -Message ("Manifest source set to: {0}" -f $Source) -Scope "ost" -LogFile $RunContext.LogFile
+        Write-Log -Message ("Manifest source set to: {0}" -f $Source) -Scope "ost" -LogFile $RunContext.LogFile -OnlyFile
     } catch {
         if (-not [string]::IsNullOrWhiteSpace($backupPath) -and (Test-Path -LiteralPath $backupPath)) {
             Copy-Item -LiteralPath $backupPath -Destination $tomlPath -Force
@@ -3665,7 +3675,7 @@ function Invoke-QuickStart {
 
         if ($value -eq "1") {
             $runContext = New-RunContext -Config $Config
-            Write-UiLog -Scope "ost" -Level INFO -Message "正在部署 OST 环境…"
+            # (moved to progress bar)
             try {
                 Invoke-DeployOst -Config $Config -RunContext $runContext
                 # A manual redeploy of the current latest also satisfies the offer.
