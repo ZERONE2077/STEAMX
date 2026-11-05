@@ -257,10 +257,13 @@ function Write-UiLog {
         [string]$Scope = "steamx"
     )
 
-    # If a progress bar is currently drawn on this line, finish it with a newline
-    # before printing a normal log line, otherwise the two would run together.
+    # If a progress bar is currently drawn on this line, erase it (carriage
+    # return + blanks) and start the log line clean, instead of newline-ing and
+    # leaving a half-finished bar frozen on screen. The next Write-UiProgress
+    # redraws the bar on its own line.
     if ($script:UiProgressActive) {
-        Write-Host ""
+        $w = [Math]::Min((Get-UiWidth), 78)
+        Write-Host ("`r" + (" " * $w) + "`r") -NoNewline
         $script:UiProgressActive = $false
     }
 
@@ -2289,7 +2292,7 @@ function Get-OstDownloadUrls {
         )
     }
     if (-not [string]::IsNullOrWhiteSpace($networkRegion)) {
-        Write-UiLog -Scope "net" -Level INFO -Message ("region {0}, GitHub official source has priority" -f $networkRegion)
+        # (region note moved off-console; progress bar covers the download)
         return @(
             $OfficialUrl
             @($urls | Where-Object { $_ -ne $OfficialUrl })
@@ -2303,14 +2306,14 @@ function Get-OstDownloadUrls {
     )
     $reachableUrls = @($probes | Where-Object { $_.Reachable } | Sort-Object ElapsedMilliseconds | ForEach-Object { $_.Url })
     if ($reachableUrls.Count -gt 0) {
-        Write-UiLog -Scope "net" -Level WARN -Message "region detection unavailable, sources ordered by connectivity"
+        # (suppressed)
         return @(
             $reachableUrls
             @($urls | Where-Object { $_ -notin $reachableUrls })
         )
     }
 
-    Write-UiLog -Scope "net" -Level WARN -Message "region and endpoint probes unavailable, using configured source order"
+    # (suppressed)
     return $urls
 }
 
