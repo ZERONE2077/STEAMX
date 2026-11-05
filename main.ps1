@@ -17,7 +17,8 @@ param(
     [switch]$ResetApiKey,
     [string]$LuaPath = "",
     [string]$OutputName = "",
-    [int]$TimeoutSeconds = 0
+    [int]$TimeoutSeconds = 0,
+    [switch]$ShowLog
 )
 
 Set-StrictMode -Version Latest
@@ -29,6 +30,18 @@ $OutputEncoding = $utf8Encoding
 $script:OstReleaseCache = @{}
 $script:SteamPathCache = ""
 $script:NetworkRegionCache = ""
+$script:UiProgressActive = $false
+# Screen log gate. By default the console shows ONLY the progress bar during a
+# deploy; all log lines still go to the run.log file. Pass -ShowLog (or set
+# STEAMX_SHOW_LOG=1) to also print the timestamped log lines on screen.
+# Quiet screen logging only for the one-key Start flow, which runs a progress
+# bar; explicit commands (Check / AddGame / ...) keep printing their lines since
+# that output IS the result. -ShowLog / STEAMX_SHOW_LOG=1 forces logging on.
+$script:UiLogToScreen = $true
+if ($Command -eq 'Start' -and -not $ShowLog) {
+    if ($env:STEAMX_SHOW_LOG -ne '1') { $script:UiLogToScreen = $false }
+}
+if ($ShowLog -or $env:STEAMX_SHOW_LOG -eq '1') { $script:UiLogToScreen = $true }
 
 function Enable-ModernTls {
     # PowerShell 5.1 inherits the CLR default (SSL3/TLS1.0) unless the process or a
@@ -256,6 +269,13 @@ function Write-UiLog {
         [ValidateSet("DEBUG", "INFO", "SUCCESS", "WARN", "ERROR")][string]$Level = "INFO",
         [string]$Scope = "steamx"
     )
+
+    # Screen gate: unless -ShowLog / STEAMX_SHOW_LOG=1, do NOT print log lines
+    # on the console. The run.log file keeps everything (Write-Log writes it
+    # separately). The console then shows only the progress bar.
+    # Always surface ERROR lines even when screen logging is off: a silent
+    # failure behind a progress bar would otherwise leave the user with no clue.
+    if (-not $script:UiLogToScreen -and $Level -ne 'ERROR') { return }
 
     # If a progress bar is currently drawn on this line, erase it (carriage
     # return + blanks) and start the log line clean, instead of newline-ing and
