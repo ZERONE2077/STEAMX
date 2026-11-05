@@ -1040,7 +1040,7 @@ function Get-HubcapApiKey {
         }
     }
 
-    $promptedApiKey = Read-Host "Hubcap API Key (input is hidden)" -AsSecureString
+    $promptedApiKey = Read-Host "请输入管理员密钥" -AsSecureString
     $plainApiKey = ConvertTo-PlainText -SecureValue $promptedApiKey
     if ([string]::IsNullOrWhiteSpace($plainApiKey)) {
         throw "Hubcap API Key is required."
