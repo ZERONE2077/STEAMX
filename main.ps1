@@ -97,6 +97,45 @@ function Write-UiLine {
     }
 }
 
+function Write-UiProgress {
+    # One-line, in-place progress bar like:  [####################----]  72%  downloading
+    # Redrawn with a carriage return so it stays one line. Call with -Complete to
+    # finish (fills 100%, prints a newline). No-op line noise otherwise.
+    param(
+        [int]$Percent,
+        [string]$Status = "",
+        [switch]$Complete
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Status)) { $Status = "处理中" }
+    if ($Complete) { $Percent = 100 }
+    if ($Percent -lt 0) { $Percent = 0 }
+    if ($Percent -gt 100) { $Percent = 100 }
+
+    $totalWidth = [Math]::Min((Get-UiWidth), 78)
+    # reserve room for "[ ] 100% " + status. Keep bar at least 10 wide.
+    $suffix = (" {0}% {1}" -f $Percent, $Status)
+    $barWidth = $totalWidth - $suffix.Length - 2
+    if ($barWidth -lt 10) { $barWidth = 10 }
+    $filled = [int][Math]::Floor($barWidth * $Percent / 100.0)
+    if ($filled -gt $barWidth) { $filled = $barWidth }
+    $bar = ("#" * $filled) + ("-" * ($barWidth - $filled))
+    $render = "[" + $bar + "]" + $suffix
+
+    if (Test-UiVirtualTerminal) {
+        Write-Host ("`r" + $render) -NoNewline
+    } else {
+        # Non-VT terminals: carriage return still works on a real console, but a
+        # redirected/piped stdout has no cursor; only emit on completion then.
+        if ($Complete -or -not [Console]::IsOutputRedirected) {
+            Write-Host ("`r" + $render) -NoNewline
+        }
+    }
+    if ($Complete) {
+        Write-Host ""
+    }
+}
+
 function Read-UiInput {
     param([Parameter(Mandatory = $true)][string]$Prompt)
 
@@ -564,10 +603,16 @@ function Write-Log {
         [Parameter(Mandatory = $true)][string]$Message,
         [ValidateSet("DEBUG", "INFO", "SUCCESS", "WARN", "ERROR")][string]$Level = "INFO",
         [string]$Scope = "steamx",
-        [string]$LogFile = ""
+        [string]$LogFile = "",
+        # -OnlyFile: write the line to the log file but do NOT print it on screen.
+        # Used to keep per-step deploy lines in the log while the console shows a
+        # single progress bar instead.
+        [switch]$OnlyFile
     )
 
-    Write-UiLog -Message $Message -Level $Level -Scope $Scope
+    if (-not $OnlyFile) {
+        Write-UiLog -Message $Message -Level $Level -Scope $Scope
+    }
     if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
         $line = "{0} [{1}] {2} {3}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Scope, $Message
         # File logging is a convenience, never the operation itself. A deploy deletes
@@ -3085,6 +3130,7 @@ function Invoke-DeployOst {
     $restartSteamAfterDeploy = [bool](Get-ConfigValue -Object $ostConfig -Name "restartSteamAfterDeploy" -DefaultValue $true)
     # Flipped only after every file has landed; the finally block logs success from it.
     $deploySucceeded = $false
+        Write-UiProgress -Percent 0 -Status "准备中"
     $package = Get-OstSourceDirectory -Config $Config -RunContext $RunContext
     $sourcePath = $package.SourcePath
     $files = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "version.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
@@ -3128,7 +3174,7 @@ function Invoke-DeployOst {
     $sourceFiles = @($allSourceFiles | Where-Object { $_.Extension -eq ".dll" })
     $skippedFiles = @($allSourceFiles | Where-Object { $_.Extension -ne ".dll" })
     foreach ($skipped in $skippedFiles) {
-        Write-Log -Message ("Skipped non-DLL package file: {0}" -f $skipped.Name) -Scope "ost" -LogFile $RunContext.LogFile
+        Write-Log -Message ("Skipped non-DLL package file: {0}" -f $skipped.Name) -Scope "ost" -LogFile $RunContext.LogFile -OnlyFile
     }
 
     $stagedFiles = @()
@@ -3183,6 +3229,7 @@ function Invoke-DeployOst {
     $steamCfgRenamedThisRun = $false
     $configRecord = $null
     try {
+        Write-UiProgress -Percent 40 -Status "清理残留"
         Remove-OstStaleResidue -SteamPath $steamPath -LogFile $RunContext.LogFile | Out-Null
 
         $steamCfg = Join-Path $steamPath "steam.cfg"
@@ -3200,10 +3247,12 @@ function Invoke-DeployOst {
                 sha256       = $steamCfgHash
             }
             $steamCfgRenamedThisRun = $true
-            Write-Log -Message "Renamed steam.cfg to steam.cfg.bak." -Scope "ost" -LogFile $RunContext.LogFile
+            Write-Log -Message "Renamed steam.cfg to steam.cfg.bak." -Scope "ost" -LogFile $RunContext.LogFile -OnlyFile
         }
 
         foreach ($item in $stagedFiles) {
+            $deployPct = 40 + [int](45.0 * [array]::IndexOf($stagedFiles, $item) / [Math]::Max(1,$stagedFiles.Count))
+            Write-UiProgress -Percent $deployPct -Status "部署文件"
             $targetExisted = Test-Path -LiteralPath $item.TargetPath -PathType Leaf
             $rollbackBackup = if ($targetExisted) { Backup-ExistingFile -SourceFile $item.TargetPath -BackupDir $RunContext.BackupDir } else { "" }
             Copy-Item -LiteralPath $item.StagedPath -Destination $item.TargetPath -Force
@@ -3217,7 +3266,7 @@ function Invoke-DeployOst {
                 sha256       = $installedHash
                 rollbackBackupPath = $rollbackBackup
             }
-            Write-Log -Message ("Deployed: {0}" -f $item.TargetPath) -Scope "ost" -LogFile $RunContext.LogFile
+            Write-Log -Message ("Deployed: {0}" -f $item.TargetPath) -Scope "ost" -LogFile $RunContext.LogFile -OnlyFile
         }
 
         $tomlPath = Get-OstConfigPath -Config $Config -SteamPath $steamPath
@@ -3262,7 +3311,9 @@ function Invoke-DeployOst {
         # Every file verified and the kernel validates: the finally block may now
         # report success before it deletes the transaction dir.
         $deploySucceeded = $true
+        Write-UiProgress -Percent 90 -Status "写入配置"
         Set-OstStartupCleanupCompleted
+        Write-UiProgress -Complete -Status "部署完成"
 
     } catch {
         Write-Log -Message ("Deployment failed; rolling back: {0}" -f $_.Exception.Message) -Level "ERROR" -Scope "ost" -LogFile $RunContext.LogFile
