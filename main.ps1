@@ -120,20 +120,38 @@ function Write-UiProgress {
         [switch]$Complete
     )
 
+    # A negative Percent means "size unknown": the bar is drawn empty and no
+    # percentage is printed, so a server that does not report a length still
+    # shows that something is happening.
     if ([string]::IsNullOrWhiteSpace($Status)) { $Status = "处理中" }
     if ($Complete) { $Percent = 100 }
+    $indeterminate = ($Percent -lt 0)
     if ($Percent -lt 0) { $Percent = 0 }
     if ($Percent -gt 100) { $Percent = 100 }
 
+    $vt = Test-UiVirtualTerminal
     $totalWidth = [Math]::Min((Get-UiWidth), 78)
-    # reserve room for "[ ] 100% " + status. Keep bar at least 10 wide.
-    $suffix = (" {0}% {1}" -f $Percent, $Status)
-    $barWidth = $totalWidth - $suffix.Length - 2
-    if ($barWidth -lt 10) { $barWidth = 10 }
+    $barWidth = 24
     $filled = [int][Math]::Floor($barWidth * $Percent / 100.0)
     if ($filled -gt $barWidth) { $filled = $barWidth }
-    $bar = ("#" * $filled) + ("-" * ($barWidth - $filled))
-    $render = "[" + $bar + "]" + $suffix
+    $percentText = if ($indeterminate) { "    " } else { ("{0,3}%" -f $Percent) }
+    $suffix = " {0}  {1}" -f $percentText, $Status
+    # Trim a long status so the line never wraps (a wrapped line cannot be
+    # redrawn in place with a carriage return).
+    $maxSuffix = $totalWidth - $barWidth - 4
+    while ((Get-UiDisplayWidth -Text $suffix) -gt $maxSuffix -and $suffix.Length -gt 8) {
+        $suffix = $suffix.Substring(0, $suffix.Length - 1)
+    }
+    $pad = $maxSuffix - (Get-UiDisplayWidth -Text $suffix)
+    if ($pad -lt 0) { $pad = 0 }
+    if ($vt) {
+        $esc = [string][char]27
+        $bar = ([string][char]0x2588 * $filled) + ([string][char]0x2591 * ($barWidth - $filled))
+        $render = "  {0}{1}{2}[0m{3}{4}" -f (Get-UiAnsiColor -Rgb $script:UiTheme.Blue), $bar, $esc, $suffix, (" " * $pad)
+    } else {
+        $bar = ("#" * $filled) + ("-" * ($barWidth - $filled))
+        $render = "  [" + $bar + "]" + $suffix + (" " * $pad)
+    }
 
     if (Test-UiVirtualTerminal) {
         Write-Host ("`r" + $render) -NoNewline
@@ -159,16 +177,63 @@ function Read-UiInput {
 }
 
 function Read-UiInputBox {
-    # Plain prompt, no box drawing. Read-Host cannot render a reliably closed
-    # box: it blocks and returns a newline, so any border drawn around the input
-    # line drifts or vanishes once the user types (especially with wide/CJK
-    # characters). A bare "> " prefix is stable on every terminal.
-    #
-    # The prompt is written manually instead of using Read-Host -Prompt because
-    # -Prompt appends ": " (turning ">" into ">: "), which looks wrong here.
-    param([string]$Label = ">")
+    # Hint line above a rounded input box:
+    #   hint
+    #   ╭─────────────────────╮
+    #   │ > _                 │
+    #   ╰─────────────────────╯
+    # Read-Host only echoes at the cursor, so the whole box is drawn first and
+    # the cursor is moved back inside it. After Enter the cursor is moved below
+    # the box, so later output cannot overwrite the bottom border.
+    # -PinBottom pads with blank lines so the box sits on the last rows of the
+    # window. Without cursor control (redirected stdin/stdout, no VT) or on any
+    # drawing error, fall back to a plain "  > " prompt.
+    # The prompt is written by hand: Read-Host -Prompt would append ": ".
+    param([string]$Title = "", [switch]$PinBottom)
 
-    Write-Host ($Label + " ") -NoNewline
+    $canDraw = $false
+    try {
+        $canDraw = (Test-UiVirtualTerminal) -and -not $env:NO_COLOR -and
+            -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected
+    } catch { $canDraw = $false }
+
+    if ($canDraw) {
+        try {
+            $raw = $host.UI.RawUI
+            $h = [string][char]0x2500
+            $v = [string][char]0x2502
+            # Columns between the two corners; the box starts at column 2.
+            $inner = (Get-UiWidth) - 4
+
+            Write-Host ""
+            if ($PinBottom) {
+                $target = $raw.WindowPosition.Y + $raw.WindowSize.Height - 5
+                $gap = $target - $raw.CursorPosition.Y
+                if ($gap -gt 0) { Write-Host ("`n" * ($gap - 1)) }
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($Title)) {
+                Write-Host ("  " + (Format-UiFit -Text $Title -Width $inner)) -ForegroundColor DarkGray
+            }
+            Write-Host ("  " + [char]0x256D + ($h * $inner) + [char]0x256E) -ForegroundColor White
+            Write-Host ("  " + $v + " >" + (" " * ($inner - 2)) + $v) -ForegroundColor White
+            Write-Host ("  " + [char]0x2570 + ($h * $inner) + [char]0x256F) -ForegroundColor White
+
+            $boxTop = $raw.CursorPosition.Y - 3
+            [Console]::SetCursorPosition(6, $boxTop + 1)
+            $answer = Read-Host
+            [Console]::SetCursorPosition(0, $boxTop + 3)
+            return $answer
+        } catch {
+            # Fall through to the plain prompt.
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Title)) {
+        Write-UiLine
+        Write-UiLine -Text ("  " + $Title) -ForegroundColor DarkGray
+    }
+    Write-Host "  > " -NoNewline
     return (Read-Host)
 }
 
@@ -189,15 +254,6 @@ function Get-UiDisplayWidth {
             ($c -ge 0xFFE0 -and $c -le 0xFFE6)) { $w += 2 } else { $w += 1 }
     }
     return $w
-}
-
-function Format-UiMenuRow {
-    # Left text padded to KeyColumn (by display width), then the shortcut key.
-    param([string]$Text, [string]$Key, [int]$KeyColumn = 28)
-
-    $pad = $KeyColumn - (Get-UiDisplayWidth -Text $Text)
-    if ($pad -lt 1) { $pad = 1 }
-    return ($Text + (" " * $pad) + $Key)
 }
 
 function Test-LauncherSession {
@@ -305,6 +361,258 @@ function Write-UiLog {
         $line += $Message
     }
     Write-UiLine -Text $line
+}
+
+# ---------------------------------------------------------------------------
+# User-facing output. Write-UiLog is the detail log (hidden in the Start flow);
+# the helpers below are what the user actually reads, so they always print.
+# ---------------------------------------------------------------------------
+
+function Clear-UiProgressLine {
+    # Erase a progress bar that is still drawn on the current line, so the next
+    # message starts on a clean line instead of after a frozen half bar.
+    if (-not $script:UiProgressActive) { return }
+    $w = [Math]::Min((Get-UiWidth), 78)
+    Write-Host ("`r" + (" " * $w) + "`r") -NoNewline
+    $script:UiProgressActive = $false
+}
+
+# Theme ("neon"): 24-bit colors used wherever the terminal supports VT.
+# Old consoles fall back to the nearest ConsoleColor (Cyan/Green/Yellow/Red).
+$script:UiTheme = @{
+    Blue  = @(0, 212, 255)
+    Green = @(0, 230, 160)
+    Gold  = @(255, 200, 87)
+    Red   = @(255, 92, 122)
+}
+
+function Get-UiAnsiColor {
+    param([int[]]$Rgb)
+    return "$([char]27)[38;2;$($Rgb[0]);$($Rgb[1]);$($Rgb[2])m"
+}
+
+function Write-UiColor {
+    # Write-Host in a theme color: 24-bit when VT is available, else $Fallback.
+    param(
+        [AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][int[]]$Rgb,
+        [Parameter(Mandatory = $true)][string]$Fallback,
+        [switch]$NoNewline
+    )
+    if (Test-UiVirtualTerminal) {
+        Write-Host ((Get-UiAnsiColor -Rgb $Rgb) + $Text + "$([char]27)[0m") -NoNewline:$NoNewline
+    } else {
+        Write-Host $Text -NoNewline:$NoNewline -ForegroundColor $Fallback
+    }
+}
+
+$script:UiStatusStyle = @{
+    ok    = @{ Mark = [string][char]0x221A; Color = "Green"; Rgb = $script:UiTheme.Green }
+    warn  = @{ Mark = "!"; Color = "Yellow"; Rgb = $script:UiTheme.Gold }
+    error = @{ Mark = [string][char]0x00D7; Color = "Red"; Rgb = $script:UiTheme.Red }
+    info  = @{ Mark = [string][char]0x00B7; Color = "Gray" }
+    dim   = @{ Mark = " "; Color = "DarkGray" }
+}
+
+function Write-UiStatus {
+    # One result line:  "  √ text"  (ok / warn / error / info / dim).
+    # Only the mark is colored for ok/info, the whole line for warn/error, so a
+    # screen of results stays calm and the problems stand out.
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet("ok", "warn", "error", "info", "dim")][string]$Kind,
+        [AllowEmptyString()][string]$Text = ""
+    )
+
+    Clear-UiProgressLine
+    $style = $script:UiStatusStyle[$Kind]
+    if ($env:NO_COLOR) {
+        Write-Host ("  {0} {1}" -f $style.Mark, $Text)
+        return
+    }
+    $rgb = if ($style.ContainsKey("Rgb")) { $style.Rgb } else { $null }
+    $markText = "  {0} " -f $style.Mark
+    $whole = $Kind -in @("warn", "error", "dim")
+    if ($null -ne $rgb) {
+        Write-UiColor -Text $markText -Rgb $rgb -Fallback $style.Color -NoNewline
+        if ($whole) { Write-UiColor -Text $Text -Rgb $rgb -Fallback $style.Color } else { Write-Host $Text }
+        return
+    }
+    Write-Host $markText -NoNewline -ForegroundColor $style.Color
+    if ($whole) {
+        Write-Host $Text -ForegroundColor $style.Color
+    } else {
+        Write-Host $Text
+    }
+}
+
+function Write-UiRule {
+    # Thin divider, as wide as the input box (Read-UiInputBox).
+    $w = (Get-UiWidth) - 2
+    Write-UiLine -Text ("  " + ([string][char]0x2500 * $w)) -ForegroundColor DarkGray
+}
+
+function Write-UiTitle {
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    Write-UiLine -Text ("  " + $Text) -ForegroundColor White
+    Write-UiRule
+}
+
+function Format-UiFit {
+    # Cut text to a display width (CJK = 2 columns), ending in "…" when cut.
+    param([AllowEmptyString()][string]$Text, [int]$Width)
+
+    if ((Get-UiDisplayWidth -Text $Text) -le $Width) { return $Text }
+    $out = ""
+    foreach ($ch in $Text.ToCharArray()) {
+        if ((Get-UiDisplayWidth -Text ($out + $ch)) -gt ($Width - 1)) { break }
+        $out += $ch
+    }
+    return ($out + [char]0x2026)
+}
+
+function Write-UiPanel {
+    # Rounded panel with the title in the top border, sized to its content:
+    #   ╭─ 入库成功 ───────────────╮
+    #   │ 游戏      ELDEN RING      │
+    #   ╰──────────────────────────╯
+    # Rows are @(label, value) or @(label, value, color). -AccentRgb (r,g,b)
+    # paints the border and title in a 24-bit color. Without VT colors
+    # (old console, NO_COLOR) it prints a title line and plain fields instead.
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][object[]]$Rows,
+        [string]$TitleColor = "White",
+        [int[]]$AccentRgb = $null,
+        [int]$LabelWidth = 10
+    )
+
+    if (-not (Test-UiVirtualTerminal) -or $env:NO_COLOR) {
+        Write-UiLine -Text ("  " + $Title) -ForegroundColor White
+        foreach ($row in $Rows) { Write-UiField -Label ([string]$row[0]) -Value ([string]$row[1]) -LabelWidth $LabelWidth }
+        return
+    }
+
+    $h = [string][char]0x2500
+    $v = [string][char]0x2502
+    $maxInner = (Get-UiWidth) - 4
+    $titleText = " " + $Title + " "
+    $titleWidth = Get-UiDisplayWidth -Text $titleText
+    $inner = $titleWidth + 4
+    foreach ($row in $Rows) {
+        $w = 1 + $LabelWidth + (Get-UiDisplayWidth -Text ([string]$row[1])) + 2
+        if ($w -gt $inner) { $inner = $w }
+    }
+    if ($inner -gt $maxInner) { $inner = $maxInner }
+    $valueWidth = $inner - 1 - $LabelWidth - 1
+
+    # Border writer: 24-bit accent when given, DarkGray otherwise.
+    $esc = [string][char]27
+    $accent = $null
+    if ($null -ne $AccentRgb -and $AccentRgb.Count -eq 3) { $accent = "$esc[38;2;$($AccentRgb[0]);$($AccentRgb[1]);$($AccentRgb[2])m" }
+    $border = {
+        param([string]$Text, [switch]$NoNewline)
+        if ($accent) { Write-Host ($accent + $Text + "$esc[0m") -NoNewline:$NoNewline }
+        else { Write-Host $Text -NoNewline:$NoNewline -ForegroundColor DarkGray }
+    }
+
+    & $border ("  " + [char]0x256D + $h) -NoNewline
+    if ($accent) { Write-Host ($accent + $titleText + "$esc[0m") -NoNewline }
+    else { Write-Host $titleText -NoNewline -ForegroundColor $TitleColor }
+    & $border (($h * [Math]::Max(0, $inner - 1 - $titleWidth)) + [char]0x256E)
+    foreach ($row in $Rows) {
+        $value = Format-UiFit -Text ([string]$row[1]) -Width $valueWidth
+        $color = if ($row.Count -gt 2 -and -not [string]::IsNullOrWhiteSpace([string]$row[2])) { [string]$row[2] } else { "Gray" }
+        & $border ("  " + $v + " ") -NoNewline
+        Write-Host (Format-UiPad -Text ([string]$row[0]) -Width $LabelWidth) -NoNewline -ForegroundColor DarkGray
+        Write-Host (Format-UiPad -Text $value -Width ($inner - 1 - $LabelWidth)) -NoNewline -ForegroundColor $color
+        & $border $v
+    }
+    & $border ("  " + [char]0x2570 + ($h * $inner) + [char]0x256F)
+}
+
+function Format-UiPad {
+    # Pad to a display width (CJK counts as 2 columns).
+    param([AllowEmptyString()][string]$Text, [int]$Width)
+
+    $pad = $Width - (Get-UiDisplayWidth -Text $Text)
+    if ($pad -lt 1) { $pad = 1 }
+    return ($Text + (" " * $pad))
+}
+
+function Write-UiField {
+    # Aligned "  label   value" row; the value may be colored.
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [AllowEmptyString()][string]$Value = "",
+        [string]$Color = "",
+        [int]$LabelWidth = 8
+    )
+
+    Write-Host ("  " + (Format-UiPad -Text $Label -Width $LabelWidth)) -NoNewline -ForegroundColor DarkGray
+    if ([string]::IsNullOrWhiteSpace($Color) -or $env:NO_COLOR) {
+        Write-Host $Value
+    } else {
+        Write-Host $Value -ForegroundColor $Color
+    }
+}
+
+function Write-UiKeyHint {
+    # A menu row:  "  [1]  text"  with the key highlighted.
+    param(
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)][string]$Text,
+        [string]$Note = ""
+    )
+
+    $keyText = Format-UiPad -Text ("[" + $Key + "]") -Width 6
+    if (-not [string]::IsNullOrWhiteSpace($Note)) { $Text = Format-UiPad -Text $Text -Width 24 }
+    if ($env:NO_COLOR) {
+        Write-Host ("  " + $keyText + $Text + $Note)
+        return
+    }
+    Write-UiColor -Text ("  " + $keyText) -Rgb $script:UiTheme.Blue -Fallback Cyan -NoNewline
+    if ([string]::IsNullOrWhiteSpace($Note)) {
+        Write-Host $Text
+    } else {
+        Write-Host $Text -NoNewline
+        Write-Host $Note -ForegroundColor DarkGray
+    }
+}
+
+function Read-UiPrompt {
+    # Input box with an optional hint. Returns the trimmed answer; a
+    # closed/redirected stdin reads as "".
+    param([string]$Hint = "", [switch]$PinBottom)
+
+    $answer = Read-UiInputBox -Title $Hint -PinBottom:$PinBottom
+    if ($null -eq $answer) { return "" }
+    return ([string]$answer).Trim()
+}
+
+function Wait-UiReturn {
+    # Keep a result screen up until the user has read it.
+    param([string]$Text = "按回车键返回主菜单")
+
+    if ([Console]::IsInputRedirected) { return }
+    [void](Read-UiPrompt -Hint $Text)
+}
+
+function Confirm-UiAction {
+    # Explicit opt-in for anything destructive: only "y" proceeds, a bare Enter
+    # cancels. A redirected stdin reads as "" and therefore also cancels.
+    param(
+        [Parameter(Mandatory = $true)][string]$Question,
+        [string[]]$Details = @()
+    )
+
+    Write-UiLine
+    Write-UiStatus -Kind warn -Text $Question
+    foreach ($detail in $Details) {
+        if (-not [string]::IsNullOrWhiteSpace($detail)) { Write-UiStatus -Kind dim -Text $detail }
+    }
+    $answer = Read-UiPrompt -Hint "输入 y 确认，直接回车取消"
+    return ($answer -match '^(?i)(y|yes|是)$')
 }
 
 function Test-SteamxProjectRoot {
@@ -555,6 +863,11 @@ function Get-Config {
     return $config
 }
 
+function Get-SteamxBackupRoot {
+    # Parent of the per-operation backup folders: %TEMP%\STEAMX\backups.
+    return Join-Path ([System.IO.Path]::GetTempPath()) "STEAMX\backups"
+}
+
 function New-RunContext {
     param([Parameter(Mandatory = $true)][pscustomobject]$Config)
 
@@ -564,20 +877,11 @@ function New-RunContext {
     # Staging and the run log are disposable, so %TEMP% is the right home for them.
     $transactionDir = Join-Path ([System.IO.Path]::GetTempPath()) ("STEAMX\transactions\{0}" -f $operationId)
 
-    # Backups are NOT disposable: BackupDir holds the only rollback copy of the
-    # original dwmapi.dll / xinput1_4.dll / OpenSteamTool.dll and of the user's Lua
-    # manifests, and uninstall reads them back. Keeping them under %TEMP% meant
-    # Windows storage clean-up could delete the only copy of a user's original files
-    # between a deploy and a later uninstall, leaving them unrestorable. %LOCALAPPDATA%
-    # is user-owned and never auto-purged, and matches where the cache/API key live
-    # (Get-HubcapCredentialPath, Get-ScriptRoot fallbacks). One directory per
-    # operation, so a new run can never overwrite a previous run's rollback data.
-    $localAppData = [Environment]::GetFolderPath("LocalApplicationData")
-    if ([string]::IsNullOrWhiteSpace($localAppData)) {
-        # Never lose the rollback path entirely: fall back to the transaction dir,
-        # which is at least guaranteed writable, rather than handing out a bad path.
-        $localAppData = [System.IO.Path]::GetTempPath()
-    }
+    # Backups are a safety copy only: uninstall restores vanilla Steam by removing
+    # files, it never reads an older run's backup back. So %TEMP% is fine, and
+    # Windows clean-up purging it is acceptable. One directory per operation, so a
+    # new run never overwrites a previous run's copy.
+    $backupBase = Get-SteamxBackupRoot
 
     # Create these here, at the moment the paths are handed out. Callers write into
     # LogFile/BackupDir/TransactionDir long before they reach their own
@@ -587,13 +891,9 @@ function New-RunContext {
     # message. Add-Content does not create parent directories, so ensure up front.
     Ensure-Directory -PathValue $transactionDir
 
-    # Backups must never be the reason a run cannot start. %LOCALAPPDATA% can be
-    # redirected to a disconnected share, locked down by policy, or full, and a
-    # failure to create the backup directory used to be fatal here - which turned a
-    # degraded backup location into a tool that would not launch at all. Fall back to
-    # the transaction dir (disposable, but writable by construction, and this is the
-    # pre-existing behaviour) and carry on.
-    $backupDir = Join-Path $localAppData ("STEAMX\backups\{0}" -f $operationId)
+    # Backups must never be the reason a run cannot start: if the directory cannot
+    # be created, fall back to the transaction dir and carry on.
+    $backupDir = Join-Path $backupBase $operationId
     try {
         Ensure-Directory -PathValue $backupDir
     } catch {
@@ -663,7 +963,7 @@ function Write-Log {
 
 function Write-SteampXLogo {
     try {
-        $host.UI.RawUI.WindowTitle = "STEAMX - OpenSteamTools Deploy"
+        $host.UI.RawUI.WindowTitle = "STEAMX"
     } catch {
     }
     Write-Host ""
@@ -681,8 +981,8 @@ function Write-SteampXLogo {
     )
 
     $steamColumns = 49
-    $blue = @(56, 189, 248)
-    $green = @(34, 197, 94)
+    $blue = $script:UiTheme.Blue
+    $green = $script:UiTheme.Green
     $reset = "$([char]27)[0m"
     $useTrueColor = Test-UiVirtualTerminal
 
@@ -694,7 +994,7 @@ function Write-SteampXLogo {
             Write-Host "STEAM" -NoNewline -ForegroundColor Cyan
             Write-Host "X" -ForegroundColor Green
         }
-        Write-UiLine -Text "  OpenSteamTools deploy and Lua manifest helper" -ForegroundColor DarkGray
+        Write-UiLine -Text "  全网第1全，已支持 118,789 款游戏入库.." -ForegroundColor DarkGray
         Write-Host ""
         return
     }
@@ -726,7 +1026,7 @@ function Write-SteampXLogo {
     }
 
     Write-Host ""
-    Write-Host ($logoIndent + "OpenSteamTools deploy and Lua manifest helper") -ForegroundColor Gray
+    Write-Host ($logoIndent + "全网第1全，已支持 118,789 款游戏入库..") -ForegroundColor Gray
     Write-Host ""
 }
 
@@ -980,7 +1280,8 @@ function Get-SteamPath {
         }
     }
 
-    $enteredPath = (Read-UiInput -Prompt "Steam path not found. Enter the folder containing steam.exe, or press Enter to cancel").Trim().Trim('"')
+    Write-UiStatus -Kind warn -Text "没有自动找到 Steam。"
+    $enteredPath = (Read-UiPrompt -Hint "请输入 steam.exe 所在的文件夹（可直接把文件夹拖进窗口），直接回车取消").Trim('"')
     if ($enteredPath.EndsWith("steam.exe", [System.StringComparison]::OrdinalIgnoreCase)) {
         $enteredPath = Split-Path -Parent $enteredPath
     }
@@ -989,7 +1290,7 @@ function Get-SteamPath {
         return $script:SteamPathCache
     }
 
-    throw "Steam path not found. Set `$env:STEAM_PATH to the folder containing steam.exe before running STEAMX."
+    throw "找不到 Steam。请确认已安装 Steam，或把 steam.exe 所在文件夹设到环境变量 STEAM_PATH 后重试。"
 }
 
 function Resolve-SteamAppId {
@@ -1010,7 +1311,124 @@ function Resolve-SteamAppId {
         return $subMatch.Groups[1].Value
     }
 
-    throw "Invalid AppID or Steam store URL."
+    throw ("无法识别「{0}」。请输入纯数字 AppID，或 Steam 商店链接（store.steampowered.com/app/...）。" -f $trimmed)
+}
+
+function Test-SteamAppIdInput {
+    # True when the text is an AppID or store link, i.e. not a name to search.
+    param([Parameter(Mandatory = $true)][string]$InputValue)
+
+    try { [void](Resolve-SteamAppId -InputValue $InputValue); return $true } catch { return $false }
+}
+
+function Find-SteamStoreGames {
+    # Name search on the Steam store, paid full games only.
+    #
+    # Two store endpoints, because neither is enough alone:
+    #   - api/storesearch ranks by name well (also matches Chinese names) and
+    #     returns AppID + price, but has no filters, so free games, DLC and
+    #     soundtracks come mixed in.
+    #   - search/results?json=1 takes the store page filters (games only, hide
+    #     free-to-play, no DLC), but after the real hits it pads the list with
+    #     loosely related games.
+    # So storesearch gives the order and the filtered page acts as a whitelist.
+    # The single-player filter of the store page (category3=2) is left out on
+    # purpose: it drops co-op games like It Takes Two.
+    #
+    # cc is required (storesearch returns nothing without it) and is CN: most
+    # users type Chinese names and read CNY prices. The CN store hides games
+    # not sold there (Hearts of Iron IV, Plague Inc); the picker points users
+    # to steamui.com to look those AppIDs up.
+    #
+    # Returns Items (AppId, Name, Price), HitCount (storesearch hits before the
+    # filter, so "nothing left" can be told apart from "nothing found") and
+    # Fallback (true when storesearch found nothing and the items are the
+    # filtered page's top hits, which may be loose matches).
+    param(
+        [Parameter(Mandatory = $true)][string]$Term,
+        [int]$TimeoutSeconds = 15,
+        [int]$MaxResults = 8
+    )
+
+    $encoded = [Uri]::EscapeDataString($Term.Trim())
+    $headers = @{ "User-Agent" = "STEAMX" }
+    $nameUrl = "https://store.steampowered.com/api/storesearch/?term={0}&l=schinese&cc=CN" -f $encoded
+    $filterUrl = "https://store.steampowered.com/search/results/?term={0}&category1=998&hidef2p=1&ndl=1&json=1&l=schinese&cc=CN" -f $encoded
+
+    $named = $null
+    $filtered = $null
+    $nameError = $null
+    $filterError = $null
+    try { $named = Invoke-RestMethod -Uri $nameUrl -Headers $headers -TimeoutSec $TimeoutSeconds } catch { $nameError = $_.Exception.Message }
+    try { $filtered = Invoke-RestMethod -Uri $filterUrl -Headers $headers -TimeoutSec $TimeoutSeconds } catch { $filterError = $_.Exception.Message }
+    if ($null -ne $nameError -and $null -ne $filterError) {
+        throw ("连不上 Steam 商店，搜索失败：{0}" -f $nameError)
+    }
+    if ($null -ne $nameError) { Write-UiLog -Scope "search" -Level WARN -Message ("storesearch failed: {0}" -f $nameError) }
+    if ($null -ne $filterError) { Write-UiLog -Scope "search" -Level WARN -Message ("search/results failed: {0}" -f $filterError) }
+
+    # The filtered page has no AppID field; it is in the capsule image URL.
+    $allowed = New-Object System.Collections.Generic.List[object]
+    foreach ($row in @(Get-ObjectPropertyValue -Object $filtered -Name "items")) {
+        if ($null -eq $row) { continue }
+        $logo = [string](Get-ObjectPropertyValue -Object $row -Name "logo")
+        $idMatch = [System.Text.RegularExpressions.Regex]::Match($logo, '/apps/(\d+)/')
+        if (-not $idMatch.Success) { continue }
+        $allowed.Add([pscustomobject]@{ AppId = $idMatch.Groups[1].Value; Name = [string](Get-ObjectPropertyValue -Object $row -Name "name") })
+    }
+    $allowedIds = @{}
+    foreach ($row in $allowed) { $allowedIds[$row.AppId] = $true }
+
+    $hits = @(@(Get-ObjectPropertyValue -Object $named -Name "items") | Where-Object {
+        $null -ne $_ -and [string](Get-ObjectPropertyValue -Object $_ -Name "type") -eq "app"
+    })
+
+    $items = New-Object System.Collections.Generic.List[object]
+    foreach ($hit in $hits) {
+        $appId = [string](Get-ObjectPropertyValue -Object $hit -Name "id")
+        $price = Get-ObjectPropertyValue -Object $hit -Name "price"
+        $final = [long](Get-ObjectPropertyValue -Object $price -Name "final")
+        # hidef2p only hides games flagged free-to-play; plain free games still
+        # pass it, so a price is required too. Without the filtered page (it
+        # failed), the price is the only test left.
+        if ($final -le 0) { continue }
+        if ($null -eq $filterError -and -not $allowedIds.ContainsKey($appId)) { continue }
+        $currency = [string](Get-ObjectPropertyValue -Object $price -Name "currency")
+        $priceText = ""
+        if ($final -gt 0) {
+            $amount = ($final / 100).ToString("0.##", [Globalization.CultureInfo]::InvariantCulture)
+            $priceText = switch ($currency) {
+                "CNY" { "¥" + $amount }
+                "USD" { "$" + $amount }
+                default { "{0} {1}" -f $amount, $currency }
+            }
+        }
+        $items.Add([pscustomobject]@{ AppId = $appId; Name = [string](Get-ObjectPropertyValue -Object $hit -Name "name"); Price = $priceText })
+        if ($items.Count -ge $MaxResults) { break }
+    }
+
+    $fallback = $false
+    if ($items.Count -eq 0 -and $hits.Count -eq 0) {
+        # storesearch misses some aliases (e.g. 只狼) that the store page still
+        # finds, so show its top hits, marked as possibly loose.
+        foreach ($row in ($allowed | Select-Object -First 5)) {
+            $items.Add([pscustomobject]@{ AppId = $row.AppId; Name = $row.Name; Price = "" })
+        }
+        $fallback = $items.Count -gt 0
+    }
+
+    if ($items.Count -gt 0) {
+        $denuvo = Get-SteamDenuvoMap -AppIds @($items | ForEach-Object { $_.AppId })
+        foreach ($item in $items) {
+            $item | Add-Member -NotePropertyName Denuvo -NotePropertyValue ($denuvo.ContainsKey($item.AppId) -and $denuvo[$item.AppId])
+        }
+    }
+
+    return [pscustomobject]@{
+        Items    = $items.ToArray()
+        HitCount = $hits.Count
+        Fallback = $fallback
+    }
 }
 
 function Get-HubcapCredentialFile {
@@ -1068,19 +1486,24 @@ function Get-HubcapApiKey {
                     return (ConvertTo-PlainText -SecureValue $secureApiKey).Trim()
                 }
             } catch {
-                Write-UiLog -Scope "hubcap" -Level WARN -Message "saved API Key could not be decrypted; a new key is required"
+                Write-UiStatus -Kind warn -Text "已保存的密钥无法读取（可能换了 Windows 账户），需要重新输入。"
             }
         }
     }
 
-    $promptedApiKey = Read-Host "请输入管理员密钥" -AsSecureString
+    Write-UiLine
+    Write-UiStatus -Kind info -Text "入库需要管理员密钥（Hubcap API Key），只需输入一次，会加密保存在本机。"
+    Write-UiStatus -Kind dim -Text "输入时屏幕不显示字符，粘贴后直接回车即可。"
+    Write-Host "  > " -NoNewline
+    $promptedApiKey = Read-Host -AsSecureString
     $plainApiKey = ConvertTo-PlainText -SecureValue $promptedApiKey
     if ([string]::IsNullOrWhiteSpace($plainApiKey)) {
-        throw "Hubcap API Key is required."
+        throw "没有输入密钥，已取消。"
     }
 
     Save-HubcapApiKey -SecureApiKey $promptedApiKey -CredentialFile $CredentialFile
-    Write-UiLog -Scope "hubcap" -Level SUCCESS -Message ("API Key encrypted for the current Windows user -> {0}" -f (Get-DisplayPath -PathValue $CredentialFile))
+    Write-UiStatus -Kind ok -Text "密钥已加密保存（仅当前 Windows 账户可读）。"
+    Write-Log -Scope "hubcap" -Level SUCCESS -Message ("API Key saved -> {0}" -f (Get-DisplayPath -PathValue $CredentialFile)) -OnlyFile
     return $plainApiKey.Trim()
 }
 
@@ -1110,19 +1533,20 @@ function Show-HubcapApiStatus {
         $remaining = [Math]::Max(0, $dailyLimit - $dailyUsage)
         $expiresValue = [string](Get-ObjectPropertyValue -Object $stats -Name "api_key_expires_at")
         $expiresText = if ([string]::IsNullOrWhiteSpace($expiresValue)) {
-            "not reported"
+            ""
         } else {
-            ([DateTimeOffset]::Parse($expiresValue)).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz")
+            ([DateTimeOffset]::Parse($expiresValue)).ToLocalTime().ToString("yyyy-MM-dd")
         }
 
         $userName = [string](Get-ObjectPropertyValue -Object $stats -Name "username")
-        Write-UiLog -Scope "hubcap" -Level INFO -Message ("{0,-10}{1}" -f "user", $userName)
-        Write-UiLog -Scope "hubcap" -Level INFO -Message ("{0,-10}{1}" -f "expires", $expiresText)
-        Write-UiLog -Scope "hubcap" -Level INFO -Message ("{0,-10}{1}" -f "quota", ("{0}/{1} used, {2} remaining" -f $dailyUsage, $dailyLimit, $remaining))
+        Write-UiLog -Scope "hubcap" -Level INFO -Message ("user={0} expires={1} quota={2}/{3}" -f $userName, $expiresText, $dailyUsage, $dailyLimit)
+        $quotaText = "密钥有效，今日剩余 {0}/{1} 次" -f $remaining, $dailyLimit
+        if (-not [string]::IsNullOrWhiteSpace($expiresText)) { $quotaText += "，有效期至 $expiresText" }
+        Write-UiStatus -Kind $(if ($remaining -le 0) { "warn" } else { "dim" }) -Text $quotaText
         return "Ready"
     } catch {
         if ((Get-HttpStatusCode -ErrorRecord $_) -eq 401) {
-            Write-UiLog -Scope "hubcap" -Level WARN -Message "API Key is invalid or expired"
+            Write-UiStatus -Kind warn -Text "密钥已到期，请联系GM获取最新密钥"
             return "Unauthorized"
         }
         Write-UiLog -Scope "hubcap" -Level WARN -Message ("status query failed, continuing: {0}" -f $_.Exception.Message)
@@ -1231,6 +1655,8 @@ function Invoke-HubcapDownloadWithProgress {
         $responseStream = $null
         $fileStream = $null
         try {
+            # Hubcap builds the lua on demand, so the wait is before the first byte.
+            Write-UiProgress -Percent -1 -Status "服务器正在生成清单，请稍候..."
             $response = $request.GetResponse()
             $totalBytes = [long]$response.ContentLength
             $responseStream = $response.GetResponseStream()
@@ -1244,12 +1670,13 @@ function Invoke-HubcapDownloadWithProgress {
                 $speed = $downloaded / [Math]::Max(0.001, $stopwatch.Elapsed.TotalSeconds)
                 if ($totalBytes -gt 0) {
                     $percent = [Math]::Min(100, [int](($downloaded * 100) / $totalBytes))
-                    $status = "{0} / {1} | {2}/s" -f (Format-FileSize $downloaded), (Format-FileSize $totalBytes), (Format-FileSize $speed)
-                    Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Status $status -PercentComplete $percent
+                    $status = "下载清单 {0} / {1}  {2}/s" -f (Format-FileSize $downloaded), (Format-FileSize $totalBytes), (Format-FileSize $speed)
+                    Write-UiProgress -Percent $percent -Status $status
                 } else {
-                    Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Status ("{0} downloaded" -f (Format-FileSize $downloaded))
+                    Write-UiProgress -Percent -1 -Status ("下载清单 {0}" -f (Format-FileSize $downloaded))
                 }
             }
+            Clear-UiProgressLine
             # Strip any query string so the logged URL is the endpoint, not its parameters.
             $logUrl = ($Url -replace '\?.*$', '') -replace '^https?://[^/]+', ''
             Write-UiLog -Scope "hubcap" -Level SUCCESS -Message ("downloaded {0} <- {1}" -f (Format-FileSize $downloaded), $logUrl)
@@ -1257,7 +1684,7 @@ function Invoke-HubcapDownloadWithProgress {
         } catch {
             $statusCode = Get-HttpStatusCode -ErrorRecord $_
             if ($statusCode -eq 401) {
-                throw "Hubcap rejected the API Key while downloading. Run the game import again to replace the saved key."
+                throw "密钥已到期，请联系GM获取最新密钥"
             }
             # Retry the transport-level failures (no status code at all) plus the transient
             # server answers. A 404 or 401 is final and must not be retried.
@@ -1265,19 +1692,20 @@ function Invoke-HubcapDownloadWithProgress {
             $retryable = (($statusCode -eq 0) -and (Test-HubcapRetryableError -ErrorRecord $_)) -or $isTransientServerError
             if ((-not $retryable) -or ($attempt -ge $maxAttempts)) {
                 if ($retryable) {
-                    throw ("Hubcap could not be reached after {0} attempts. The lua is built on demand and the link to hubcapmanifest.com dropped mid-request - {1} If a proxy or VPN is running, switch the node and try again." -f $maxAttempts, $_.Exception.Message)
+                    throw ("连续 {0} 次连不上清单服务器（hubcapmanifest.com）。如果开着代理/加速器，换个节点再试。原始错误：{1}" -f $maxAttempts, $_.Exception.Message)
                 }
                 throw
             }
             $backoffSeconds = [int][Math]::Pow(2, $attempt)
             Write-UiLog -Scope "hubcap" -Level WARN -Message ("link dropped, retrying in {0}s ({1}/{2}): {3}" -f $backoffSeconds, ($attempt + 1), $maxAttempts, $_.Exception.Message)
+            Write-UiStatus -Kind warn -Text ("连接中断，{0} 秒后重试（第 {1}/{2} 次）" -f $backoffSeconds, ($attempt + 1), $maxAttempts)
             Start-Sleep -Seconds $backoffSeconds
         } finally {
             if ($null -ne $fileStream) { $fileStream.Dispose() }
             if ($null -ne $responseStream) { $responseStream.Dispose() }
             if ($null -ne $response) { $response.Dispose() }
-            Write-Progress -Id 3 -Activity "Downloading Lua manifests" -Completed
-    }
+            Clear-UiProgressLine
+        }
     }
 }
 
@@ -1330,7 +1758,7 @@ function Invoke-AddGame {
     )
 
     if ([string]::IsNullOrWhiteSpace($InputAppId)) {
-        $InputAppId = Read-UiInput -Prompt "Game AppID or Steam store URL"
+        $InputAppId = Read-UiPrompt -Hint "请输入游戏 AppID 或 Steam 商店链接"
     }
     $resolvedAppId = Resolve-SteamAppId -InputValue $InputAppId
     $steamPath = Get-SteamPath -Config $Config
@@ -1375,13 +1803,14 @@ function Invoke-AddGame {
 
     Write-UiLog -Scope "addgame" -Level INFO -Message ("{0,-10}{1}" -f "appid", ("{0} (variant={1})" -f $resolvedAppId, $InputVariant))
     Write-UiLog -Scope "addgame" -Level INFO -Message ("{0,-10}{1}" -f "lua", (Get-DisplayPath -PathValue $targetLuaPath))
+    $variantLabel = switch ($InputVariant) { "basegame" { "（仅本体）" } "dlc" { "（仅 DLC）" } default { "" } }
+    Write-UiStatus -Kind info -Text ("正在入库 AppID {0}{1}" -f $resolvedAppId, $variantLabel)
     $apiStatus = Show-HubcapApiStatus -Headers $headers -RequestTimeoutSeconds $RequestTimeoutSeconds
     if ($apiStatus -eq "Unauthorized") {
         if (-not $RetryInvalidCredential) {
-            throw "Hubcap API Key is invalid or expired. Run again with -ResetApiKey to replace it."
+            throw "密钥已到期，请联系GM获取最新密钥"
         }
 
-        Write-UiLog -Scope "hubcap" -Level INFO -Message "entering a new API Key to replace the saved credential"
         $resolvedApiKey = Get-HubcapApiKey `
             -ConfiguredApiKey "" `
             -CredentialFile $credentialFile `
@@ -1389,7 +1818,7 @@ function Invoke-AddGame {
         $headers = Get-HubcapHeaders -ResolvedApiKey $resolvedApiKey
         $apiStatus = Show-HubcapApiStatus -Headers $headers -RequestTimeoutSeconds $RequestTimeoutSeconds
         if ($apiStatus -eq "Unauthorized") {
-            throw "The new Hubcap API Key was also rejected. Check the key and try again."
+            throw "密钥已到期，请联系GM获取最新密钥"
         }
     }
 
@@ -1427,9 +1856,14 @@ function Invoke-AddGame {
             # pre-release pages and delisted entries are the usual causes, so explain that
             # instead of surfacing a raw .NET exception to the user.
             if ($notFound -and ((Get-HttpStatusCode -ErrorRecord $lastDownloadError) -eq 404)) {
-                throw ("Hubcap has no lua for AppID {0}. Demos, pre-release pages and delisted games are not covered - use the full game's store link instead." -f $resolvedAppId)
+                throw ("清单库里没有 AppID {0}。试玩版、未发售和已下架的游戏不收录，请改用正式版游戏的商店链接。" -f $resolvedAppId)
             }
             throw $lastDownloadError
+        }
+        # Already added before: show what the new manifest changes, overwrite only on "y".
+        $existingPath = Join-Path $targetLuaPath $outputFileName
+        if ((Test-Path -LiteralPath $existingPath -PathType Leaf) -and -not (Test-ZipFile -PathValue $tempDownload)) {
+            if (-not (Confirm-HubcapLuaReplace -ExistingPath $existingPath -NewPath $tempDownload -AppId $resolvedAppId)) { return }
         }
         Install-HubcapLuaDownload `
             -DownloadPath $tempDownload `
@@ -1441,7 +1875,171 @@ function Invoke-AddGame {
         }
     }
 
-    Write-UiLog -Scope "steam" -Level INFO -Message "restart Steam to load the new lua"
+    # A zip answer (fallback path) installs its own file names, so fall back to the folder.
+    $writtenPath = Join-Path $targetLuaPath $outputFileName
+    if (-not (Test-Path -LiteralPath $writtenPath)) { $writtenPath = $targetLuaPath }
+    $info = $null
+    if (Test-Path -LiteralPath $writtenPath -PathType Leaf) {
+        try { $info = Get-HubcapLuaInfo -Path $writtenPath } catch { $info = $null }
+    }
+    # Only rows the file actually told us; older or hand-made files may lack a header.
+    $rows = @()
+    if ($null -ne $info -and $info.Name) { $rows += , @("游戏", $info.Name, "White") }
+    $rows += , @("AppID", [string]$resolvedAppId)
+    if ($null -ne $info -and $null -ne $info.DlcCount) { $rows += , @("DLC", $(if ($info.DlcCount -gt 0) { "{0} 个" -f $info.DlcCount } else { "无" })) }
+    Write-UiLine
+    # Color emoji only in terminals known to render them (Windows Terminal,
+    # VS Code); the legacy console would show a box, so it gets a check mark.
+    $mark = if ($env:WT_SESSION -or $env:TERM_PROGRAM) { [char]::ConvertFromUtf32(0x1F389) } else { [string][char]0x221A }
+    Write-UiPanel -Title ($mark + " 入库成功") -TitleColor Green -AccentRgb $script:UiTheme.Green -Rows $rows
+
+    # A reminder only, after the game is in: Denuvo games need one launch on an
+    # account that owns them before they run on the user's own account.
+    if (Test-SteamDenuvoGame -AppId $resolvedAppId) {
+        Write-UiStatus -Kind warn -Text "Denuvo(DRM) 加密过的游戏，请自行购买离线号、或租号打开一次游戏后，切换回自己的号即可游玩。"
+    }
+}
+
+function Get-SteamDenuvoMap {
+    # AppID -> $true when the store's DRM notice (appdetails drm_notice) names
+    # Denuvo. appdetails takes one AppID per call (a list is a 400), and one by
+    # one 8 results take ~4 s, so the calls run in parallel (~1 s). An AppID
+    # whose call failed is left out of the map: unknown, shown as no notice.
+    param(
+        [Parameter(Mandatory = $true)][string[]]$AppIds,
+        [int]$TimeoutSeconds = 8
+    )
+
+    $map = @{}
+    $client = $null
+    try {
+        Add-Type -AssemblyName System.Net.Http
+        $client = New-Object System.Net.Http.HttpClient
+        $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+        $client.DefaultRequestHeaders.UserAgent.ParseAdd("STEAMX")
+        $tasks = @{}
+        foreach ($id in ($AppIds | Select-Object -Unique)) {
+            $tasks[$id] = $client.GetStringAsync(("https://store.steampowered.com/api/appdetails?appids={0}&l=schinese" -f $id))
+        }
+        # WaitAll throws when any call failed; the rest are still read below.
+        try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($tasks.Values), ($TimeoutSeconds + 2) * 1000) } catch { }
+        foreach ($id in $tasks.Keys) {
+            $task = $tasks[$id]
+            if ($task.Status -ne [Threading.Tasks.TaskStatus]::RanToCompletion) {
+                Write-UiLog -Scope "drm" -Level WARN -Message ("appdetails {0} {1}" -f $id, $task.Status)
+                continue
+            }
+            try {
+                $answer = $task.Result | ConvertFrom-Json
+                $data = Get-ObjectPropertyValue -Object (Get-ObjectPropertyValue -Object $answer -Name $id) -Name "data"
+                if ($null -eq $data) { continue }
+                $notice = [string](Get-ObjectPropertyValue -Object $data -Name "drm_notice")
+                $map[$id] = ($notice -match '(?i)denuvo')
+            } catch {
+                Write-UiLog -Scope "drm" -Level WARN -Message ("appdetails {0} unreadable: {1}" -f $id, $_.Exception.Message)
+            }
+        }
+    } catch {
+        Write-UiLog -Scope "drm" -Level WARN -Message ("drm check failed: {0}" -f $_.Exception.Message)
+    } finally {
+        if ($null -ne $client) { $client.Dispose() }
+    }
+    return $map
+}
+
+function Test-SteamDenuvoGame {
+    # True when the game is known to use Denuvo; unknown counts as "no", since
+    # this only decides a reminder.
+    param([Parameter(Mandatory = $true)][string]$AppId)
+
+    $map = Get-SteamDenuvoMap -AppIds @($AppId)
+    return ($map.ContainsKey($AppId) -and $map[$AppId])
+}
+
+function Get-HubcapLuaInfo {
+    # Game facts from the comment header Hubcap writes at the top of each lua:
+    #   -- ELDEN RING
+    #   -- Created: September 08, 2026 at 03:35:10 EDT
+    #   -- Total DLCs: 9
+    # Missing facts stay $null. No size: the depot list covers every platform and
+    # language, so summing it overstates the download several times over.
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8 -TotalCount 20)
+    $info = [ordered]@{ Name = $null; DlcCount = $null; Created = $null }
+
+    if ($lines.Count -ge 2 -and $lines[0] -match "Created by Hubcap" -and $lines[1] -match '^--\s*(.+?)\s*$') {
+        $info.Name = $Matches[1]
+    }
+    foreach ($line in $lines) {
+        if ($line -match '^--\s*Total DLCs:\s*(\d+)') { $info.DlcCount = [int]$Matches[1]; continue }
+        if ($line -match '^--\s*Created:\s*(.+?)\s+at\s+(\d{1,2}:\d{2})') {
+            $parsed = [datetime]::MinValue
+            if ([datetime]::TryParseExact(($Matches[1] + " " + $Matches[2]), "MMMM d, yyyy H:mm", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+                $info.Created = $parsed.ToString("yyyy-MM-dd HH:mm")
+            }
+        }
+    }
+    return [pscustomobject]$info
+}
+
+function Get-LuaManifestMap {
+    # depot id -> manifest id, from the setManifestid(...) lines of a lua.
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $map = @{}
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        if ($line -match '^\s*setManifestid\(\s*(\d+)\s*,\s*"(\d+)"') { $map[$Matches[1]] = $Matches[2] }
+    }
+    return $map
+}
+
+function Confirm-HubcapLuaReplace {
+    # The AppID already has a lua. Same bytes: nothing to do. Otherwise show the
+    # old/new manifest dates and how many depots changed, and return $true only
+    # when the user types y. No answer (or no console) keeps the old file.
+    param(
+        [Parameter(Mandatory = $true)][string]$ExistingPath,
+        [Parameter(Mandatory = $true)][string]$NewPath,
+        [Parameter(Mandatory = $true)][string]$AppId
+    )
+
+    if ((Get-FileHash -LiteralPath $ExistingPath -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $NewPath -Algorithm SHA256).Hash) {
+        Write-UiStatus -Kind ok -Text ("AppID {0} 已入库，清单已是最新，无需重复入库" -f $AppId)
+        return $false
+    }
+
+    $old = $null; $new = $null
+    try { $old = Get-HubcapLuaInfo -Path $ExistingPath } catch { }
+    try { $new = Get-HubcapLuaInfo -Path $NewPath } catch { }
+    $oldMap = @{}; $newMap = @{}
+    try { $oldMap = Get-LuaManifestMap -Path $ExistingPath } catch { }
+    try { $newMap = Get-LuaManifestMap -Path $NewPath } catch { }
+    $changed = 0
+    foreach ($depot in $newMap.Keys) {
+        if (-not $oldMap.ContainsKey($depot) -or $oldMap[$depot] -ne $newMap[$depot]) { $changed++ }
+    }
+
+    $name = if ($null -ne $new -and $new.Name) { $new.Name } elseif ($null -ne $old -and $old.Name) { $old.Name } else { $null }
+    $rows = @()
+    if ($name) { $rows += , @("游戏", $name, "White") }
+    $rows += , @("AppID", $AppId)
+    $rows += , @("本地清单", $(if ($null -ne $old -and $old.Created) { $old.Created } else { "未知" }))
+    $rows += , @("新清单", $(if ($null -ne $new -and $new.Created) { $new.Created } else { "未知" }), "White")
+    if ($null -ne $old -and $null -ne $new -and $null -ne $old.DlcCount -and $null -ne $new.DlcCount -and $old.DlcCount -ne $new.DlcCount) {
+        $rows += , @("DLC", ("{0} → {1} 个" -f $old.DlcCount, $new.DlcCount))
+    }
+    if ($newMap.Count -gt 0) {
+        $rows += , @("Depot", $(if ($changed -gt 0) { "{0} 个有更新" -f $changed } else { "版本无变化" }))
+    }
+    Write-UiLine
+    Write-UiPanel -Title "已入库过" -TitleColor Cyan -AccentRgb $script:UiTheme.Blue -Rows $rows
+
+    $answer = ""
+    try { $answer = Read-UiPrompt -Hint "输入 y 覆盖为新清单，直接回车保留原清单" } catch { $answer = "" }
+    if ($answer -match '^(y|yes)$') { return $true }
+    Write-UiStatus -Kind info -Text "已保留原清单，未做改动"
+    return $false
 }
 
 function Get-SteamVersionInfo {
@@ -1661,7 +2259,7 @@ function ConvertTo-UtcDateTime {
 
 function Get-OstUpdateStatePath {
     # Remembers which release tags have already been offered, so the same release is
-    # never re-downloaded. Lives beside the backups/credential for the same reason:
+    # never re-downloaded. Lives beside the credential for the same reason:
     # %LOCALAPPDATA% is user-owned and never auto-purged.
     $localAppData = [Environment]::GetFolderPath("LocalApplicationData")
     if ([string]::IsNullOrWhiteSpace($localAppData)) { $localAppData = [System.IO.Path]::GetTempPath() }
@@ -1970,8 +2568,12 @@ function Stop-SteamProcesses {
         }
     }
 
+    $waitNoticeShown = $false
     while (@(Get-SteamRelatedProcesses).Count -gt 0) {
-        Write-UiLine -Text "Please exit the Steam client to continue." -ForegroundColor Red
+        if (-not $waitNoticeShown) {
+            Write-UiStatus -Kind warn -Text "无法自动关闭 Steam，请手动退出 Steam（托盘图标右键 → 退出），完成后会自动继续..."
+            $waitNoticeShown = $true
+        }
         Start-Sleep -Milliseconds 1500
     }
 }
@@ -2041,7 +2643,7 @@ function Get-OstKernelState {
     # Two views of the same install time are kept on purpose.
     #
     # FileDate stays a "yyyy-MM-dd" string: other call sites (the -Check report and
-    # Format-VersionWithDate) print it, and a bare date is what a human wants there.
+    # Format-UiKernelVersion) print it, and a bare date is what a human wants there.
     #
     # FileTimestampUtc is the full-precision round-trip used by the update decision.
     # The old code took .Date here, which collapsed every install on a given day to
@@ -2229,16 +2831,27 @@ function Format-DateStamp {
     }
 }
 
-function Format-VersionWithDate {
+function Format-UiKernelVersion {
+    # "1.5.3.6（2026.11.01）" for display. The shipped DLL usually carries no
+    # version, so the install/publish date is what tells two builds apart.
     param(
         [AllowEmptyString()][string]$Version,
         [AllowEmptyString()][string]$DateValue
     )
 
-    $versionText = if ([string]::IsNullOrWhiteSpace($Version)) { "unknown" } else { $Version }
     $dateStamp = Format-DateStamp -DateValue $DateValue
-    if ([string]::IsNullOrWhiteSpace($dateStamp)) { return $versionText }
-    return "{0}-{1}" -f $dateStamp, $versionText
+    if ([string]::IsNullOrWhiteSpace($Version) -and [string]::IsNullOrWhiteSpace($dateStamp)) { return "未安装" }
+    if ([string]::IsNullOrWhiteSpace($Version)) { return ("安装于 {0}" -f $dateStamp) }
+    if ([string]::IsNullOrWhiteSpace($dateStamp)) { return $Version }
+    return ("{0}（{1}）" -f $Version, $dateStamp)
+}
+
+function Get-UiLuaCount {
+    param([Parameter(Mandatory = $true)][string]$SteamPath)
+
+    $luaDir = Join-Path $SteamPath "config\lua"
+    if (-not (Test-Path -LiteralPath $luaDir -PathType Container)) { return 0 }
+    return @(Get-ChildItem -LiteralPath $luaDir -File -Filter *.lua -ErrorAction SilentlyContinue).Count
 }
 
 function Invoke-DownloadFileWithProgress {
@@ -2272,7 +2885,7 @@ function Invoke-DownloadFileWithProgress {
                 $status = "{0} / {1}" -f (Format-FileSize $downloaded), (Format-FileSize $totalBytes)
             } else {
                 $percent = 0
-                $status = "{0} downloaded" -f (Format-FileSize $downloaded)
+                $status = "已下载 {0}" -f (Format-FileSize $downloaded)
             }
             Write-UiProgress -Percent ([int]($percent * 0.2)) -Status ("下载核心 " + $status)
         }
@@ -2958,41 +3571,51 @@ function Invoke-Check {
 
     $steamVersion = Get-SteamVersionInfo -SteamPath $steamPath
     $steamBuildDisplay = Format-DateStamp -DateValue $steamVersion.BuildDate
-    if ([string]::IsNullOrWhiteSpace($steamBuildDisplay)) { $steamBuildDisplay = "unknown" }
-    Write-UiLog -Scope "check" -Level INFO -Message ("{0,-12}{1}" -f "steam.path", (Get-DisplayPath -PathValue $steamPath))
-    Write-UiLog -Scope "check" -Level INFO -Message ("{0,-12}{1}" -f "steam.build", $steamBuildDisplay)
-    $localOstDisplay = if ([string]::IsNullOrWhiteSpace($kernelState.Version)) {
-        Format-VersionWithDate -Version "" -DateValue $kernelState.FileDate
-    } else {
-        Format-VersionWithDate -Version $kernelState.Version -DateValue $kernelState.FileDate
-    }
+    if ([string]::IsNullOrWhiteSpace($steamBuildDisplay)) { $steamBuildDisplay = "未知" }
+    $localOstDisplay = Format-UiKernelVersion -Version $kernelState.Version -DateValue $kernelState.FileDate
     $latestOstDisplay = if (-not $remote.Available) {
-        "unavailable"
+        "查询失败（网络不可用或镜像全部失效）"
     } else {
-        Format-VersionWithDate -Version $remote.Version -DateValue $remote.PublishedDate
+        Format-UiKernelVersion -Version $remote.Version -DateValue $remote.PublishedDate
     }
     # Partial means a working kernel whose files do not match the configured list
-    # exactly - the payload is installed and loadable, upstream just ships a
-    # different file set than this build expects. That is a healthy install and is
-    # reported as SUCCESS; calling it a warning would flag every machine as broken
-    # the moment upstream changes packaging. IsComplete carries the detail.
-    $localOstLevel = if ($kernelState.Status -in @("Ready", "ReadyByDate", "Partial")) {
-        "SUCCESS"
-    } elseif ($kernelState.Status -eq "UpdateAvailable") {
-        "WARN"
-    } else {
-        "INFO"
+    # exactly - upstream just ships a different file set than this build expects.
+    # That is a healthy install, so it reads as ready; IsComplete carries the detail.
+    $kernelLabel = switch ($kernelState.Status) {
+        "Ready"           { @("ok", "已就绪") }
+        "ReadyByDate"     { @("ok", "已就绪") }
+        "Partial"         { @("ok", "已就绪") }
+        "VersionUnknown"  { @("ok", "已安装") }
+        "UpdateAvailable" { @("warn", "有新版本") }
+        default           { @("error", "未安装") }
     }
-    Write-UiLog -Scope "check" -Level $localOstLevel -Message ("{0,-12}{1}" -f "ost.local", ("{0} ({1})" -f $localOstDisplay, $kernelState.Status))
-    Write-UiLog -Scope "check" -Level INFO -Message ("{0,-12}{1}" -f "ost.latest", $latestOstDisplay)
-    Write-UiLog -Scope "check" -Level INFO -Message ("{0,-12}{1}" -f "ost.legacy", $(if ($kernelState.LegacyPaths.Count -gt 0) { @($kernelState.LegacyPaths | ForEach-Object { Get-DisplayPath -PathValue $_ }) -join ", " } else { "none" }))
+    $steamRunning = @(Get-SteamRelatedProcesses).Count -gt 0
+    $luaCount = Get-UiLuaCount -SteamPath $steamPath
+
+    Write-UiLine
+    Write-UiTitle -Text "环境检查"
+    Write-UiField -Label "Steam" -Value (Get-DisplayPath -PathValue $steamPath)
+    Write-UiField -Label "客户端" -Value ("{0}{1}" -f $steamBuildDisplay, $(if ($steamRunning) { "（运行中）" } else { "" }))
+    Write-UiField -Label "内核" -Value $localOstDisplay
+    Write-UiField -Label "最新版" -Value $latestOstDisplay
+    Write-UiField -Label "已入库" -Value ("{0} 个游戏" -f $luaCount)
+    Write-UiField -Label "配置" -Value (Get-DisplayPath -PathValue (Get-OstConfigPath -Config $Config -SteamPath $steamPath))
+    Write-UiLine
+    Write-UiStatus -Kind $kernelLabel[0] -Text ("内核状态：" + $kernelLabel[1])
+    if ($kernelState.LegacyPaths.Count -gt 0) {
+        Write-UiStatus -Kind warn -Text ("发现旧版工具残留：" + (@($kernelState.LegacyPaths | ForEach-Object { Get-DisplayPath -PathValue $_ }) -join ", "))
+    }
     if ($cfgState -ne "None") {
-        Write-UiLog -Scope "check" -Level WARN -Message ("{0,-12}{1}" -f "steam.cfg", $cfgState)
+        $cfgText = switch ($cfgState) {
+            "Conflict" { "steam.cfg 与 steam.cfg.bak 同时存在，需要手动处理" }
+            "Locked"   { "存在 steam.cfg（Steam 自动更新被锁定），部署内核时会自动删除" }
+            default    { "存在 steam.cfg.bak（旧的更新锁定备份）" }
+        }
+        Write-UiStatus -Kind warn -Text $cfgText
     }
-    Write-UiLog -Scope "check" -Level INFO -Message ("{0,-12}{1}" -f "ost.config", (Get-DisplayPath -PathValue (Get-OstConfigPath -Config $Config -SteamPath $steamPath)))
 
     if (-not $remote.Available) {
-        Write-Log -Message ("Remote OST status unavailable: {0}" -f $remote.Error) -Level "WARN" -Scope "ost" -LogFile $RunContext.LogFile
+        Write-Log -Message ("Remote OST status unavailable: {0}" -f $remote.Error) -Level "WARN" -Scope "ost" -LogFile $RunContext.LogFile -OnlyFile
     }
 }
 
@@ -3163,7 +3786,7 @@ function Invoke-DeployOst {
     $restartSteamAfterDeploy = [bool](Get-ConfigValue -Object $ostConfig -Name "restartSteamAfterDeploy" -DefaultValue $true)
     # Flipped only after every file has landed; the finally block logs success from it.
     $deploySucceeded = $false
-        Write-UiProgress -Percent 0 -Status "准备中"
+    Write-UiProgress -Percent 0 -Status "准备中"
     $package = Get-OstSourceDirectory -Config $Config -RunContext $RunContext
     $sourcePath = $package.SourcePath
     $files = @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @("dwmapi.dll", "version.dll", "xinput1_4.dll", "OpenSteamTool.dll"))
@@ -3258,30 +3881,12 @@ function Invoke-DeployOst {
     }
 
     $fileRecords = @()
-    $steamCfgRecord = $null
-    $steamCfgRenamedThisRun = $false
     $configRecord = $null
     try {
         Write-UiProgress -Percent 40 -Status "清理残留"
+        # steam.cfg (Steam's update lock) is on the residue list, so this also
+        # removes it - or throws if it cannot. No rename/restore is needed here.
         Remove-OstStaleResidue -SteamPath $steamPath -LogFile $RunContext.LogFile | Out-Null
-
-        $steamCfg = Join-Path $steamPath "steam.cfg"
-        $steamCfgBak = Join-Path $steamPath "steam.cfg.bak"
-        if ((Test-Path -LiteralPath $steamCfg) -and (Test-Path -LiteralPath $steamCfgBak)) {
-            throw "Both steam.cfg and steam.cfg.bak exist. Resolve this conflict before deployment."
-        }
-        if (Test-Path -LiteralPath $steamCfg -PathType Leaf) {
-            $steamCfgHash = Get-FileSha256 -PathValue $steamCfg
-            Rename-Item -LiteralPath $steamCfg -NewName "steam.cfg.bak"
-            $steamCfgRecord = [pscustomobject]@{
-                renamed     = $true
-                originalPath = $steamCfg
-                backupPath   = $steamCfgBak
-                sha256       = $steamCfgHash
-            }
-            $steamCfgRenamedThisRun = $true
-            Write-Log -Message "Renamed steam.cfg to steam.cfg.bak." -Scope "ost" -LogFile $RunContext.LogFile -OnlyFile
-        }
 
         foreach ($item in $stagedFiles) {
             $deployPct = 40 + [int](45.0 * [array]::IndexOf($stagedFiles, $item) / [Math]::Max(1,$stagedFiles.Count))
@@ -3364,7 +3969,7 @@ function Invoke-DeployOst {
             Write-Log -Message ('Could not persist OST cache for uninstall: {0}' -f $_.Exception.Message) -Level 'WARN' -Scope 'ost' -LogFile $RunContext.LogFile -OnlyFile
         }
         Set-OstStartupCleanupCompleted
-        Write-UiProgress -Complete -Status (([char]0x2705) + " 已更新到新版本核心")
+        Write-UiProgress -Complete -Status "完成"
 
     } catch {
         Write-Log -Message ("Deployment failed; rolling back: {0}" -f $_.Exception.Message) -Level "ERROR" -Scope "ost" -LogFile $RunContext.LogFile
@@ -3382,9 +3987,6 @@ function Invoke-DeployOst {
             } elseif (-not $configExisted -and (Test-Path -LiteralPath $configRecord.path)) {
                 Remove-Item -LiteralPath $configRecord.path -Force
             }
-        }
-        if ($steamCfgRenamedThisRun -and $null -ne $steamCfgRecord -and (Test-Path -LiteralPath $steamCfgRecord.backupPath) -and -not (Test-Path -LiteralPath $steamCfgRecord.originalPath)) {
-            Rename-Item -LiteralPath $steamCfgRecord.backupPath -NewName "steam.cfg"
         }
         throw
     } finally {
@@ -3405,9 +4007,11 @@ function Invoke-DeployOst {
         }
     }
 
+    Write-UiStatus -Kind ok -Text ("内核已部署：{0}" -f (Format-UiKernelVersion -Version ([string]$package.Version) -DateValue ([string]$package.PublishedDate)))
     $restartSteam = [bool](Get-ConfigValue -Object $ostConfig -Name "restartSteamAfterDeploy" -DefaultValue $true)
     if ($restartSteam) {
         Start-Steam -RunContext $RunContext -SteamPath $steamPath
+        Write-UiStatus -Kind dim -Text "Steam 已重新启动。"
     }
 }
 
@@ -3459,11 +4063,12 @@ function Invoke-EnableUnlockMode {
 }
 
 function Confirm-DestructiveAction {
-    param([Parameter(Mandatory = $true)][string]$Message)
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [string[]]$Details = @()
+    )
 
-    Write-UiLog -Scope "steamx" -Level WARN -Message $Message
-    $answer = Read-UiInput -Prompt "Press Enter to continue, or type anything else to cancel"
-    return ([string]::IsNullOrWhiteSpace($answer))
+    return (Confirm-UiAction -Question $Message -Details $Details)
 }
 
 function Invoke-UninstallOst {
@@ -3502,20 +4107,30 @@ function Invoke-UninstallOst {
             existed      = $false
         }
     }
-    if ($legacyFileRecords.Count -eq 0) {
-        throw "No non-official files were found in the Steam directory to uninstall."
+    $luaCount = if ($RemoveLua) { Get-UiLuaCount -SteamPath $steamPath } else { 0 }
+    if ($legacyFileRecords.Count -eq 0 -and $luaCount -eq 0) {
+        Write-UiStatus -Kind ok -Text "Steam 目录里没有需要清理的文件，已经是官方原版。"
+        return
     }
     $uninstallPlan = [pscustomobject]@{
         files = @($legacyFileRecords)
     }
 
-    $message = if ($RemoveLua) {
-        "This will remove STEAMX-managed OST files and back up then clear Lua manifests in: {0}" -f (Join-Path $steamPath "config\lua")
-    } else {
-        "This will remove only STEAMX-managed OST files from: {0}" -f $steamPath
+    $details = @()
+    if ($legacyFileRecords.Count -gt 0) {
+        $names = @($legacyFileRecords | ForEach-Object { [string]$_.relativePath })
+        $preview = ($names | Select-Object -First 5) -join ", "
+        if ($names.Count -gt 5) { $preview += " 等" }
+        $details += ("删除 {0} 个非官方文件：{1}" -f $names.Count, $preview)
     }
-    if (-not (Confirm-DestructiveAction -Message $message)) {
-        Write-Log -Message "Uninstall cancelled by user." -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile
+    if ($RemoveLua) {
+        $details += ("清空已入库的 {0} 个游戏清单（config\lua）" -f $luaCount)
+    }
+    $details += "删除前会先备份；Steam 会被关闭。"
+    $question = if ($RemoveLua) { "确认卸载内核并清空游戏清单？" } else { "确认卸载内核？已入库的游戏清单会保留。" }
+    if (-not (Confirm-DestructiveAction -Message $question -Details $details)) {
+        Write-Log -Message "Uninstall cancelled by user." -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
+        Write-UiStatus -Kind info -Text "已取消，未做任何改动。"
         return
     }
 
@@ -3545,13 +4160,13 @@ function Invoke-UninstallOst {
         $expectedLuaPath = [System.IO.Path]::GetFullPath((Join-Path $steamPath "config\lua"))
         $actualLuaPath = [System.IO.Path]::GetFullPath($luaPath)
         if ($actualLuaPath -ne $expectedLuaPath) {
-            throw "Refusing to clear Lua path because it is not the default Steam config lua path: $luaPath"
+            throw "拒绝清空清单目录：$luaPath 不是 Steam 默认的 config\lua。"
         }
 
         if (Test-Path -LiteralPath $luaPath -PathType Container) {
             $luaItem = Get-Item -LiteralPath $luaPath -Force
             if (($luaItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Refusing to clear Lua path because it is a symbolic link or directory junction: $luaPath"
+                throw "拒绝清空清单目录：$luaPath 是符号链接或目录联接。"
             }
             $luaBackup = Join-Path $RunContext.BackupDir "lua"
             Ensure-Directory -PathValue $luaBackup
@@ -3567,194 +4182,325 @@ function Invoke-UninstallOst {
 
     if ($warnings.Count -eq 0) {
         if ($RemoveLua) {
-            Write-Log -Message ("Lua backup retained at: {0}" -f (Join-Path $RunContext.BackupDir "lua")) -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile
+            Write-Log -Message ("Lua backup retained at: {0}" -f (Join-Path $RunContext.BackupDir "lua")) -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
         } elseif (Test-Path -LiteralPath $RunContext.TransactionDir) {
             Remove-Item -LiteralPath $RunContext.TransactionDir -Recurse -Force -ErrorAction SilentlyContinue
         }
-        Write-Log -Message "Uninstall completed." -Scope "uninstall" -LogFile $RunContext.LogFile
+        Write-Log -Message "Uninstall completed." -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
+        Write-UiStatus -Kind ok -Text $(if ($RemoveLua) { "卸载完成，内核和游戏清单已清除，Steam 已还原为官方版本。" } else { "卸载完成，Steam 已还原为官方版本。" })
+        Write-UiStatus -Kind dim -Text ("备份位置：" + (Get-DisplayPath -PathValue $RunContext.BackupDir))
     } else {
-        Write-Log -Message ("Uninstall completed with warnings. {0}" -f ($warnings -join " | ")) -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile
+        Write-Log -Message ("Uninstall completed with warnings. {0}" -f ($warnings -join " | ")) -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
+        Write-UiStatus -Kind warn -Text ("卸载完成，但有警告：" + ($warnings -join "；"))
     }
 }
 
-function Invoke-QuickStart {
-    param([pscustomobject]$Config)
+# ---------------------------------------------------------------------------
+# Interactive shell (Start). One home screen with a status panel and a menu;
+# every action opens its own page and stays on screen until the user has read
+# the result. Startup results (auto deploy / update) are carried onto the home
+# screen as notices, because the home screen clears whatever came before it.
+# ---------------------------------------------------------------------------
+
+$script:UiNotices = New-Object System.Collections.Generic.List[object]
+$script:UiRemoteInfo = $null
+
+function Add-UiNotice {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet("ok", "warn", "error", "info", "dim")][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$Text
+    )
+
+    $script:UiNotices.Add([pscustomobject]@{ Kind = $Kind; Text = $Text })
+}
+
+function Write-UiNotices {
+    if ($script:UiNotices.Count -eq 0) { return }
+    Write-UiLine
+    foreach ($notice in $script:UiNotices) {
+        Write-UiStatus -Kind $notice.Kind -Text $notice.Text
+    }
+    $script:UiNotices.Clear()
+}
+
+function Write-UiKeyRow {
+    # Several "[k] label" items on one line, in fixed-width columns.
+    param([Parameter(Mandatory = $true)][object[]]$Items, [int]$ColumnWidth = 20)
+
+    Write-Host "  " -NoNewline
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $key = "[" + [string]$Items[$i][0] + "] "
+        $label = [string]$Items[$i][1]
+        $cell = $key + $label
+        $isLast = ($i -eq $Items.Count - 1)
+        $padText = if ($isLast) { "" } else { " " * [Math]::Max(1, $ColumnWidth - (Get-UiDisplayWidth -Text $cell)) }
+        if ($env:NO_COLOR) {
+            Write-Host ($cell + $padText) -NoNewline
+        } else {
+            Write-UiColor -Text $key -Rgb $script:UiTheme.Blue -Fallback Cyan -NoNewline
+            Write-Host ($label + $padText) -NoNewline
+        }
+    }
+    Write-Host ""
+}
+
+function Get-UiKernelSummary {
+    # Text and color for the kernel row of the home screen. Local state only,
+    # plus the remote answer cached by the startup check (no network here).
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject]$Config,
+        [Parameter(Mandatory = $true)][string]$SteamPath
+    )
+
+    $state = Get-OstKernelState -Config $Config -SteamPath $SteamPath
+    if (-not $state.IsReady) {
+        return [pscustomobject]@{ Text = "未安装"; Tail = "按 1 部署"; Color = "Red" }
+    }
+    $text = Format-UiKernelVersion -Version $state.Version -DateValue $state.FileDate
+    $remote = $script:UiRemoteInfo
+    if ($null -ne $remote -and $remote.Available) {
+        $newer = $false
+        try { $newer = Test-OstUpdateAvailable -KernelState $state -Remote $remote } catch { $newer = $false }
+        if ($newer) {
+            $remoteText = Format-UiKernelVersion -Version ([string]$remote.Version) -DateValue ([string]$remote.PublishedDate)
+            return [pscustomobject]@{ Text = $text; Tail = ("有新版本 {0}，按 1 更新" -f $remoteText); Color = "Yellow" }
+        }
+    }
+    return [pscustomobject]@{ Text = $text; Tail = "已就绪"; Color = "Green" }
+}
+
+function Write-UiHomeStatus {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Config)
+
+    $steamPath = Get-SteamPath -Config $Config
+    $running = @(Get-SteamRelatedProcesses).Count -gt 0
+    $kernel = Get-UiKernelSummary -Config $Config -SteamPath $steamPath
+    $luaCount = Get-UiLuaCount -SteamPath $steamPath
+
+    Write-UiField -Label "Steam" -Value ("{0}{1}" -f (Get-DisplayPath -PathValue $steamPath), $(if ($running) { "  · 运行中" } else { "  · 未运行" }))
+    Write-Host ("  " + (Format-UiPad -Text "内核" -Width 8)) -NoNewline -ForegroundColor DarkGray
+    Write-Host ($kernel.Text + "  ") -NoNewline
+    if ($env:NO_COLOR) { Write-Host $kernel.Tail } else { Write-Host $kernel.Tail -ForegroundColor $kernel.Color }
+    Write-UiField -Label "已入库" -Value ("{0} 个游戏" -f $luaCount)
+}
+
+function Show-UiHome {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Config)
 
     Clear-Host
     Write-SteampXLogo
+    try {
+        Write-UiHomeStatus -Config $Config
+    } catch {
+        Write-UiStatus -Kind warn -Text ("状态读取失败：" + $_.Exception.Message)
+    }
+    Write-UiNotices
+    Write-UiLine
+    Write-UiRule
+    Write-UiKeyRow -Items @(@("1", "部署/修复内核"), @("0", "卸载"), @("?", "帮助"))
+}
 
-    $steamPath = Get-SteamPath -Config $Config
-    $kernelState = Get-OstKernelState -Config $Config -SteamPath $steamPath
-    if (-not $kernelState.IsReady) {
-        Write-UiLine
-        # (suppressed; the progress bar already shows the deploy starting)
+function Open-UiPage {
+    param([Parameter(Mandatory = $true)][string]$Title)
+
+    Clear-Host
+    Write-SteampXLogo
+    Write-UiTitle -Text $Title
+}
+
+function Show-UiHelp {
+    Open-UiPage -Title "帮助"
+    Write-UiLine -Text "  怎么用" -ForegroundColor White
+    Write-UiLine -Text "    1. 首次运行会自动部署内核，之后每次启动自动检查更新。"
+    Write-UiLine -Text "    2. 在主菜单输入游戏名称（如 艾尔登法环）、AppID（如 1245620）或 Steam 商店链接，回车即可入库。"
+    Write-UiLine -Text "       按名称搜索只查国区商店，只列出付费游戏本体，免费游戏、DLC、原声会被排除。"
+    Write-UiSteamUiHint -Indent "       "
+    Write-UiLine -Text "    3. 入库后游戏直接出现在 Steam 库中，不用重启 Steam。"
+    Write-UiLine
+    Write-UiLine -Text "  按键" -ForegroundColor White
+    Write-UiKeyHint -Key "1" -Text "部署 / 修复内核" -Note "游戏打不开、更新后失效时先试这个"
+    Write-UiKeyHint -Key "0" -Text "卸载" -Note "还原官方 Steam，可选是否清空已入库游戏"
+    Write-UiLine
+    Write-UiLine -Text "  常见问题" -ForegroundColor White
+    Write-UiLine -Text "    · 提示「清单库里没有」：试玩版、未发售、已下架的游戏不收录，换正式版的商店链接。"
+    Write-UiLine -Text "    · 提示「密钥已到期」：联系GM获取最新密钥，入库时按提示粘贴即可。"
+    Write-UiLine -Text "    · 下载反复中断：开着代理或加速器时换个节点再试。"
+    Write-UiLine -Text "    · 卸载和部署前都会自动关闭 Steam，被替换或删除的文件会先备份。"
+    Write-UiLine
+    Write-UiField -Label "备份" -Value (Get-DisplayPath -PathValue (Get-SteamxBackupRoot)) -LabelWidth 8
+    Wait-UiReturn
+}
+
+function Invoke-UiDeploy {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Config)
+
+    Open-UiPage -Title "部署 / 修复内核"
+    Write-UiStatus -Kind info -Text "正在下载并部署最新内核，期间会自动关闭 Steam..."
+    Write-UiLine
+    try {
         $runContext = New-RunContext -Config $Config
         Invoke-DeployOst -Config $Config -RunContext $runContext
-        Write-UiLine -Text "输入游戏 AppID 即可入库。" -ForegroundColor DarkGray
-    } elseif (-not (Test-OstStartupCleanupCompleted)) {
-        Write-UiLine
-        # (suppressed; the progress bar already shows the deploy starting)
-        try {
-            $runContext = New-RunContext -Config $Config
-            Invoke-DeployOst -Config $Config -RunContext $runContext
-            Write-Log -Scope "ost" -Level SUCCESS -Message "首次清理与部署完成。" -LogFile $RunContext.LogFile -OnlyFile
-        } catch {
-            Write-UiLog -Scope "ost" -Level WARN -Message "首次部署失败，继续使用本地版本。"
-            Write-UiLog -Scope "ost" -Level WARN -Message $_.Exception.Message
+        # A manual redeploy of the current latest also satisfies the offer, and
+        # clears any recorded defect for that tag: the user may have fixed the
+        # file by hand, or upstream may have re-cut the release.
+        $manualRemote = Get-LatestOstReleaseInfo -Config $Config -AllowFailure
+        if ($null -ne $manualRemote -and $manualRemote.Available) {
+            Clear-OstFailedTag -Tag ([string]$manualRemote.Version)
+            Add-OstHandledTag -Tag ([string]$manualRemote.Version)
+            $script:UiRemoteInfo = $manualRemote
         }
-    } elseif (Get-OstAutoUpdateEnabled -Config $Config) {
-        # The kernel is present, so an update is optional: check, and when a newer
-        # release exists say so on screen (users asked to SEE that an update was
-        # found) before silently installing it. A failed check must never block
-        # startup - offline, or every mirror down, still has to reach the prompt.
-        $remoteCheck = Get-LatestOstReleaseInfo -Config $Config -AllowFailure
-        $updateNeeded = $false
-        try {
-            $updateNeeded = Test-OstUpdateAvailable -KernelState $kernelState -Remote $remoteCheck
-        } catch {
-            $updateNeeded = $false
-        }
-
-        # A release whose package was already proven bad is not downloaded again.
-        # Without this the run re-fetched the same broken zip on every launch: the
-        # deploy failed at the content check, the tag was never latched (by design,
-        # so a transient failure stays retryable), and the next launch saw the same
-        # "newer release" and repeated the whole download. The failure record is
-        # what breaks that cycle, and it carries the reason so this can explain
-        # itself instead of silently doing nothing.
-        if ($updateNeeded) {
-            $failedRecord = Get-OstFailedTag -Tag ([string]$remoteCheck.Version)
-            if ($null -ne $failedRecord) {
-                Write-UiLine
-                Write-UiLog -Scope "ost" -Level WARN -Message "OST 新版本包有缺陷，已跳过自动更攡："
-                if (-not [string]::IsNullOrWhiteSpace($failedRecord.reason)) {
-                    Write-UiLog -Scope "ost" -Level WARN -Message ("原因：" + " " + $failedRecord.reason)
-                }
-                Write-UiLog -Scope "ost" -Level INFO -Message "如需强制重试，请按 1 手动重新部署。"
-                $updateNeeded = $false
-            }
-        }
-
-        if ($updateNeeded) {
-            $localDisplay = Format-VersionWithDate -Version $kernelState.Version -DateValue $kernelState.FileDate
-            $remoteDisplay = Format-VersionWithDate -Version $remoteCheck.Version -DateValue $remoteCheck.PublishedDate
-            Write-UiLine
-            Write-UiLog -Scope "ost" -Level WARN -Message "检测到 OST 新版本，正在自动更新..."
-            Write-UiLine -Text ("  {0} -> {1}" -f $localDisplay, $remoteDisplay) -ForegroundColor DarkGray
-            try {
-                $runContext = New-RunContext -Config $Config
-                Invoke-DeployOst -Config $Config -RunContext $runContext
-                # Latch the tag only after a verified install: a failed deploy must
-                # stay offerable on the next launch.
-                Add-OstHandledTag -Tag ([string]$remoteCheck.Version)
-                $refreshed = Get-OstKernelState -Config $Config -SteamPath $steamPath
-                $refreshedDisplay = Format-VersionWithDate -Version $refreshed.Version -DateValue $refreshed.FileDate
-                Write-UiLog -Scope "ost" -Level SUCCESS -Message "OST 自动更新完成。"
-                Write-UiLine -Text ("  {0}" -f $refreshedDisplay) -ForegroundColor DarkGray
-            } catch {
-                # Keep running on the version already installed.
-                Write-UiLog -Scope "ost" -Level WARN -Message "OST 更新失败，继续使用本地版本。"
-                Write-UiLog -Scope "ost" -Level WARN -Message $_.Exception.Message
-
-                # A deterministic failure (an incomplete package, a broken archive,
-                # a hash that does not match) reproduces identically forever, so
-                # latching it as failed is what stops the next launch from spending
-                # another full download to reach the same exception. Transient
-                # failures - a mirror down, TLS broken, the box offline - stay
-                # unlatch and therefore retryable.
-                $failureKind = Get-OstFailureKind -Message $_.Exception.Message
-                if (-not (Test-OstFailureRetryable -Kind $failureKind)) {
-                    Add-OstFailedTag `
-                        -Tag ([string]$remoteCheck.Version) `
-                        -Reason $_.Exception.Message `
-                        -Kind $failureKind
-                }
-            }
-        }
+    } catch {
+        Write-UiStatus -Kind error -Text ("部署失败，本次改动已回滚：" + $_.Exception.Message)
+        Write-UiStatus -Kind dim -Text "可以稍后再按 1 重试；下载失败多半是网络问题，换个网络或代理节点再试。"
     }
+    Wait-UiReturn
+}
 
-    # If stdin is redirected (parent process piped/closed it), Read-Host returns
-    # EOF immediately and the loop would treat that as "user pressed Enter" and
-    # exit silently. Detect it up front and tell the user why, so an abnormal
-    # launch does not look like the tool crashing after the prompt.
-    if ([Console]::IsInputRedirected) {
-        Write-UiLine
-        Write-UiLine -Text "当前窗口无法交互输入（stdin 被重定向）。请双击 STEAMX 快捷方式，或单独打开一个 PowerShell 窗口运行。" -ForegroundColor Yellow
+function Invoke-UiUninstall {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Config)
+
+    Open-UiPage -Title "卸载"
+    Write-UiKeyHint -Key "1" -Text "仅卸载内核" -Note "保留已入库的游戏清单"
+    Write-UiKeyHint -Key "2" -Text "卸载内核并清空游戏清单" -Note "清单会先备份"
+    $choice = Read-UiPrompt -Hint "输入 1 或 2，直接回车返回主菜单"
+    if ($choice -notin @("1", "2")) { return }
+
+    try {
+        $runContext = New-RunContext -Config $Config
+        Invoke-UninstallOst -Config $Config -RunContext $runContext -RemoveLua:($choice -eq "2")
+    } catch {
+        Write-UiStatus -Kind error -Text ("卸载失败：" + $_.Exception.Message)
+    }
+    Wait-UiReturn
+}
+
+function Write-UiSteamUiHint {
+    # The one line pointing to steamui.com for games the CN store search cannot
+    # find, with the address highlighted as the thing to remember.
+    param([string]$Indent = "    ")
+
+    $Before = "搜不到？可能是锁区或R18等游戏，建议上 "
+    $After = " 查询 AppID 入库"
+    $url = "steamui.com"
+    if ($env:NO_COLOR) {
+        Write-Host ($Indent + $Before + $url + $After)
         return
     }
+    Write-Host ($Indent + $Before) -NoNewline
+    Write-UiColor -Text $url -Rgb $script:UiTheme.Blue -Fallback Cyan -NoNewline
+    Write-Host $After
+}
+
+function Write-UiSearchTable {
+    # Search results as aligned columns:  [n]  name  price  AppID.
+    # The name column fits the longest name, capped so a row fits the screen.
+    param([Parameter(Mandatory = $true)][object[]]$Items)
+
+    $keyWidth = ("[{0}]" -f $Items.Count).Length + 2
+    $priceWidth = 0
+    $idWidth = 0
+    foreach ($item in $Items) {
+        $priceWidth = [Math]::Max($priceWidth, (Get-UiDisplayWidth -Text ([string]$item.Price)))
+        $idWidth = [Math]::Max($idWidth, ([string]$item.AppId).Length)
+    }
+    $nameWidth = 0
+    foreach ($item in $Items) { $nameWidth = [Math]::Max($nameWidth, (Get-UiDisplayWidth -Text ([string]$item.Name))) }
+    $gap = 3
+    $maxName = (Get-UiWidth) - 2 - $keyWidth - $gap - $priceWidth - $gap - $idWidth
+    $nameWidth = [Math]::Max(10, [Math]::Min($nameWidth, $maxName))
+
+    $header = "  " + (Format-UiPad -Text "序号" -Width $keyWidth) + (Format-UiPad -Text "游戏" -Width ($nameWidth + $gap))
+    if ($priceWidth -gt 0) {
+        $priceWidth = [Math]::Max($priceWidth, 4)
+        $header += (" " * ($priceWidth - 4)) + "价格" + (" " * $gap)
+    }
+    $idWidth = [Math]::Max($idWidth, 5)
+    $header += "AppID".PadLeft($idWidth)
+    # The remark column only appears when a result is a Denuvo game.
+    $anyDenuvo = @($Items | Where-Object { $_.PSObject.Properties["Denuvo"] -and $_.Denuvo }).Count -gt 0
+    if ($anyDenuvo) { $header += (" " * $gap) + "备注" }
+    Write-UiLine -Text $header -ForegroundColor DarkGray
+
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $key = Format-UiPad -Text ("[{0}]" -f ($i + 1)) -Width $keyWidth
+        $name = Format-UiPad -Text (Format-UiFit -Text ([string]$Items[$i].Name) -Width $nameWidth) -Width ($nameWidth + $gap)
+        $price = [string]$Items[$i].Price
+        $price = (" " * [Math]::Max(0, $priceWidth - (Get-UiDisplayWidth -Text $price))) + $price
+        $price = if ($priceWidth -gt 0) { $price + (" " * $gap) } else { "" }
+        $id = ([string]$Items[$i].AppId).PadLeft($idWidth)
+        $remark = if ($Items[$i].PSObject.Properties["Denuvo"] -and $Items[$i].Denuvo) { (" " * $gap) + "DRM！" } else { "" }
+        if ($env:NO_COLOR) {
+            Write-Host ("  " + $key + $name + $price + $id + $remark)
+            continue
+        }
+        Write-UiColor -Text ("  " + $key) -Rgb $script:UiTheme.Blue -Fallback Cyan -NoNewline
+        Write-Host $name -NoNewline
+        Write-Host $price -NoNewline -ForegroundColor Yellow
+        Write-Host $id -NoNewline -ForegroundColor DarkGray
+        if ($remark) { Write-UiColor -Text $remark -Rgb $script:UiTheme.Gold -Fallback Yellow } else { Write-Host "" }
+    }
+    if ($anyDenuvo) {
+        Write-UiLine
+        Write-UiStatus -Kind warn -Text "标 DRM！ 的是 Denuvo 加密游戏，入库后需离线号或租号先打开一次游戏。"
+    }
+}
+
+function Select-UiSteamGame {
+    # Search the store by name and let the user pick one by number. Typing
+    # another name searches again. Returns the AppID, or "" when cancelled.
+    param([Parameter(Mandatory = $true)][string]$Term)
 
     while ($true) {
-        # Clear and re-draw the header each turn so repeated deploys do not stack
-        # duplicate menus on screen; every interaction starts from one clean screen.
-        Clear-Host
-        Write-SteampXLogo
-        Write-UiLine
-        Write-UiLine -Text "开启/部署/修复游戏入库   1"
-        Write-UiLine -Text "卸载                    0"
-        Write-UiLine -Text "更多帮助                ?"
-        Write-UiLine
-        Write-UiLine -Text "输入游戏 AppID 或商店链接"
-        $rawInput = [string](Read-UiInputBox -Label ">")
-        $value = $rawInput.Trim()
-        if ([string]::IsNullOrWhiteSpace($value)) { return }
-        if ($value -match '^(?i)(q|quit|exit)$') { return }
-
-        if ($value -match '^(?i)(h|help|\?)$') {
-            Write-UiLine
-            Write-UiLine -Text "可用命令"
-            Write-UiLine
-            Write-UiLine -Text "<AppID 或 Steam 链接>   游戏入库"
-            Write-UiLine -Text "1    部署 / 重新部署 OST"
-            Write-UiLine -Text "0    卸载 OST（1 仅 OST / 2 连清单）"
-            Write-UiLine -Text "h    显示本帮助"
-            Write-UiLine -Text "q / 回车    退出"
-            continue
+        Write-UiStatus -Kind dim -Text ("正在搜索「{0}」..." -f $Term)
+        try {
+            $result = Find-SteamStoreGames -Term $Term
+        } catch {
+            Write-UiStatus -Kind error -Text $_.Exception.Message
+            return ""
         }
 
-        if ($value -eq "1") {
-            $runContext = New-RunContext -Config $Config
-            # (moved to progress bar)
-            try {
-                Invoke-DeployOst -Config $Config -RunContext $runContext
-                # A manual redeploy of the current latest also satisfies the offer.
-                $manualRemote = Get-LatestOstReleaseInfo -Config $Config -AllowFailure
-                if ($null -eq $manualRemote) { $manualRemote = [pscustomobject]@{ Available = $false; Version = "" } }
-                if ($manualRemote.Available) {
-                    # A successful manual deploy clears any recorded defect for that
-                    # tag: the user may have dropped the missing file in by hand, or
-                    # upstream may have re-cut the release. Both are the escape hatch
-                    # this record exists to preserve.
-                    Clear-OstFailedTag -Tag ([string]$manualRemote.Version)
-                    Add-OstHandledTag -Tag ([string]$manualRemote.Version)
-                }
-            } catch {
-                Write-UiLog -Scope "steamx" -Level ERROR -Message $_.Exception.Message
-            }
-            continue
-        }
-
-        if ($value -match '^(?i)(0|u|uninstall)$') {
-            Write-UiLine
-            Write-UiLine -Text "卸载选项"
-            Write-UiLine -Text ("  " + "1 仅卸载 OST   2 卸载 OST 并清理游戏清单   回车取消") -ForegroundColor DarkGray
-            $uninstallChoice = [string](Read-UiInputBox -Label ">")
-            $runContext = New-RunContext -Config $Config
-            if ($uninstallChoice.Trim() -eq "1") {
-                Invoke-UninstallOst -Config $Config -RunContext $runContext
-            } elseif ($uninstallChoice.Trim() -eq "2") {
-                Invoke-UninstallOst -Config $Config -RunContext $runContext -RemoveLua
+        $items = @($result.Items)
+        if ($items.Count -eq 0) {
+            if ($result.HitCount -gt 0) {
+                Write-UiStatus -Kind warn -Text ("「{0}」只搜到免费游戏、DLC 或原声等，已排除。" -f $Term)
             } else {
-                Write-UiLog -Scope "steamx" -Message "已取消。" -Level WARN
+                Write-UiStatus -Kind warn -Text ("没有搜到「{0}」，换个叫法试试，或直接输入 AppID。" -f $Term)
+                Write-UiSteamUiHint
             }
-            continue
+        } else {
+            if ($result.Fallback) {
+                Write-UiStatus -Kind warn -Text "没有精确匹配，下面是商店里相近的结果："
+                Write-UiSteamUiHint
+            }
+            Write-UiLine
+            Write-UiSearchTable -Items $items
         }
 
-        # Single digits other than 0/1 are reserved command slots, not AppIDs.
-        if ($value -match '^\d$') {
-            Write-UiLog -Scope "steamx" -Level WARN -Message "无效输入。可输入 AppID / Steam 链接，或 1、0、h、q"
-            continue
+        $hint = if ($items.Count -gt 0) { "输入序号、AppID 或商店链接入库，输入其他名称重新搜索，直接回车取消" } else { "输入 AppID 或商店链接入库，输入其他名称重新搜索，直接回车取消" }
+        $answer = Read-UiPrompt -Hint $hint
+        if ([string]::IsNullOrWhiteSpace($answer)) { return "" }
+        # A number within the list is an index; any other number is an AppID
+        # (real AppIDs can be two digits, e.g. 10 Counter-Strike).
+        if ($answer -match '^\d{1,2}$' -and [int]$answer -ge 1 -and [int]$answer -le $items.Count) {
+            return $items[[int]$answer - 1].AppId
         }
+        if (Test-SteamAppIdInput -InputValue $answer) { return (Resolve-SteamAppId -InputValue $answer) }
+        Write-UiLine
+        $Term = $answer
+    }
+}
 
+function Invoke-UiAddGame {
+    # The add-game page stays open for the next AppID, so several games can be
+    # added in a row without bouncing through the home screen.
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject]$Config,
+        [Parameter(Mandatory = $true)][string]$FirstInput
+    )
+
+    Open-UiPage -Title "入库游戏"
+    $value = $FirstInput
+    while ($true) {
         try {
             Invoke-AddGame `
                 -Config $Config `
@@ -3767,8 +4513,162 @@ function Invoke-QuickStart {
                 -LuaOverride $LuaPath `
                 -RequestTimeoutSeconds $TimeoutSeconds
         } catch {
-            Write-UiLog -Scope "steamx" -Message $_.Exception.Message -Level ERROR
+            Write-UiStatus -Kind error -Text ("入库失败：" + $_.Exception.Message)
         }
+
+        while ($true) {
+            $next = Read-UiPrompt -Hint "继续输入游戏名称、AppID 或商店链接入库，直接回车返回主菜单"
+            if ([string]::IsNullOrWhiteSpace($next)) { return }
+            if ($next -match '^\d$') {
+                Write-UiStatus -Kind warn -Text "这里只能输入游戏名称、AppID 或商店链接。"
+                continue
+            }
+            if (-not (Test-SteamAppIdInput -InputValue $next)) {
+                Write-UiLine
+                $next = Select-UiSteamGame -Term $next
+                if ([string]::IsNullOrWhiteSpace($next)) { continue }
+            }
+            break
+        }
+        Write-UiLine
+        $value = $next
+    }
+}
+
+function Invoke-UiStartupMaintenance {
+    # Deploy / repair / update the kernel before the menu. Nothing here may stop
+    # the menu from opening: every failure becomes a notice on the home screen.
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject]$Config,
+        [Parameter(Mandatory = $true)][string]$SteamPath
+    )
+
+    $kernelState = Get-OstKernelState -Config $Config -SteamPath $SteamPath
+    if (-not $kernelState.IsReady) {
+        Write-UiStatus -Kind info -Text "首次运行，正在自动部署内核..."
+        Write-UiLine
+        try {
+            $runContext = New-RunContext -Config $Config
+            Invoke-DeployOst -Config $Config -RunContext $runContext
+            Add-UiNotice -Kind ok -Text "内核已自动部署。输入游戏 AppID 即可入库。"
+        } catch {
+            Add-UiNotice -Kind error -Text ("内核部署失败：" + $_.Exception.Message)
+            Add-UiNotice -Kind dim -Text "按 1 可重试。"
+        }
+        return
+    }
+
+    if (-not (Test-OstStartupCleanupCompleted)) {
+        Write-UiStatus -Kind info -Text "首次运行，正在清理旧版残留并重新部署内核..."
+        Write-UiLine
+        try {
+            $runContext = New-RunContext -Config $Config
+            Invoke-DeployOst -Config $Config -RunContext $runContext
+            Add-UiNotice -Kind ok -Text "已清理旧版残留，内核已重新部署。"
+        } catch {
+            Add-UiNotice -Kind warn -Text ("首次清理失败，继续使用本地内核：" + $_.Exception.Message)
+        }
+        return
+    }
+
+    if (-not (Get-OstAutoUpdateEnabled -Config $Config)) { return }
+
+    # A failed check must never block startup - offline, or every mirror down,
+    # still has to reach the menu.
+    Write-UiStatus -Kind dim -Text "正在检查内核更新..."
+    $remoteCheck = Get-LatestOstReleaseInfo -Config $Config -AllowFailure
+    $script:UiRemoteInfo = $remoteCheck
+    $updateNeeded = $false
+    try {
+        $updateNeeded = Test-OstUpdateAvailable -KernelState $kernelState -Remote $remoteCheck
+    } catch {
+        $updateNeeded = $false
+    }
+    if (-not $updateNeeded) { return }
+
+    # A release whose package was already proven bad is not downloaded again;
+    # without this record every launch re-fetched the same broken zip.
+    $remoteDisplay = Format-UiKernelVersion -Version ([string]$remoteCheck.Version) -DateValue ([string]$remoteCheck.PublishedDate)
+    $failedRecord = Get-OstFailedTag -Tag ([string]$remoteCheck.Version)
+    if ($null -ne $failedRecord) {
+        Add-UiNotice -Kind warn -Text ("新版本 {0} 的安装包有缺陷，已跳过自动更新（按 1 可强制重试）。" -f $remoteDisplay)
+        if (-not [string]::IsNullOrWhiteSpace([string]$failedRecord.reason)) {
+            Add-UiNotice -Kind dim -Text ("原因：" + $failedRecord.reason)
+        }
+        return
+    }
+
+    $localDisplay = Format-UiKernelVersion -Version $kernelState.Version -DateValue $kernelState.FileDate
+    Write-UiStatus -Kind info -Text ("发现内核新版本：{0}  →  {1}，正在自动更新..." -f $localDisplay, $remoteDisplay)
+    Write-UiLine
+    try {
+        $runContext = New-RunContext -Config $Config
+        Invoke-DeployOst -Config $Config -RunContext $runContext
+        # Latch the tag only after a verified install: a failed deploy must stay
+        # offerable on the next launch.
+        Add-OstHandledTag -Tag ([string]$remoteCheck.Version)
+        Add-UiNotice -Kind ok -Text ("内核已自动更新：{0}  →  {1}" -f $localDisplay, $remoteDisplay)
+    } catch {
+        Add-UiNotice -Kind warn -Text ("内核更新失败，继续使用本地版本：" + $_.Exception.Message)
+        # A deterministic failure (incomplete package, broken archive, hash
+        # mismatch) reproduces identically forever, so record it to stop the next
+        # launch from spending another download on it. Transient failures (mirror
+        # down, TLS, offline) are not recorded and stay retryable.
+        $failureKind = Get-OstFailureKind -Message $_.Exception.Message
+        if (-not (Test-OstFailureRetryable -Kind $failureKind)) {
+            Add-OstFailedTag `
+                -Tag ([string]$remoteCheck.Version) `
+                -Reason $_.Exception.Message `
+                -Kind $failureKind
+        }
+    }
+}
+
+function Invoke-QuickStart {
+    param([pscustomobject]$Config)
+
+    Clear-Host
+    Write-SteampXLogo
+    Write-UiStatus -Kind dim -Text "正在检查环境..."
+    $steamPath = Get-SteamPath -Config $Config
+    Invoke-UiStartupMaintenance -Config $Config -SteamPath $steamPath
+
+    # A redirected stdin reads EOF at once, so the menu would see an endless
+    # stream of empty answers. Say why instead of looking like a crash.
+    if ([Console]::IsInputRedirected) {
+        Write-UiNotices
+        Write-UiLine
+        Write-UiStatus -Kind warn -Text "当前窗口无法交互输入（stdin 被重定向）。请双击 STEAMX 快捷方式，或单独打开一个 PowerShell 窗口运行。"
+        return
+    }
+
+    while ($true) {
+        Show-UiHome -Config $Config
+        $value = Read-UiPrompt -Hint "输入游戏名称、AppID 或商店链接入库，或输入上方数字选择功能" -PinBottom
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+
+        # if/elseif, not switch: "continue" inside a switch only leaves the switch.
+        if ($value -match '^(?i)(\?|？|h|help|帮助)$') { Show-UiHelp; continue }
+        if ($value -eq "1") { Invoke-UiDeploy -Config $Config; continue }
+        if ($value -match '^(?i)(0|u|uninstall)$') { Invoke-UiUninstall -Config $Config; continue }
+        if ($value -match '^\d$') {
+            Add-UiNotice -Kind warn -Text ("没有「{0}」这个选项。请输入游戏名称、AppID、商店链接，或菜单里的按键。" -f $value)
+            continue
+        }
+
+        # Anything else is a game: an AppID or store link goes straight in, any
+        # other text is searched by name. A link that is not a store link is
+        # rejected instead of being searched as a name.
+        if (-not (Test-SteamAppIdInput -InputValue $value)) {
+            if ($value -match '(?i)^https?://|steampowered\.com') {
+                try { [void](Resolve-SteamAppId -InputValue $value) } catch { Add-UiNotice -Kind error -Text $_.Exception.Message }
+                continue
+            }
+            Open-UiPage -Title "搜索游戏"
+            $value = Select-UiSteamGame -Term $value
+            if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        }
+        Invoke-UiAddGame -Config $Config -FirstInput $value
     }
 }
 
@@ -3805,14 +4705,14 @@ if ($MyInvocation.InvocationName -ne ".") {
         # real error plus the failing line, persist it to a file, then hold the
         # window open so the text can actually be read.
         Write-UiLine
-        Write-UiLog -Scope "steamx" -Level ERROR -Message $_.Exception.Message
+        Write-UiStatus -Kind error -Text ("出错了：" + $_.Exception.Message)
 
         try {
             if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) {
-                Write-UiLine -Text ("  at main.ps1 line {0}" -f $_.InvocationInfo.ScriptLineNumber) -ForegroundColor DarkGray
+                Write-UiLine -Text ("    位置：main.ps1 第 {0} 行" -f $_.InvocationInfo.ScriptLineNumber) -ForegroundColor DarkGray
                 $offending = ([string]$_.InvocationInfo.Line).Trim()
                 if (-not [string]::IsNullOrWhiteSpace($offending)) {
-                    Write-UiLine -Text ("  " + $offending) -ForegroundColor DarkGray
+                    Write-UiLine -Text ("    " + $offending) -ForegroundColor DarkGray
                 }
             }
         } catch {
@@ -3832,7 +4732,7 @@ if ($MyInvocation.InvocationName -ne ".") {
                 $_.ScriptStackTrace
             ) -join [Environment]::NewLine
             Set-Content -LiteralPath $errorLog -Value $detail -Encoding UTF8
-            Write-UiLine -Text ("  details written to: " + $errorLog) -ForegroundColor DarkGray
+            Write-UiLine -Text ("    详细信息已保存到：" + $errorLog) -ForegroundColor DarkGray
         } catch {
         }
 
