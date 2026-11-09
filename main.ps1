@@ -983,6 +983,9 @@ function Write-Log {
     }
 }
 
+# Tagline under the logo; update the game count here only.
+$script:UiTagline = "全网第1全，已支持 118,789 款游戏入库.."
+
 function Write-SteampXLogo {
     try {
         $host.UI.RawUI.WindowTitle = "✨ STEAMX"
@@ -1016,7 +1019,7 @@ function Write-SteampXLogo {
             Write-Host "STEAM" -NoNewline -ForegroundColor Cyan
             Write-Host "X" -ForegroundColor Green
         }
-        Write-UiLine -Text "  全网第1全，已支持 118,789 款游戏入库.." -ForegroundColor DarkGray
+        Write-UiLine -Text ("  " + $script:UiTagline) -ForegroundColor DarkGray
         Write-Host ""
         return
     }
@@ -1048,7 +1051,7 @@ function Write-SteampXLogo {
     }
 
     Write-Host ""
-    Write-Host ($logoIndent + "全网第1全，已支持 118,789 款游戏入库..") -ForegroundColor Gray
+    Write-Host ($logoIndent + $script:UiTagline) -ForegroundColor Gray
     Write-Host ""
 }
 
@@ -1377,12 +1380,35 @@ function Find-SteamStoreGames {
     $nameUrl = "https://store.steampowered.com/api/storesearch/?term={0}&l=schinese&cc=CN" -f $encoded
     $filterUrl = "https://store.steampowered.com/search/results/?term={0}&category1=998&hidef2p=1&ndl=1&json=1&l=schinese&cc=CN" -f $encoded
 
+    # Both requests run at once; one search waits for the slower call only.
     $named = $null
     $filtered = $null
     $nameError = $null
     $filterError = $null
-    try { $named = Invoke-RestMethod -Uri $nameUrl -Headers $headers -TimeoutSec $TimeoutSeconds } catch { $nameError = $_.Exception.Message }
-    try { $filtered = Invoke-RestMethod -Uri $filterUrl -Headers $headers -TimeoutSec $TimeoutSeconds } catch { $filterError = $_.Exception.Message }
+    $client = $null
+    try {
+        Add-Type -AssemblyName System.Net.Http
+        $client = New-Object System.Net.Http.HttpClient
+        $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+        $client.DefaultRequestHeaders.UserAgent.ParseAdd("STEAMX")
+        $nameTask = $client.GetStringAsync($nameUrl)
+        $filterTask = $client.GetStringAsync($filterUrl)
+        # WaitAll throws when either call failed; each task is read on its own below.
+        try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($nameTask, $filterTask), ($TimeoutSeconds + 2) * 1000) } catch { }
+        $read = {
+            param($Task)
+            if ($Task.Status -eq [Threading.Tasks.TaskStatus]::RanToCompletion) { return @{ Data = ($Task.Result | ConvertFrom-Json); Error = $null } }
+            $why = if ($Task.Exception) { $Task.Exception.GetBaseException().Message } else { [string]$Task.Status }
+            return @{ Data = $null; Error = $why }
+        }
+        try { $r = & $read $nameTask; $named = $r.Data; $nameError = $r.Error } catch { $nameError = $_.Exception.Message }
+        try { $r = & $read $filterTask; $filtered = $r.Data; $filterError = $r.Error } catch { $filterError = $_.Exception.Message }
+    } catch {
+        if ($null -eq $nameError) { $nameError = $_.Exception.Message }
+        if ($null -eq $filterError) { $filterError = $_.Exception.Message }
+    } finally {
+        if ($null -ne $client) { $client.Dispose() }
+    }
     if ($null -ne $nameError -and $null -ne $filterError) {
         throw ("连不上 Steam 商店，搜索失败：{0}" -f $nameError)
     }
