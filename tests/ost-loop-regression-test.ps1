@@ -12,12 +12,12 @@
 
   用真实函数（Get-OstKernelState / Get-OstLocalVersion）+ 真实文件系统。
 
-  运行： pwsh -File _analysis\ost-loop-regression-test.ps1
+  运行： pwsh -File tests\ost-loop-regression-test.ps1
 #>
 
 $ErrorActionPreference = 'Stop'
 
-$mainPath = 'D:\Dev\STEAMX Cli\main.ps1'
+$mainPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'main.ps1'
 $src = Get-Content $mainPath -Raw -Encoding UTF8
 
 function Get-FunctionSource([string]$Name) {

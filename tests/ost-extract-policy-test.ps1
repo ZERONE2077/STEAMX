@@ -9,13 +9,12 @@
 
   用真实函数（从 main.ps1 抽取）+ 真实 zip 文件。
 
-  运行： pwsh -File _analysis\ost-extract-policy-test.ps1
+  运行： pwsh -File tests\ost-extract-policy-test.ps1
 #>
 
 $ErrorActionPreference = 'Stop'
 
-$mainPath = 'D:\Dev\STEAMX Cli\main.ps1'
-if (-not (Test-Path $mainPath)) { $mainPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'main.ps1' }
+$mainPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'main.ps1'
 $src = Get-Content $mainPath -Raw -Encoding UTF8
 
 function Get-FunctionSource([string]$Name) {

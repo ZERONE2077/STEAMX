@@ -1,27 +1,12 @@
-.agents/
-.obsidian/
+# 运行时缓存（cache\opensteamtools 存放已校验的 OST 包）
 cache/
-logs/
+# docs：只留在本地（参考资料、归档、Hubcap 文档含其后台接口）。项目说明只有两份 README
 docs/
-test/
-.workbuddy/
-backups/
+# 本地游戏补丁，不上传
 patch/
-# 缓存中转服务已从 main.ps1 移除（客户端改为直连 Hubcap），源码只留在开发机上
-cache-service/
-# 清单包源：只留在开发机上，不上传仓库（31 个 zip 约 141MB）
+# 清单包源：只留在开发机上，不上传（31 个 zip 约 141MB）
 /manifest/
-# opensteamtool.toml 现在【被跟踪】：它是本项目发布给用户的配置，
-# main.ps1 通过 Get-OstTomlContent 从仓库下载它（首次部署且用户没有 toml 时）。
-# 不要加回忽略，否则下载路径 404、只能退回内嵌模板。
-# 注意：<Steam>/opensteamtool.toml 是运行时文件，部署流程只在用户【没有】它时才写。
-#
-# opensteamtool.example.toml 已删除（2026-10-15）：它从未被 main.ps1 引用，
-# 内容是 mmxlyo 时代的 3 源版（url=wudrm、旧超时），而且注释里的 manifest.lua
-# 示例写的是"wudrm 优先"，与 lua/manifest.lua 实际的 manifestdex 优先相反。
-# opensteamtool.toml 本身就是那份"示例"，不再需要第二个名字。
-# 需要旧内容：git show b5fd34a^:opensteamtool.example.toml
-# 沙箱文件权限修复的备份与报告（本机一次性产物，含权限回滚脚本）
-/.acl-recovery/
+# opensteamtool.toml 必须被跟踪：首次部署时 main.ps1 会从仓库下载它（Get-OstTomlContent），
+# 忽略掉会导致下载 404，只能退回内嵌模板。
 *.log
 *.tmp

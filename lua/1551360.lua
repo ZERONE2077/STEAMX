@@ -1,32 +1,30 @@
 -- 1551360's Lua and Manifest Created by Hubcap Manifest
 -- Forza Horizon 5
--- Created: February 17, 2026 at 12:25:06 EST
+-- Created: September 18, 2026 at 14:00:14 EDT
 -- Website: https://hubcapmanifest.com/
+-- Build: 21856128 (public branch)
+-- Build Date: February 09, 2026 at 16:59:16 EST (1770674356)
 -- Total Depots: 5
 -- Total DLCs: 56
 -- Shared Depots: 2
 
 -- MAIN APPLICATION
 addappid(1551360, 1, "c82fbc3ff45a4f2e66ad382e8c749e2e1a227555ad87298708d0d814e974b659") -- Forza Horizon 5
+addtoken(1551360, "7875698057602846803")
 -- MAIN APP DEPOTS
 addappid(1551361, 1, "13b42353469d4bb26905e2c12e73d4cd63ad89c21f438b3cf5b4b9a9bb659227") -- FH5 Content
-setManifestid(1551361, "7875698057602846803", 159159767186)
 -- SHARED DEPOTS (from other apps)
 addappid(228988, 1, "1845444d5e2cfd0ae65ae4a8fedb6e2fbf776fcc5b913ab4ac461bc9a74f8358") -- VC 2019 Redist (Shared from App 228980)
-setManifestid(228988, "6645201662696499616", 29212173)
 addappid(228990, 1, "44d8c45ce229a11c4f231a3d2a350eaf80b0d69a8af938ec7ccca720f694b0e8") -- DirectX Jun 2010 Redist (Shared from App 228980)
-setManifestid(228990, "1829726630299308803", 102931551)
 -- DLCS WITH DEDICATED DEPOTS
 -- Forza Horizon 5 Hot Wheels (AppID: 1613280)
 addappid(1613280)
 addtoken(1613280, "8093933008698055561")
 addappid(1613280, 1, "1cc274dec87bdc5651311f72c4c162f4067eafba2d8fb98cac6e3be307f5948a") -- Forza Horizon 5 Hot Wheels - DLC 1613280 Forza Horizon 5: Hot Wheels
-setManifestid(1613280, "1076978755699820847", 11498087812)
 -- Forza Horizon 5 Rally Adventure (AppID: 1613281)
 addappid(1613281)
 addtoken(1613281, "12349570259425034288")
 addappid(1613281, 1, "d371f628205489a48d2888a29f596b335963d189f3e822ec32978292e989483a") -- Forza Horizon 5 Rally Adventure - DLC 1613281 Forza Horizon 5 Rally Adventure
-setManifestid(1613281, "8702078743692499086", 19004582813)
 -- DLCS WITHOUT DEDICATED DEPOTS
 addappid(1613282) -- Forza Horizon 5 Formula Drift Pack
 addappid(1613283) -- Forza Horizon 5 VIP Membership

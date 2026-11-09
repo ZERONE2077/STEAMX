@@ -10,7 +10,7 @@
     - 被测函数从 main.ps1 原文抽取，不改写
     - 状态文件重定向到隔离临时目录（不碰真实 %LOCALAPPDATA%）
 
-  运行： pwsh -File _analysis\ost-latch-test.ps1
+  运行： pwsh -File tests\ost-latch-test.ps1
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -19,7 +19,6 @@ $ErrorActionPreference = 'Stop'
 # 测试床
 # ---------------------------------------------------------------------------
 $mainPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'main.ps1'
-if (-not (Test-Path $mainPath)) { $mainPath = 'D:\Dev\STEAMX Cli\main.ps1' }
 $src = Get-Content $mainPath -Raw -Encoding UTF8
 
 function Get-FunctionSource([string]$Name) {
