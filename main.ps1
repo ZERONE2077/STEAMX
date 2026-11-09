@@ -963,7 +963,7 @@ function Write-Log {
 
 function Write-SteampXLogo {
     try {
-        $host.UI.RawUI.WindowTitle = "STEAMX"
+        $host.UI.RawUI.WindowTitle = "✨ STEAMX"
     } catch {
     }
     Write-Host ""
