@@ -104,7 +104,7 @@ function Write-UiLine {
         return
     }
     if ($PSBoundParameters.ContainsKey("ForegroundColor") -and -not $env:NO_COLOR) {
-        Write-Host $Text -ForegroundColor $ForegroundColor
+        Write-UiText -Text $Text -Color ([string]$ForegroundColor)
     } else {
         Write-Host $Text
     }
@@ -406,6 +406,28 @@ function Write-UiColor {
     }
 }
 
+# ConsoleColor names that callers pass around (rows, fields, kernel state)
+# map onto the neon theme, so one screen never mixes console and neon hues.
+$script:UiThemeByName = @{
+    Green = "Green"; DarkGreen = "Green"
+    Cyan = "Blue"; DarkCyan = "Blue"; Blue = "Blue"
+    Yellow = "Gold"; DarkYellow = "Gold"
+    Red = "Red"; DarkRed = "Red"
+}
+
+function Write-UiText {
+    # Write-Host with a ConsoleColor name; theme hues become 24-bit neon.
+    param(
+        [AllowEmptyString()][string]$Text,
+        [string]$Color = "",
+        [switch]$NoNewline
+    )
+    if ([string]::IsNullOrWhiteSpace($Color)) { Write-Host $Text -NoNewline:$NoNewline; return }
+    $key = $script:UiThemeByName[$Color]
+    if ($key) { Write-UiColor -Text $Text -Rgb $script:UiTheme[$key] -Fallback $Color -NoNewline:$NoNewline }
+    else { Write-Host $Text -NoNewline:$NoNewline -ForegroundColor $Color }
+}
+
 $script:UiStatusStyle = @{
     ok    = @{ Mark = [string][char]0x221A; Color = "Green"; Rgb = $script:UiTheme.Green }
     warn  = @{ Mark = "!"; Color = "Yellow"; Rgb = $script:UiTheme.Gold }
@@ -518,14 +540,14 @@ function Write-UiPanel {
 
     & $border ("  " + [char]0x256D + $h) -NoNewline
     if ($accent) { Write-Host ($accent + $titleText + "$esc[0m") -NoNewline }
-    else { Write-Host $titleText -NoNewline -ForegroundColor $TitleColor }
+    else { Write-UiText -Text $titleText -Color $TitleColor -NoNewline }
     & $border (($h * [Math]::Max(0, $inner - 1 - $titleWidth)) + [char]0x256E)
     foreach ($row in $Rows) {
         $value = Format-UiFit -Text ([string]$row[1]) -Width $valueWidth
         $color = if ($row.Count -gt 2 -and -not [string]::IsNullOrWhiteSpace([string]$row[2])) { [string]$row[2] } else { "Gray" }
         & $border ("  " + $v + " ") -NoNewline
         Write-Host (Format-UiPad -Text ([string]$row[0]) -Width $LabelWidth) -NoNewline -ForegroundColor DarkGray
-        Write-Host (Format-UiPad -Text $value -Width ($inner - 1 - $LabelWidth)) -NoNewline -ForegroundColor $color
+        Write-UiText -Text (Format-UiPad -Text $value -Width ($inner - 1 - $LabelWidth)) -Color $color -NoNewline
         & $border $v
     }
     & $border ("  " + [char]0x2570 + ($h * $inner) + [char]0x256F)
@@ -553,7 +575,7 @@ function Write-UiField {
     if ([string]::IsNullOrWhiteSpace($Color) -or $env:NO_COLOR) {
         Write-Host $Value
     } else {
-        Write-Host $Value -ForegroundColor $Color
+        Write-UiText -Text $Value -Color $Color
     }
 }
 
@@ -4280,7 +4302,7 @@ function Write-UiHomeStatus {
     Write-UiField -Label "Steam" -Value ("{0}{1}" -f (Get-DisplayPath -PathValue $steamPath), $(if ($running) { "  · 运行中" } else { "  · 未运行" }))
     Write-Host ("  " + (Format-UiPad -Text "内核" -Width 8)) -NoNewline -ForegroundColor DarkGray
     Write-Host ($kernel.Text + "  ") -NoNewline
-    if ($env:NO_COLOR) { Write-Host $kernel.Tail } else { Write-Host $kernel.Tail -ForegroundColor $kernel.Color }
+    if ($env:NO_COLOR) { Write-Host $kernel.Tail } else { Write-UiText -Text $kernel.Tail -Color $kernel.Color }
     Write-UiField -Label "已入库" -Value ("{0} 个游戏" -f $luaCount)
 }
 
@@ -4435,7 +4457,7 @@ function Write-UiSearchTable {
         }
         Write-UiColor -Text ("  " + $key) -Rgb $script:UiTheme.Blue -Fallback Cyan -NoNewline
         Write-Host $name -NoNewline
-        Write-Host $price -NoNewline -ForegroundColor Yellow
+        Write-UiText -Text $price -Color Yellow -NoNewline
         Write-Host $id -NoNewline -ForegroundColor DarkGray
         if ($remark) { Write-UiColor -Text $remark -Rgb $script:UiTheme.Gold -Fallback Yellow } else { Write-Host "" }
     }
