@@ -2162,7 +2162,18 @@ function Get-SteamDenuvoMap {
         [int]$TimeoutSeconds = 8
     )
 
+    if ($null -eq $script:SteamDenuvoCache) { $script:SteamDenuvoCache = @{} }
     $map = @{}
+    $pendingIds = @()
+    foreach ($id in ($AppIds | Select-Object -Unique)) {
+        if ($script:SteamDenuvoCache.ContainsKey($id)) {
+            $map[$id] = $script:SteamDenuvoCache[$id]
+        } else {
+            $pendingIds += $id
+        }
+    }
+    if ($pendingIds.Count -eq 0) { return $map }
+
     $client = $null
     try {
         Add-Type -AssemblyName System.Net.Http
@@ -2170,11 +2181,11 @@ function Get-SteamDenuvoMap {
         $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
         $client.DefaultRequestHeaders.UserAgent.ParseAdd("STEAMX")
         $tasks = @{}
-        foreach ($id in ($AppIds | Select-Object -Unique)) {
+        foreach ($id in $pendingIds) {
             $tasks[$id] = $client.GetStringAsync(("https://store.steampowered.com/api/appdetails?appids={0}&l=schinese" -f $id))
         }
         # WaitAll throws when any call failed; the rest are still read below.
-        try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($tasks.Values), ($TimeoutSeconds + 2) * 1000) } catch { }
+        try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($tasks.Values), ($TimeoutSeconds * 1000) + 500) } catch { }
         foreach ($id in $tasks.Keys) {
             $task = $tasks[$id]
             if ($task.Status -ne [Threading.Tasks.TaskStatus]::RanToCompletion) {
@@ -2186,7 +2197,9 @@ function Get-SteamDenuvoMap {
                 $data = Get-ObjectPropertyValue -Object (Get-ObjectPropertyValue -Object $answer -Name $id) -Name "data"
                 if ($null -eq $data) { continue }
                 $notice = [string](Get-ObjectPropertyValue -Object $data -Name "drm_notice")
-                $map[$id] = ($notice -match '(?i)denuvo')
+                $hasDenuvo = ($notice -match '(?i)denuvo')
+                $map[$id] = $hasDenuvo
+                $script:SteamDenuvoCache[$id] = $hasDenuvo
             } catch {
                 Write-UiLog -Scope "drm" -Level WARN -Message ("appdetails {0} unreadable: {1}" -f $id, $_.Exception.Message)
             }
@@ -2204,7 +2217,7 @@ function Test-SteamDenuvoGame {
     # this only decides a reminder.
     param([Parameter(Mandatory = $true)][string]$AppId)
 
-    $map = Get-SteamDenuvoMap -AppIds @($AppId)
+    $map = Get-SteamDenuvoMap -AppIds @($AppId) -TimeoutSeconds 3
     return ($map.ContainsKey($AppId) -and $map[$AppId])
 }
 
