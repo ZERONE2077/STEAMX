@@ -189,7 +189,7 @@ function Read-UiInputBox {
     # window. Without cursor control (redirected stdin/stdout, no VT) or on any
     # drawing error, fall back to a plain "  > " prompt.
     # The prompt is written by hand: Read-Host -Prompt would append ": ".
-    param([string]$Title = "", [switch]$PinBottom)
+    param([string]$Title = "", [switch]$PinBottom, [switch]$AsSecureString)
 
     $canDraw = $false
     try {
@@ -221,7 +221,7 @@ function Read-UiInputBox {
 
             $boxTop = $raw.CursorPosition.Y - 3
             [Console]::SetCursorPosition(6, $boxTop + 1)
-            $answer = Read-Host
+            $answer = if ($AsSecureString) { Read-Host -AsSecureString } else { Read-Host }
             [Console]::SetCursorPosition(0, $boxTop + 3)
             return $answer
         } catch {
@@ -234,6 +234,7 @@ function Read-UiInputBox {
         Write-UiLine -Text ("  " + $Title) -ForegroundColor DarkGray
     }
     Write-Host "  > " -NoNewline
+    if ($AsSecureString) { return (Read-Host -AsSecureString) }
     return (Read-Host)
 }
 
@@ -1705,6 +1706,13 @@ function Save-HubcapApiKey {
         Set-Content -LiteralPath $CredentialFile -Encoding ASCII -NoNewline
 }
 
+function Format-CleanApiKey {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrEmpty($Value)) { return "" }
+    return [System.Text.RegularExpressions.Regex]::Replace($Value, '[\x00-\x1F\x7F\u200B-\u200D\uFEFF\s]+', '')
+}
+
 function Get-HubcapApiKey {
     param(
         [string]$ConfiguredApiKey,
@@ -1714,17 +1722,20 @@ function Get-HubcapApiKey {
 
     if (-not $ForcePrompt) {
         if (-not [string]::IsNullOrWhiteSpace($ConfiguredApiKey)) {
-            return $ConfiguredApiKey.Trim()
+            $cleaned = Format-CleanApiKey -Value $ConfiguredApiKey
+            if (-not [string]::IsNullOrWhiteSpace($cleaned)) { return $cleaned }
         }
         if (-not [string]::IsNullOrWhiteSpace($env:HUBCAP_API_KEY)) {
-            return $env:HUBCAP_API_KEY.Trim()
+            $cleaned = Format-CleanApiKey -Value $env:HUBCAP_API_KEY
+            if (-not [string]::IsNullOrWhiteSpace($cleaned)) { return $cleaned }
         }
         if (Test-Path -LiteralPath $CredentialFile -PathType Leaf) {
             try {
                 $encryptedValue = (Get-Content -LiteralPath $CredentialFile -Raw -Encoding ASCII).Trim()
                 if (-not [string]::IsNullOrWhiteSpace($encryptedValue)) {
                     $secureApiKey = $encryptedValue | ConvertTo-SecureString
-                    return (ConvertTo-PlainText -SecureValue $secureApiKey).Trim()
+                    $cleaned = Format-CleanApiKey -Value (ConvertTo-PlainText -SecureValue $secureApiKey)
+                    if (-not [string]::IsNullOrWhiteSpace($cleaned)) { return $cleaned }
                 }
             } catch {
                 Write-UiStatus -Kind warn -Text "已保存的密钥无法读取（可能换了 Windows 账户），需要重新输入。"
@@ -1733,26 +1744,26 @@ function Get-HubcapApiKey {
     }
 
     Write-UiLine
-    Write-UiStatus -Kind info -Text "入库需要管理员密钥（Hubcap API Key），只需输入一次，会加密保存在本机。"
-    Write-UiStatus -Kind dim -Text "输入时屏幕不显示字符，粘贴后直接回车即可。"
-    Write-Host "  > " -NoNewline
-    $promptedApiKey = Read-Host -AsSecureString
-    $plainApiKey = ConvertTo-PlainText -SecureValue $promptedApiKey
+    Write-UiStatus -Kind warn -Text "入库需要管理员 API Key 密钥，只需输入一次，会加密保存在本机。"
+    $promptedApiKey = Read-UiInputBox -Title "输入时屏幕不显示字符，粘贴后直接回车即可。" -AsSecureString
+    $plainApiKey = Format-CleanApiKey -Value (ConvertTo-PlainText -SecureValue $promptedApiKey)
     if ([string]::IsNullOrWhiteSpace($plainApiKey)) {
         throw "没有输入密钥，已取消。"
     }
 
-    Save-HubcapApiKey -SecureApiKey $promptedApiKey -CredentialFile $CredentialFile
+    $cleanSecureApiKey = ConvertTo-SecureString -String $plainApiKey -AsPlainText -Force
+    Save-HubcapApiKey -SecureApiKey $cleanSecureApiKey -CredentialFile $CredentialFile
     Write-UiStatus -Kind ok -Text "密钥已加密保存（仅当前 Windows 账户可读）。"
     Write-Log -Scope "hubcap" -Level SUCCESS -Message ("API Key saved -> {0}" -f (Get-DisplayPath -PathValue $CredentialFile)) -OnlyFile
-    return $plainApiKey.Trim()
+    return $plainApiKey
 }
 
 function Get-HubcapHeaders {
     param([Parameter(Mandatory = $true)][string]$ResolvedApiKey)
 
+    $cleanKey = Format-CleanApiKey -Value $ResolvedApiKey
     return @{
-        "Authorization" = "Bearer $ResolvedApiKey"
+        "Authorization" = "Bearer $cleanKey"
         "User-Agent"    = "STEAMX"
         "Accept"        = "*/*"
     }
