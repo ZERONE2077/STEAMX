@@ -1304,6 +1304,107 @@ function Test-SteamInstallPath {
     }
 }
 
+function Find-InstalledSteamPath {
+    $candidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Steam"),
+        (Join-Path $env:ProgramFiles "Steam")
+    )
+    foreach ($registryPath in @(
+        "HKCU:\Software\Valve\Steam",
+        "HKLM:\Software\WOW6432Node\Valve\Steam",
+        "HKLM:\Software\Valve\Steam"
+    )) {
+        if (-not (Test-Path $registryPath -ErrorAction SilentlyContinue)) { continue }
+        $item = Get-ItemProperty -Path $registryPath -ErrorAction SilentlyContinue
+        $steamPathValue = Get-ObjectPropertyValue -Object $item -Name "SteamPath"
+        $installPathValue = Get-ObjectPropertyValue -Object $item -Name "InstallPath"
+        if (-not [string]::IsNullOrWhiteSpace($steamPathValue)) { $candidates += $steamPathValue }
+        if (-not [string]::IsNullOrWhiteSpace($installPathValue)) { $candidates += $installPathValue }
+    }
+
+    foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        $candidatePath = ([string]$candidate).Trim().Trim('"')
+        if (Test-SteamInstallPath -PathValue $candidatePath) {
+            return [System.IO.Path]::GetFullPath($candidatePath)
+        }
+    }
+    return ""
+}
+
+function Install-SteamToDefaultLocation {
+    $wingetCmd = Get-Command winget -ErrorAction SilentlyContinue
+    if ($null -ne $wingetCmd) {
+        Write-UiStatus -Kind info -Text "正在通过 winget 安装 Steam 到默认位置..."
+        $prevEap = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            & $wingetCmd.Source install --id Valve.Steam -e --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+            $wingetExit = $LASTEXITCODE
+        } catch {
+            $wingetExit = 1
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+        if ($wingetExit -eq 0) {
+            $installed = Find-InstalledSteamPath
+            if (-not [string]::IsNullOrWhiteSpace($installed)) {
+                Write-UiStatus -Kind ok -Text ("Steam 安装完成：" + $installed)
+                return $installed
+            }
+        }
+        Write-UiStatus -Kind warn -Text "winget 未能完成安装，改用官方安装程序..."
+    }
+
+    $urls = if ((Get-NetworkRegion) -eq "CN") {
+        @(
+            "https://media.st.dl.eccdnx.com/client/installer/SteamSetup.exe",
+            "https://cdn.fastly.steamstatic.com/client/installer/SteamSetup.exe"
+        )
+    } else {
+        @(
+            "https://cdn.fastly.steamstatic.com/client/installer/SteamSetup.exe",
+            "https://media.st.dl.eccdnx.com/client/installer/SteamSetup.exe"
+        )
+    }
+
+    $setupPath = Join-Path $env:TEMP ("STEAMX-SteamSetup-{0}.exe" -f [Guid]::NewGuid().ToString("N").Substring(0, 8))
+    $downloaded = $false
+    $downloadErrors = @()
+    try {
+        foreach ($url in $urls) {
+            try {
+                Invoke-DownloadFileWithProgress -Url $url -Destination $setupPath -TimeoutSeconds 60 -ProgressLabel "下载 Steam 安装程序" -ProgressFrom 0 -ProgressTo 80
+                if ((Test-Path -LiteralPath $setupPath -PathType Leaf) -and ((Get-Item -LiteralPath $setupPath).Length -gt 0)) {
+                    $downloaded = $true
+                    break
+                }
+            } catch {
+                $downloadErrors += ("{0}: {1}" -f $url, $_.Exception.Message)
+            }
+        }
+        Write-UiProgress -Complete -Status "下载完成"
+        if (-not $downloaded) {
+            throw ("下载 Steam 安装程序失败：{0}" -f ($downloadErrors -join "; "))
+        }
+
+        Write-UiStatus -Kind info -Text "正在静默安装 Steam 到默认位置（如弹出权限确认请点击「是」）..."
+        $proc = Start-Process -FilePath $setupPath -ArgumentList "/S" -Verb RunAs -Wait -PassThru
+        if ($null -ne $proc -and $proc.ExitCode -ne 0) {
+            throw ("Steam 安装程序退出码异常：{0}" -f $proc.ExitCode)
+        }
+    } finally {
+        Remove-Item -LiteralPath $setupPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $installedPath = Find-InstalledSteamPath
+    if (-not [string]::IsNullOrWhiteSpace($installedPath)) {
+        Write-UiStatus -Kind ok -Text ("Steam 安装完成：" + $installedPath)
+        return $installedPath
+    }
+
+    throw "Steam 安装程序已执行，但未在默认目录找到 steam.exe。"
+}
+
 function Get-SteamPath {
     param([pscustomobject]$Config)
 
@@ -1379,7 +1480,46 @@ function Get-SteamPath {
     }
 
     Write-UiStatus -Kind warn -Text "没有自动找到 Steam。"
-    $enteredPath = (Read-UiPrompt -Hint "请输入 steam.exe 所在的文件夹（可直接把文件夹拖进窗口），直接回车取消").Trim('"')
+    Write-UiLine -Text "  [1] 自动安装 Steam 到默认位置（C:\Program Files (x86)\Steam）"
+    Write-UiLine -Text "  [2] 打开 Steam 官方下载页面自行安装"
+    Write-UiLine -Text "  [直接输入/拖入] 已有 Steam 时，输入或拖入 steam.exe 所在文件夹"
+    $choice = (Read-UiPrompt -Hint "请选择 [1/2]，或直接输入路径（回车取消）").Trim().Trim('"')
+
+    if ($choice -eq "1") {
+        $installedPath = Install-SteamToDefaultLocation
+        $script:SteamPathCache = $installedPath
+        return $script:SteamPathCache
+    }
+
+    if ($choice -eq "2") {
+        try {
+            Start-Process "https://store.steampowered.com/about/" | Out-Null
+            Write-UiStatus -Kind info -Text "已在浏览器打开 Steam 官方下载页面，请完成安装。"
+        } catch {
+            Write-UiStatus -Kind warn -Text "无法自动打开浏览器，请手动访问：https://store.steampowered.com/about/"
+        }
+        $afterInstall = (Read-UiPrompt -Hint "安装完成后按回车重新检测，或输入 Steam 文件夹路径（输入 q 取消）").Trim().Trim('"')
+        if ($afterInstall -ne "q" -and $afterInstall -ne "Q") {
+            if ([string]::IsNullOrWhiteSpace($afterInstall)) {
+                $detected = Find-InstalledSteamPath
+                if (-not [string]::IsNullOrWhiteSpace($detected)) {
+                    $script:SteamPathCache = $detected
+                    return $script:SteamPathCache
+                }
+            } else {
+                if ($afterInstall.EndsWith("steam.exe", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $afterInstall = Split-Path -Parent $afterInstall
+                }
+                if (Test-SteamInstallPath -PathValue $afterInstall) {
+                    $script:SteamPathCache = [System.IO.Path]::GetFullPath($afterInstall)
+                    return $script:SteamPathCache
+                }
+            }
+        }
+        throw "找不到 Steam。请确认已安装 Steam，或把 steam.exe 所在文件夹设到环境变量 STEAM_PATH 后重试。"
+    }
+
+    $enteredPath = $choice
     if ($enteredPath.EndsWith("steam.exe", [System.StringComparison]::OrdinalIgnoreCase)) {
         $enteredPath = Split-Path -Parent $enteredPath
     }
