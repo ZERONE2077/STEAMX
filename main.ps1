@@ -1482,8 +1482,7 @@ function Get-SteamPath {
     Write-UiStatus -Kind warn -Text "没有自动找到 Steam。"
     Write-UiLine -Text "  [1] 自动安装 Steam 到默认位置（C:\Program Files (x86)\Steam）"
     Write-UiLine -Text "  [2] 打开 Steam 官方下载页面自行安装"
-    Write-UiLine -Text "  [直接输入/拖入] 已有 Steam 时，输入或拖入 steam.exe 所在文件夹"
-    $choice = (Read-UiPrompt -Hint "请选择 [1/2]，或直接输入路径（回车取消）").Trim().Trim('"')
+    $choice = (Read-UiPrompt -Hint "请选择 [1/2]（直接回车取消）").Trim()
 
     if ($choice -eq "1") {
         $installedPath = Install-SteamToDefaultLocation
@@ -1498,37 +1497,18 @@ function Get-SteamPath {
         } catch {
             Write-UiStatus -Kind warn -Text "无法自动打开浏览器，请手动访问：https://store.steampowered.com/about/"
         }
-        $afterInstall = (Read-UiPrompt -Hint "安装完成后按回车重新检测，或输入 Steam 文件夹路径（输入 q 取消）").Trim().Trim('"')
+        $afterInstall = (Read-UiPrompt -Hint "安装完成后按回车重新检测（输入 q 取消）").Trim()
         if ($afterInstall -ne "q" -and $afterInstall -ne "Q") {
-            if ([string]::IsNullOrWhiteSpace($afterInstall)) {
-                $detected = Find-InstalledSteamPath
-                if (-not [string]::IsNullOrWhiteSpace($detected)) {
-                    $script:SteamPathCache = $detected
-                    return $script:SteamPathCache
-                }
-            } else {
-                if ($afterInstall.EndsWith("steam.exe", [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $afterInstall = Split-Path -Parent $afterInstall
-                }
-                if (Test-SteamInstallPath -PathValue $afterInstall) {
-                    $script:SteamPathCache = [System.IO.Path]::GetFullPath($afterInstall)
-                    return $script:SteamPathCache
-                }
+            $detected = Find-InstalledSteamPath
+            if (-not [string]::IsNullOrWhiteSpace($detected)) {
+                $script:SteamPathCache = $detected
+                return $script:SteamPathCache
             }
         }
-        throw "找不到 Steam。请确认已安装 Steam，或把 steam.exe 所在文件夹设到环境变量 STEAM_PATH 后重试。"
+        throw "找不到 Steam。请确认已安装 Steam 后重试。"
     }
 
-    $enteredPath = $choice
-    if ($enteredPath.EndsWith("steam.exe", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $enteredPath = Split-Path -Parent $enteredPath
-    }
-    if (Test-SteamInstallPath -PathValue $enteredPath) {
-        $script:SteamPathCache = [System.IO.Path]::GetFullPath($enteredPath)
-        return $script:SteamPathCache
-    }
-
-    throw "找不到 Steam。请确认已安装 Steam，或把 steam.exe 所在文件夹设到环境变量 STEAM_PATH 后重试。"
+    throw "找不到 Steam。请确认已安装 Steam 后重试。"
 }
 
 function Resolve-SteamAppId {
