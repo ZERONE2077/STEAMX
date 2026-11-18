@@ -1155,27 +1155,11 @@ function Get-LatestOstRelease {
         return $script:OstReleaseCache[$repo]
     }
 
-    # Both tiers below are cheap metadata reads, so a transport-level failure is worth
-    # retrying before it reaches the user: this runs on every launch, and a single
-    # dropped socket used to abort startup with the raw WebException text. Only the
-    # transport failures are retried - a real 404 (repo or release gone) is final.
-    $maxAttempts = 3
-    $lastError = $null
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        try {
-            return Get-LatestOstReleaseOnce -Config $Config -OstConfig $ostConfig -Repo $repo -TimeoutSeconds $timeoutSeconds
-        } catch {
-            $lastError = $_
-            $retryable = if ($null -ne $lastError.Exception) {
-                (Test-HubcapRetryableError -ErrorRecord $lastError)
-            } else {
-                $false
-            }
-            if ((-not $retryable) -or ($attempt -ge $maxAttempts)) { break }
-            Start-Sleep -Seconds (2 * $attempt)
-        }
-    }
-    throw $lastError
+    # Get-LatestOstReleaseOnce already sweeps all configured mirrors plus the
+    # official host across both the API and web-redirect tiers, so a single pass
+    # is already multi-source; repeating the whole sweep on an offline machine
+    # would multiply timeouts unnecessarily.
+    return Get-LatestOstReleaseOnce -Config $Config -OstConfig $ostConfig -Repo $repo -TimeoutSeconds $timeoutSeconds
 }
 
 function Get-GitHubMirrorUrls {
@@ -1228,8 +1212,8 @@ function Get-LatestOstReleaseOnce {
 
     $repo = $Repo
     $ostConfig = $OstConfig
-    $timeoutSeconds = [Math]::Min($TimeoutSeconds, 10)
-    if ($timeoutSeconds -lt 1) { $timeoutSeconds = 10 }
+    $timeoutSeconds = [Math]::Min($TimeoutSeconds, 6)
+    if ($timeoutSeconds -lt 1) { $timeoutSeconds = 6 }
 
     $apiUrl = "https://api.github.com/repos/{0}/releases/latest" -f $repo
     $apiUrls = @(Get-GitHubMirrorUrls -OstConfig $ostConfig -OfficialUrl $apiUrl)
@@ -1249,7 +1233,13 @@ function Get-LatestOstReleaseOnce {
             $apiErrors += (Get-HttpErrorDetail -ErrorRecord $_)
         }
     }
-    $apiError = if ($apiErrors.Count -gt 0) { $apiErrors[0] } else { "Unknown error" }
+    $apiError = if ($apiErrors.Count -gt 1) {
+        "tried {0} sources; first error: {1}" -f $apiErrors.Count, $apiErrors[0]
+    } elseif ($apiErrors.Count -eq 1) {
+        $apiErrors[0]
+    } else {
+        "Unknown error"
+    }
 
     $latestUrl = "https://github.com/{0}/releases/latest" -f $repo
     $webUrls = @(Get-GitHubMirrorUrls -OstConfig $ostConfig -OfficialUrl $latestUrl)
@@ -1290,7 +1280,13 @@ function Get-LatestOstReleaseOnce {
             if ($null -ne $response) { $response.Dispose() }
         }
     }
-    $fallbackError = if ($fallbackErrors.Count -gt 0) { $fallbackErrors[0] } else { "Unknown error" }
+    $fallbackError = if ($fallbackErrors.Count -gt 1) {
+        "tried {0} sources; first error: {1}" -f $fallbackErrors.Count, $fallbackErrors[0]
+    } elseif ($fallbackErrors.Count -eq 1) {
+        $fallbackErrors[0]
+    } else {
+        "Unknown error"
+    }
     throw ("Unable to fetch the latest OST release. GitHub API: {0}. GitHub web fallback: {1}" -f $apiError, $fallbackError)
 }
 
@@ -1307,10 +1303,18 @@ function Test-SteamInstallPath {
 }
 
 function Find-InstalledSteamPath {
-    $candidates = @(
-        (Join-Path ${env:ProgramFiles(x86)} "Steam"),
-        (Join-Path $env:ProgramFiles "Steam")
-    )
+    $candidates = @()
+
+    foreach ($process in @(Get-Process -Name "steam" -ErrorAction SilentlyContinue)) {
+        try {
+            if (-not [string]::IsNullOrWhiteSpace([string]$process.Path)) {
+                $candidates += Split-Path -Parent ([string]$process.Path)
+            }
+        } catch {
+            continue
+        }
+    }
+
     foreach ($registryPath in @(
         "HKCU:\Software\Valve\Steam",
         "HKLM:\Software\WOW6432Node\Valve\Steam",
@@ -1320,8 +1324,38 @@ function Find-InstalledSteamPath {
         $item = Get-ItemProperty -Path $registryPath -ErrorAction SilentlyContinue
         $steamPathValue = Get-ObjectPropertyValue -Object $item -Name "SteamPath"
         $installPathValue = Get-ObjectPropertyValue -Object $item -Name "InstallPath"
+        $steamExeValue = Get-ObjectPropertyValue -Object $item -Name "SteamExe"
         if (-not [string]::IsNullOrWhiteSpace($steamPathValue)) { $candidates += $steamPathValue }
         if (-not [string]::IsNullOrWhiteSpace($installPathValue)) { $candidates += $installPathValue }
+        if (-not [string]::IsNullOrWhiteSpace($steamExeValue)) {
+            $candidates += Split-Path -Parent ([string]$steamExeValue)
+        }
+    }
+
+    foreach ($registryPath in @(
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\steam.exe",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\steam.exe",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\steam.exe"
+    )) {
+        if (-not (Test-Path $registryPath -ErrorAction SilentlyContinue)) { continue }
+        try {
+            $steamExe = [string](Get-Item -Path $registryPath -ErrorAction Stop).GetValue("")
+            if (-not [string]::IsNullOrWhiteSpace($steamExe)) {
+                $candidates += Split-Path -Parent $steamExe.Trim('"')
+            }
+        } catch {
+            continue
+        }
+    }
+
+    foreach ($drive in @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+        $root = [string]$drive.Root
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
+        $candidates += @(
+            [System.IO.Path]::Combine($root, "Steam"),
+            [System.IO.Path]::Combine($root, "Program Files (x86)", "Steam"),
+            [System.IO.Path]::Combine($root, "Program Files", "Steam")
+        )
     }
 
     foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
@@ -1384,10 +1418,11 @@ function Install-SteamToDefaultLocation {
                 $downloadErrors += ("{0}: {1}" -f $url, $_.Exception.Message)
             }
         }
-        Write-UiProgress -Complete -Status "下载完成"
         if (-not $downloaded) {
+            Clear-UiProgressLine
             throw ("下载 Steam 安装程序失败：{0}" -f ($downloadErrors -join "; "))
         }
+        Write-UiProgress -Complete -Status "下载完成"
 
         Write-UiStatus -Kind info -Text "正在静默安装 Steam 到默认位置（如弹出权限确认请点击「是」）..."
         $proc = Start-Process -FilePath $setupPath -ArgumentList "/S" -Verb RunAs -Wait -PassThru
@@ -1746,7 +1781,10 @@ function Get-HubcapApiKey {
 
     Write-UiLine
     Write-UiStatus -Kind warn -Text "入库需要管理员 API Key 密钥，只需输入一次，会加密保存在本机。"
-    $promptedApiKey = Read-UiInputBox -Title "输入时屏幕不显示字符，粘贴后直接回车即可。" -AsSecureString
+    $promptedApiKey = Read-UiInputBox -Title "粘贴或输入密钥后直接回车即可（输入内容会隐藏显示）。" -AsSecureString
+    if ($null -eq $promptedApiKey) {
+        throw "没有输入密钥，已取消。"
+    }
     $plainApiKey = Format-CleanApiKey -Value (ConvertTo-PlainText -SecureValue $promptedApiKey)
     if ([string]::IsNullOrWhiteSpace($plainApiKey)) {
         throw "没有输入密钥，已取消。"
