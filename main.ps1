@@ -29,6 +29,7 @@ $utf8Encoding = New-Object System.Text.UTF8Encoding $false
 $OutputEncoding = $utf8Encoding
 $script:OstReleaseCache = @{}
 $script:SteamPathCache = ""
+$script:SteamDenuvoCache = @{}
 $script:NetworkRegionCache = ""
 $script:UiProgressActive = $false
 # Screen log gate. By default the console shows ONLY the progress bar during a
@@ -2162,7 +2163,7 @@ function Get-SteamDenuvoMap {
         [int]$TimeoutSeconds = 8
     )
 
-    if ($null -eq $script:SteamDenuvoCache) { $script:SteamDenuvoCache = @{} }
+    if (-not (Get-Variable -Name SteamDenuvoCache -Scope Script -ErrorAction SilentlyContinue)) { $script:SteamDenuvoCache = @{} }
     $map = @{}
     $pendingIds = @()
     foreach ($id in ($AppIds | Select-Object -Unique)) {
