@@ -863,6 +863,21 @@ function New-DefaultConfig {
             autoCloseSteam              = $true
             restartSteamAfterDeploy     = $true
         }
+        # CloudRedirect: Steam Cloud saves for lua games. Deployed alongside the
+        # kernel and loaded by OST through [cloud] in opensteamtool.toml. Same
+        # author as the OST fork above, so the two builds agree on the CR_* API.
+        # It is MIT licensed; the bytes are fetched and SHA-256 checked like OST.
+        cloud      = [pscustomobject]@{
+            enabled    = $true
+            githubRepo = "huanyuejue/CloudRedirect"
+            assetName  = "cloud_redirect.dll"
+            # Where saves sync to when the user has no CloudRedirect config yet:
+            # CloudRedirect's own local-folder name ("localcloud", which its app
+            # puts under the Steam dir), placed under Documents instead. Windows
+            # moves Documents into OneDrive when OneDrive folder backup is on, so
+            # saves follow OneDrive there and stay under the user profile otherwise.
+            syncFolder = "localcloud"
+        }
     }
 }
 
@@ -1161,6 +1176,46 @@ function Get-LatestOstRelease {
     throw $lastError
 }
 
+function Get-GitHubMirrorUrls {
+    param(
+        [AllowNull()]$OstConfig,
+        [Parameter(Mandatory = $true)][string]$OfficialUrl
+    )
+
+    $defaultTemplates = @(
+        "{official}",
+        "https://gh-proxy.com/{official}",
+        "https://gh.monlor.com/{official}",
+        "https://hk.gh-proxy.com/{official}",
+        "https://gh.nxnow.top/{official}",
+        "https://ghproxy.net/{official}",
+        "https://ghfast.top/{official}"
+    )
+    $templates = @(Get-ConfigValue -Object $OstConfig -Name "downloadUrlTemplates" -DefaultValue $defaultTemplates)
+    $urls = @()
+    foreach ($template in $templates) {
+        $templateText = [string]$template
+        if ([string]::IsNullOrWhiteSpace($templateText)) { continue }
+        if ($templateText -notlike "*{official}*") { continue }
+        $url = $templateText.Replace("{official}", $OfficialUrl)
+        if ($url -notin $urls) { $urls += $url }
+    }
+    if ($OfficialUrl -notin $urls) { $urls += $OfficialUrl }
+
+    $networkRegion = Get-NetworkRegion
+    if ($networkRegion -eq "CN") {
+        return @(
+            @($urls | Where-Object { $_ -ne $OfficialUrl })
+            $OfficialUrl
+        )
+    }
+
+    return @(
+        $OfficialUrl
+        @($urls | Where-Object { $_ -ne $OfficialUrl })
+    )
+}
+
 function Get-LatestOstReleaseOnce {
     param(
         [Parameter(Mandatory = $true)][pscustomobject]$Config,
@@ -1171,52 +1226,70 @@ function Get-LatestOstReleaseOnce {
 
     $repo = $Repo
     $ostConfig = $OstConfig
-    $timeoutSeconds = $TimeoutSeconds
+    $timeoutSeconds = [Math]::Min($TimeoutSeconds, 10)
+    if ($timeoutSeconds -lt 1) { $timeoutSeconds = 10 }
 
     $apiUrl = "https://api.github.com/repos/{0}/releases/latest" -f $repo
-    try {
-        $release = Invoke-RestMethod -Uri $apiUrl -Headers (Get-GitHubHeaders) -TimeoutSec $timeoutSeconds
-        $script:OstReleaseCache[$repo] = $release
-        return $release
-    } catch {
-        $apiError = Get-HttpErrorDetail -ErrorRecord $_
+    $apiUrls = @(Get-GitHubMirrorUrls -OstConfig $ostConfig -OfficialUrl $apiUrl)
+    $apiErrors = @()
+    foreach ($candidateApiUrl in $apiUrls) {
+        try {
+            $release = Invoke-RestMethod -Uri $candidateApiUrl -Headers (Get-GitHubHeaders) -TimeoutSec $timeoutSeconds
+            if ($null -ne $release -and
+                $null -ne $release.PSObject.Properties["tag_name"] -and
+                -not [string]::IsNullOrWhiteSpace([string]$release.tag_name) -and
+                $null -ne $release.PSObject.Properties["assets"]) {
+                $script:OstReleaseCache[$repo] = $release
+                return $release
+            }
+            $apiErrors += ("{0}: Invalid release payload" -f $candidateApiUrl)
+        } catch {
+            $apiErrors += (Get-HttpErrorDetail -ErrorRecord $_)
+        }
     }
+    $apiError = if ($apiErrors.Count -gt 0) { $apiErrors[0] } else { "Unknown error" }
 
     $latestUrl = "https://github.com/{0}/releases/latest" -f $repo
-    $request = [System.Net.HttpWebRequest]::Create($latestUrl)
-    $request.UserAgent = "STEAMX"
-    $request.AllowAutoRedirect = $true
-    $request.Timeout = $timeoutSeconds * 1000
-    $request.ReadWriteTimeout = $timeoutSeconds * 1000
-    $response = $null
-    try {
-        $response = $request.GetResponse()
-        $finalUrl = [string]$response.ResponseUri.AbsoluteUri
-        if ($finalUrl -notmatch '/releases/tag/([^/?#]+)') {
-            throw "GitHub latest release redirect did not contain a tag."
+    $webUrls = @(Get-GitHubMirrorUrls -OstConfig $ostConfig -OfficialUrl $latestUrl)
+    $fallbackErrors = @()
+    foreach ($candidateWebUrl in $webUrls) {
+        $request = [System.Net.HttpWebRequest]::Create($candidateWebUrl)
+        $request.UserAgent = "STEAMX"
+        $request.AllowAutoRedirect = $true
+        $request.Timeout = $timeoutSeconds * 1000
+        $request.ReadWriteTimeout = $timeoutSeconds * 1000
+        $response = $null
+        try {
+            $response = $request.GetResponse()
+            $finalUrl = [string]$response.ResponseUri.AbsoluteUri
+            if ($finalUrl -notmatch '/releases/tag/([^/?#]+)') {
+                $fallbackErrors += ("{0}: GitHub latest release redirect did not contain a tag." -f $candidateWebUrl)
+                continue
+            }
+            $tagName = [Uri]::UnescapeDataString($Matches[1])
+            $assetNameTemplate = [string](Get-ConfigValue -Object $ostConfig -Name "assetNameTemplate" -DefaultValue "OpenSteamTool-{tag}-Release.zip")
+            $assetName = $assetNameTemplate.Replace("{tag}", $tagName)
+            $assetUrl = "https://github.com/{0}/releases/download/{1}/{2}" -f $repo, ([Uri]::EscapeDataString($tagName)), ([Uri]::EscapeDataString($assetName))
+            $release = [pscustomobject]@{
+                tag_name     = $tagName
+                published_at = ""
+                assets       = @(
+                    [pscustomobject]@{
+                        name                 = $assetName
+                        browser_download_url = $assetUrl
+                    }
+                )
+            }
+            $script:OstReleaseCache[$repo] = $release
+            return $release
+        } catch {
+            $fallbackErrors += $_.Exception.Message
+        } finally {
+            if ($null -ne $response) { $response.Dispose() }
         }
-        $tagName = [Uri]::UnescapeDataString($Matches[1])
-        $assetNameTemplate = [string](Get-ConfigValue -Object $ostConfig -Name "assetNameTemplate" -DefaultValue "OpenSteamTool-{tag}-Release.zip")
-        $assetName = $assetNameTemplate.Replace("{tag}", $tagName)
-        $assetUrl = "https://github.com/{0}/releases/download/{1}/{2}" -f $repo, ([Uri]::EscapeDataString($tagName)), ([Uri]::EscapeDataString($assetName))
-        $release = [pscustomobject]@{
-            tag_name     = $tagName
-            published_at = ""
-            assets       = @(
-                [pscustomobject]@{
-                    name                 = $assetName
-                    browser_download_url = $assetUrl
-                }
-            )
-        }
-        $script:OstReleaseCache[$repo] = $release
-        return $release
-    } catch {
-        $fallbackError = $_.Exception.Message
-        throw ("Unable to fetch the latest OST release. GitHub API: {0}. GitHub web fallback: {1}" -f $apiError, $fallbackError)
-    } finally {
-        if ($null -ne $response) { $response.Dispose() }
     }
+    $fallbackError = if ($fallbackErrors.Count -gt 0) { $fallbackErrors[0] } else { "Unknown error" }
+    throw ("Unable to fetch the latest OST release. GitHub API: {0}. GitHub web fallback: {1}" -f $apiError, $fallbackError)
 }
 
 function Test-SteamInstallPath {
@@ -2906,9 +2979,13 @@ function Invoke-DownloadFileWithProgress {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$Destination,
-        [int]$TimeoutSeconds = 30
+        [int]$TimeoutSeconds = 30,
+        [string]$ProgressLabel = "下载核心",
+        [int]$ProgressFrom = 0,
+        [int]$ProgressTo = 20
     )
 
+    $progressSpan = $ProgressTo - $ProgressFrom
     $request = [System.Net.HttpWebRequest]::Create($Url)
     $request.UserAgent = "STEAMX"
     $request.Accept = "application/octet-stream"
@@ -2935,13 +3012,13 @@ function Invoke-DownloadFileWithProgress {
                 $percent = 0
                 $status = "已下载 {0}" -f (Format-FileSize $downloaded)
             }
-            Write-UiProgress -Percent ([int]($percent * 0.2)) -Status ("下载核心 " + $status)
+            Write-UiProgress -Percent ($ProgressFrom + [int]($percent * $progressSpan / 100)) -Status ($ProgressLabel + " " + $status)
         }
     } finally {
         if ($null -ne $fileStream) { $fileStream.Dispose() }
         if ($null -ne $responseStream) { $responseStream.Dispose() }
         if ($null -ne $response) { $response.Dispose() }
-        Write-UiProgress -Percent 20 -Status "下载核心"
+        Write-UiProgress -Percent $ProgressTo -Status $ProgressLabel
     }
 }
 
@@ -3578,6 +3655,214 @@ function Set-OstManifestSourceInToml {
     return $true
 }
 
+function Get-CloudRedirectRelease {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$AssetName,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [AllowNull()]$OstConfig = $null
+    )
+
+    $timeoutSec = [Math]::Min($TimeoutSeconds, 10)
+    if ($timeoutSec -lt 1) { $timeoutSec = 10 }
+
+    # Same two tiers as the OST lookup: the API carries the SHA-256 digest; the
+    # web redirect only yields the tag, and Assert-OstDownloadSha256 then falls
+    # back to comparing a mirror download against the official asset.
+    $apiUrl = "https://api.github.com/repos/{0}/releases/latest" -f $Repo
+    $apiUrls = @(Get-GitHubMirrorUrls -OstConfig $OstConfig -OfficialUrl $apiUrl)
+    foreach ($candidateApiUrl in $apiUrls) {
+        try {
+            $release = Invoke-RestMethod -Uri $candidateApiUrl -Headers (Get-GitHubHeaders) -TimeoutSec $timeoutSec
+            if ($null -ne $release -and
+                $null -ne $release.PSObject.Properties["tag_name"] -and
+                -not [string]::IsNullOrWhiteSpace([string]$release.tag_name)) {
+                $asset = @($release.assets) | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+                if ($null -ne $asset) {
+                    return [pscustomobject]@{
+                        Tag         = [string]$release.tag_name
+                        OfficialUrl = [string]$asset.browser_download_url
+                        Sha256      = Get-Sha256FromAssetDigest -Asset $asset
+                    }
+                }
+            }
+        } catch {
+        }
+    }
+
+    $latestUrl = "https://github.com/{0}/releases/latest" -f $Repo
+    $webUrls = @(Get-GitHubMirrorUrls -OstConfig $OstConfig -OfficialUrl $latestUrl)
+    foreach ($candidateWebUrl in $webUrls) {
+        $request = [System.Net.HttpWebRequest]::Create($candidateWebUrl)
+        $request.UserAgent = "STEAMX"
+        $request.AllowAutoRedirect = $true
+        $request.Timeout = $timeoutSec * 1000
+        $request.ReadWriteTimeout = $timeoutSec * 1000
+        $response = $null
+        try {
+            $response = $request.GetResponse()
+            if ([string]$response.ResponseUri.AbsoluteUri -match '/releases/tag/([^/?#]+)') {
+                $tag = [Uri]::UnescapeDataString($Matches[1])
+                return [pscustomobject]@{
+                    Tag         = $tag
+                    OfficialUrl = "https://github.com/{0}/releases/download/{1}/{2}" -f $Repo, ([Uri]::EscapeDataString($tag)), $AssetName
+                    Sha256      = ""
+                }
+            }
+        } catch {
+        } finally {
+            if ($null -ne $response) { $response.Dispose() }
+        }
+    }
+    throw "GitHub latest release redirect did not contain a tag."
+}
+
+function Get-CloudRedirectDll {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject]$Config,
+        [Parameter(Mandatory = $true)][pscustomobject]$RunContext
+    )
+
+    # Downloads and verifies the latest cloud_redirect.dll into the transaction
+    # dir. Returns the staged file, or $null on any failure: cloud saves are an
+    # extra, so a GitHub/mirror outage here must not cost the user the kernel.
+    # Nothing in the Steam directory is touched by this function.
+    $cloudConfig = Get-ConfigValue -Object $Config -Name "cloud" -DefaultValue $null
+    $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
+    $networkConfig = Get-ConfigValue -Object $Config -Name "network" -DefaultValue $null
+    $repo = [string](Get-ConfigValue -Object $cloudConfig -Name "githubRepo" -DefaultValue "huanyuejue/CloudRedirect")
+    $assetName = [string](Get-ConfigValue -Object $cloudConfig -Name "assetName" -DefaultValue "cloud_redirect.dll")
+    $timeoutSeconds = [int](Get-ConfigValue -Object $networkConfig -Name "timeoutSeconds" -DefaultValue 30)
+    $stagedPath = Join-Path $RunContext.TransactionDir $assetName
+    $partialPath = "$stagedPath.partial"
+
+    try {
+        $release = Get-CloudRedirectRelease -Repo $repo -AssetName $assetName -TimeoutSeconds $timeoutSeconds -OstConfig $ostConfig
+        # The OST mirror list is reused as-is: its templates only wrap {official}.
+        $urls = @(Get-OstDownloadUrls -OstConfig $ostConfig -Repo $repo -Tag $release.Tag -AssetName $assetName -OfficialUrl $release.OfficialUrl)
+        $errors = @()
+        foreach ($url in $urls) {
+            try {
+                Write-Log -Message ("Downloading CloudRedirect {0} from: {1}" -f $release.Tag, $url) -Scope "cloud" -LogFile $RunContext.LogFile -OnlyFile
+                Invoke-DownloadFileWithProgress -Url $url -Destination $partialPath -TimeoutSeconds $timeoutSeconds -ProgressLabel "下载云存档组件" -ProgressFrom 30 -ProgressTo 38
+                if ((Get-Item -LiteralPath $partialPath).Length -eq 0) { throw "Downloaded CloudRedirect DLL is empty." }
+                Assert-OstDownloadSha256 -DownloadedPath $partialPath -DownloadUrl $url -OfficialUrl $release.OfficialUrl `
+                    -TimeoutSeconds $timeoutSeconds -ExpectedSha256 $release.Sha256 -LogFile $RunContext.LogFile
+                Move-Item -LiteralPath $partialPath -Destination $stagedPath -Force
+                Write-Log -Message ("CloudRedirect {0} staged" -f $release.Tag) -Scope "cloud" -LogFile $RunContext.LogFile -OnlyFile
+                return [pscustomobject]@{ Path = $stagedPath; Version = $release.Tag }
+            } catch {
+                $errors += ("{0}: {1}" -f $url, $_.Exception.Message)
+                if (Test-Path -LiteralPath $partialPath) { Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue }
+            }
+        }
+        throw ($errors -join " | ")
+    } catch {
+        Write-Log -Message ("CloudRedirect download skipped: {0}" -f $_.Exception.Message) -Level "WARN" -Scope "cloud" -LogFile $RunContext.LogFile -OnlyFile
+        return $null
+    }
+}
+
+function Set-OstCloudEnabledInToml {
+    param(
+        [Parameter(Mandatory = $true)][string]$TomlPath,
+        [Parameter(Mandatory = $true)][bool]$Enabled
+    )
+
+    # Same contract as the manifest url: rewrite only the [cloud] enabled line,
+    # keeping comments, key order, BOM state and line endings. [cloud] is created
+    # at the end of the file when missing.
+    $line = "enabled = {0}" -f $(if ($Enabled) { "true" } else { "false" })
+    $bytes = [System.IO.File]::ReadAllBytes($TomlPath)
+    $hasBom = ($bytes.Length -ge 3) -and ($bytes[0] -eq 0xEF) -and ($bytes[1] -eq 0xBB) -and ($bytes[2] -eq 0xBF)
+    $encoding = New-Object System.Text.UTF8Encoding $hasBom
+    $text = $encoding.GetString($bytes)
+    $eol = if ($text.Contains("`r`n")) { "`r" } else { "" }
+    $result = New-Object System.Collections.Generic.List[string]
+    foreach ($l in @($text -split "`n")) { $result.Add([string]$l) }
+
+    $sectionIndex = -1
+    for ($i = 0; $i -lt $result.Count; $i++) {
+        if ($result[$i].Trim() -eq "[cloud]") { $sectionIndex = $i; break }
+    }
+
+    if ($sectionIndex -lt 0) {
+        # Append after the last non-blank line, separated by one blank line.
+        $insertAt = $result.Count
+        while ($insertAt -gt 0 -and $result[$insertAt - 1].Trim() -eq "") { $insertAt-- }
+        if ($insertAt -gt 0 -and -not $result[$insertAt - 1].EndsWith($eol)) { $result[$insertAt - 1] += $eol }
+        $block = @(("[cloud]" + $eol), ($line + $eol))
+        if ($insertAt -gt 0) { $block = @($eol) + $block }
+        for ($i = 0; $i -lt $block.Count; $i++) { $result.Insert($insertAt + $i, $block[$i]) }
+        # Keep a trailing newline when the block landed at the very end.
+        if ($insertAt + $block.Count -eq $result.Count) { $result.Add("") }
+    } else {
+        $handled = $false
+        for ($i = $sectionIndex + 1; $i -lt $result.Count; $i++) {
+            $trimmed = $result[$i].Trim()
+            if ($trimmed.StartsWith("[")) { break }
+            if ($trimmed -match '^enabled[ \t]*=') {
+                if ($trimmed -eq $line) { return $false }
+                $result[$i] = $line + $eol
+                $handled = $true
+                break
+            }
+        }
+        if (-not $handled) { $result.Insert($sectionIndex + 1, $line + $eol) }
+    }
+
+    [System.IO.File]::WriteAllText($TomlPath, ($result -join "`n"), $encoding)
+    return $true
+}
+
+function Get-CloudRedirectConfigPath {
+    # Where cloud_redirect.dll reads its provider settings (fixed by the DLL).
+    return Join-Path ([Environment]::GetFolderPath("ApplicationData")) "CloudRedirect\config.json"
+}
+
+function Get-CloudRedirectSyncPath {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Config)
+
+    # GetFolderPath reads the Documents known folder, so it already points into
+    # OneDrive when OneDrive backs up Documents, and at a relocated Documents
+    # (e.g. D:\Documents) when the user moved it.
+    $cloudConfig = Get-ConfigValue -Object $Config -Name "cloud" -DefaultValue $null
+    $folder = [string](Get-ConfigValue -Object $cloudConfig -Name "syncFolder" -DefaultValue "localcloud")
+    $documents = [Environment]::GetFolderPath("MyDocuments")
+    if ([string]::IsNullOrWhiteSpace($documents)) {
+        $documents = Join-Path ([Environment]::GetFolderPath("UserProfile")) "Documents"
+    }
+    return Join-Path $documents $folder
+}
+
+function Initialize-CloudRedirectConfig {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Config)
+
+    # Writes a local-folder config pointing at Documents, but only when the user
+    # has none: an existing file may hold a Google Drive / OneDrive / WebDAV
+    # sign-in made in the CloudRedirect app, and that choice wins.
+    # Returns the path saves sync to, or "" when it is not ours to know.
+    $configPath = Get-CloudRedirectConfigPath
+    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+        try {
+            $existing = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ([string]$existing.provider -in @("folder", "local")) { return [string]$existing.sync_path }
+        } catch {
+        }
+        return ""
+    }
+
+    $syncPath = Get-CloudRedirectSyncPath -Config $Config
+    Ensure-Directory -PathValue $syncPath
+    Ensure-Directory -PathValue (Split-Path -Parent $configPath)
+    $escaped = $syncPath.Replace('\', '\\').Replace('"', '\"')
+    # auto_update_dll is left unset: the DLL then updates itself from GitHub.
+    $json = "{`r`n  `"provider`": `"folder`",`r`n  `"sync_path`": `"$escaped`"`r`n}`r`n"
+    # No BOM: the DLL's JSON parser does not skip one.
+    [System.IO.File]::WriteAllText($configPath, $json, (New-Object System.Text.UTF8Encoding $false))
+    return $syncPath
+}
+
 function Invoke-Check {
     param(
         [pscustomobject]$Config,
@@ -3920,6 +4205,31 @@ function Invoke-DeployOst {
         }
     }
 
+    # CloudRedirect is installed only when missing: once present, the DLL keeps
+    # itself up to date from GitHub, so a redeploy must not overwrite a newer
+    # self-updated build with whatever STEAMX fetched. A fresh install rides the
+    # same transaction (staged before Steam is closed, backup/rollback, verified
+    # with the kernel files) and goes to the Steam root, OST's default [cloud]
+    # library path. A failed download only means cloud saves stay off this run.
+    $cloudConfig = Get-ConfigValue -Object $Config -Name "cloud" -DefaultValue $null
+    $cloudWanted = [bool](Get-ConfigValue -Object $cloudConfig -Name "enabled" -DefaultValue $true)
+    $cloudDllName = [string](Get-ConfigValue -Object $cloudConfig -Name "assetName" -DefaultValue "cloud_redirect.dll")
+    $cloudDllTarget = Join-Path $steamPath $cloudDllName
+    $cloudPackage = $null
+    $cloudNeedsInstall = $cloudWanted -and -not (Test-Path -LiteralPath $cloudDllTarget -PathType Leaf)
+    if ($cloudNeedsInstall) {
+        Write-UiProgress -Percent 30 -Status "下载云存档组件"
+        $cloudPackage = Get-CloudRedirectDll -Config $Config -RunContext $RunContext
+        if ($null -ne $cloudPackage) {
+            $stagedFiles += [pscustomobject]@{
+                Name       = $cloudDllName
+                SourcePath = $cloudPackage.Path
+                StagedPath = $cloudPackage.Path
+                TargetPath = $cloudDllTarget
+            }
+        }
+    }
+
     if ([bool](Get-ConfigValue -Object $ostConfig -Name "requireSteamClosed" -DefaultValue $true)) {
         if ([bool](Get-ConfigValue -Object $ostConfig -Name "autoCloseSteam" -DefaultValue $true)) {
             Stop-SteamProcesses -Config $Config -RunContext $RunContext
@@ -3961,6 +4271,10 @@ function Invoke-DeployOst {
         # Out-Null: the function returns a bool and PowerShell would otherwise echo it
         # to the console as a stray "True" between the Deployed lines.
         Set-OstManifestSourceInToml -TomlPath $tomlPath -Source ([string](Get-ConfigValue -Object (Get-ConfigValue -Object $Config -Name "manifest" -DefaultValue $null) -Name "source" -DefaultValue "wudrm")) | Out-Null
+        # Follows the setting even when the DLL failed to download: OST just logs
+        # a warning and skips cloud saves if the DLL is missing, and the switch is
+        # already on once a later run (or the user) puts the DLL in place.
+        Set-OstCloudEnabledInToml -TomlPath $tomlPath -Enabled $cloudWanted | Out-Null
         $configRecord = [pscustomobject]@{
             path       = $tomlPath
             rollbackBackupPath = $configRollbackBackup
@@ -4056,7 +4370,28 @@ function Invoke-DeployOst {
     }
 
     Write-UiStatus -Kind ok -Text ("内核已部署：{0}" -f (Format-UiKernelVersion -Version ([string]$package.Version) -DateValue ([string]$package.PublishedDate)))
-    $restartSteam = [bool](Get-ConfigValue -Object $ostConfig -Name "restartSteamAfterDeploy" -DefaultValue $true)
+    if ($cloudWanted) {
+        $cloudInstalled = Test-Path -LiteralPath $cloudDllTarget -PathType Leaf
+        if ($cloudInstalled) {
+            # Outside the Steam dir and after the kernel is in, so a failure here
+            # is a warning, not a reason to roll the deploy back.
+            $syncPath = ""
+            try {
+                $syncPath = Initialize-CloudRedirectConfig -Config $Config
+            } catch {
+                Write-Log -Message ("CloudRedirect config not written: {0}" -f $_.Exception.Message) -Level "WARN" -Scope "cloud" -LogFile $RunContext.LogFile -OnlyFile
+            }
+            if (-not [string]::IsNullOrWhiteSpace($syncPath)) {
+                Write-UiStatus -Kind ok -Text ("云存档已启用，存档保存在：{0}" -f $syncPath)
+            } else {
+                Write-UiStatus -Kind ok -Text "云存档已启用（沿用 CloudRedirect 里已有的同步设置）。"
+            }
+        }
+        if (-not $cloudInstalled) {
+            Write-UiStatus -Kind warn -Text "云存档组件下载失败，本次未启用云存档；下次部署会再试。"
+        }
+    }
+    $restartSteam =[bool](Get-ConfigValue -Object $ostConfig -Name "restartSteamAfterDeploy" -DefaultValue $true)
     if ($restartSteam) {
         Start-Steam -RunContext $RunContext -SteamPath $steamPath
         Write-UiStatus -Kind dim -Text "Steam 已重新启动。"
@@ -4139,6 +4474,13 @@ function Invoke-UninstallOst {
     }
     foreach ($n in @(Get-ConfigValue -Object $ostConfig -Name "files" -DefaultValue @())) {
         if (-not [string]::IsNullOrWhiteSpace($n) -and -not $removeTargets.Contains($n)) { $removeTargets.Add($n) }
+    }
+    # CloudRedirect's DLL and log. Its <Steam>\cloud_redirect cache folder is
+    # left alone: it may hold saves not yet synced, and Steam ignores it. The
+    # synced copy in Documents and %APPDATA%\CloudRedirect are user data.
+    $cloudDllName = [string](Get-ConfigValue -Object (Get-ConfigValue -Object $Config -Name "cloud" -DefaultValue $null) -Name "assetName" -DefaultValue "cloud_redirect.dll")
+    foreach ($n in @($cloudDllName, "cloud_redirect.log")) {
+        if (-not $removeTargets.Contains($n)) { $removeTargets.Add($n) }
     }
 
     # Never touch Steam's own core files even if a name somehow collides.
@@ -4607,14 +4949,41 @@ function Invoke-UiStartupMaintenance {
     }
 
     if (-not (Test-OstStartupCleanupCompleted)) {
-        Write-UiStatus -Kind info -Text "首次运行，正在清理旧版残留并重新部署内核..."
+        Write-UiStatus -Kind info -Text "检测到本地已有内核但尚未完成旧版残留清理，正在清理并重新部署..."
         Write-UiLine
         try {
             $runContext = New-RunContext -Config $Config
             Invoke-DeployOst -Config $Config -RunContext $runContext
             Add-UiNotice -Kind ok -Text "已清理旧版残留，内核已重新部署。"
         } catch {
-            Add-UiNotice -Kind warn -Text ("首次清理失败，继续使用本地内核：" + $_.Exception.Message)
+            Add-UiNotice -Kind warn -Text ("清理并重装内核失败，继续使用本地内核：" + $_.Exception.Message)
+        }
+        return
+    }
+
+    # Kernels deployed before CloudRedirect shipped have no cloud_redirect.dll.
+    # Redeploy once to add it. The marker is set whatever the outcome, so an
+    # unreachable GitHub does not restart Steam on every launch; later deploys
+    # (updates, menu 1) keep retrying the download on their own.
+    $cloudConfig = Get-ConfigValue -Object $Config -Name "cloud" -DefaultValue $null
+    $cloudDll = Join-Path $SteamPath ([string](Get-ConfigValue -Object $cloudConfig -Name "assetName" -DefaultValue "cloud_redirect.dll"))
+    $cloudMarker = Join-Path (Split-Path -Parent (Get-OstStartupCleanupMarkerPath)) "cloud-bootstrap-v1.done"
+    if ([bool](Get-ConfigValue -Object $cloudConfig -Name "enabled" -DefaultValue $true) `
+        -and -not (Test-Path -LiteralPath $cloudDll -PathType Leaf) `
+        -and -not (Test-Path -LiteralPath $cloudMarker -PathType Leaf)) {
+        try { Set-Content -LiteralPath $cloudMarker -Value (Get-Date).ToUniversalTime().ToString("o") -Encoding ASCII -NoNewline } catch { }
+        Write-UiStatus -Kind info -Text "正在部署云存档组件，存档会同步到「文档」文件夹..."
+        Write-UiLine
+        try {
+            $runContext = New-RunContext -Config $Config
+            Invoke-DeployOst -Config $Config -RunContext $runContext
+            if (Test-Path -LiteralPath $cloudDll -PathType Leaf) {
+                Add-UiNotice -Kind ok -Text "云存档已启用，存档会同步到「文档」文件夹。"
+            } else {
+                Add-UiNotice -Kind warn -Text "云存档组件下载失败，按 1 重新部署可重试。"
+            }
+        } catch {
+            Add-UiNotice -Kind warn -Text ("云存档部署失败，继续使用本地内核：" + $_.Exception.Message)
         }
         return
     }
