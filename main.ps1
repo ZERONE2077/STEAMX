@@ -430,11 +430,11 @@ function Write-UiText {
 }
 
 $script:UiStatusStyle = @{
-    ok    = @{ Mark = [string][char]0x221A; Color = "Green"; Rgb = $script:UiTheme.Green }
+    ok    = @{ Mark = "+"; Color = "Green"; Rgb = $script:UiTheme.Green }
     warn  = @{ Mark = "!"; Color = "Yellow"; Rgb = $script:UiTheme.Gold }
-    error = @{ Mark = [string][char]0x00D7; Color = "Red"; Rgb = $script:UiTheme.Red }
-    info  = @{ Mark = [string][char]0x00B7; Color = "Gray" }
-    dim   = @{ Mark = " "; Color = "DarkGray" }
+    error = @{ Mark = "x"; Color = "Red"; Rgb = $script:UiTheme.Red }
+    info  = @{ Mark = ">"; Color = "Cyan"; Rgb = $script:UiTheme.Blue }
+    dim   = @{ Mark = "-"; Color = "DarkGray" }
 }
 
 function Write-UiStatus {
@@ -1604,7 +1604,7 @@ function Find-SteamStoreGames {
         if ($null -ne $client) { $client.Dispose() }
     }
     if ($null -ne $nameError -and $null -ne $filterError) {
-        throw ("连不上 Steam 商店，搜索失败：{0}" -f $nameError)
+        throw ("连不上 Steam 商店，建议开启加速器或直接输入 AppID（搜索失败：{0}）" -f $nameError)
     }
     if ($null -ne $nameError) { Write-UiLog -Scope "search" -Level WARN -Message ("storesearch failed: {0}" -f $nameError) }
     if ($null -ne $filterError) { Write-UiLog -Scope "search" -Level WARN -Message ("search/results failed: {0}" -f $filterError) }
