@@ -5024,7 +5024,7 @@ function Select-UiSteamGame {
     param([Parameter(Mandatory = $true)][string]$Term)
 
     while ($true) {
-        Write-UiStatus -Kind dim -Text ("正在搜索「{0}」..." -f $Term)
+        Write-UiStatus -Kind dim -Text ("正在搜索「{0}」（开启加速器，可以提高搜索速度）..." -f $Term)
         try {
             $result = Find-SteamStoreGames -Term $Term
         } catch {
