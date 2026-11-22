@@ -4289,6 +4289,399 @@ function Remove-OstStaleResidue {
     }
 }
 
+function Test-IsAdministrator {
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
+        return [bool]$principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+function Get-SmartAppControlState {
+    param(
+        [string]$PolicyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy",
+        [string]$ValueName = "VerifiedAndReputablePolicyState",
+        [switch]$SkipDefenderQuery
+    )
+
+    try {
+        if (Test-Path -LiteralPath $PolicyPath) {
+            $item = Get-ItemProperty -LiteralPath $PolicyPath -Name $ValueName -ErrorAction SilentlyContinue
+            if ($null -ne $item) {
+                $prop = $item.PSObject.Properties[$ValueName]
+                if ($null -ne $prop -and $null -ne $prop.Value) {
+                    switch ([int]$prop.Value) {
+                        0 { return "Off" }
+                        1 { return "On" }
+                        2 { return "Evaluation" }
+                        default { return "Unknown" }
+                    }
+                }
+            }
+        }
+    } catch {
+        # Fall through to Defender status query if registry read fails.
+    }
+
+    if (-not $SkipDefenderQuery) {
+        try {
+            if ($null -ne (Get-Command -Name "Get-MpComputerStatus" -ErrorAction SilentlyContinue)) {
+                $mpStatus = Get-MpComputerStatus -ErrorAction Stop
+                $sacProp = $mpStatus.PSObject.Properties["SmartAppControlState"]
+                if ($null -ne $sacProp -and -not [string]::IsNullOrWhiteSpace([string]$sacProp.Value)) {
+                    $sacValue = [string]$sacProp.Value
+                    if ($sacValue -ieq "Off") { return "Off" }
+                    if ($sacValue -ieq "Evaluation") { return "Evaluation" }
+                    if ($sacValue -ieq "On" -or $sacValue -ieq "Enforcement") { return "On" }
+                    return $sacValue
+                }
+            }
+        } catch {
+            # Defender service unavailable or older Windows build without SmartAppControlState.
+        }
+    }
+
+    return "NotApplicable"
+}
+
+function Disable-SmartAppControl {
+    # Windows 11 Smart App Control blocks unsigned DLLs (including OST shims).
+    # Run during every deploy/redeploy so a first install or repair turns it off
+    # when active, while staying a no-op when already Off or on Windows 10.
+    param(
+        [string]$LogFile = "",
+        [string]$PolicyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy",
+        [string]$ValueName = "VerifiedAndReputablePolicyState",
+        [switch]$SkipDefenderQuery,
+        [switch]$SkipCiTool,
+        [switch]$NoElevation
+    )
+
+    $state = Get-SmartAppControlState -PolicyPath $PolicyPath -ValueName $ValueName -SkipDefenderQuery:$SkipDefenderQuery
+    if ($state -eq "Off" -or $state -eq "NotApplicable") {
+        if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+            Write-Log -Message ("Smart App Control does not need changes (state: {0})." -f $state) -Scope "sac" -LogFile $LogFile -OnlyFile
+        }
+        return [pscustomobject]@{
+            Status        = "Skipped"
+            PreviousState = $state
+            CurrentState  = $state
+            Message       = ""
+        }
+    }
+
+    try {
+        $needsAdmin = ($PolicyPath -match '^HKLM:')
+        $canWriteDirectly = (-not $needsAdmin) -or (Test-IsAdministrator)
+
+        if ($canWriteDirectly) {
+            if (-not (Test-Path -LiteralPath $PolicyPath)) {
+                New-Item -Path $PolicyPath -Force -ErrorAction Stop | Out-Null
+            }
+            Set-ItemProperty -LiteralPath $PolicyPath -Name $ValueName -Value 0 -Type DWord -Force -ErrorAction Stop
+            if (-not $SkipCiTool) {
+                $citool = Get-Command -Name "citool.exe" -ErrorAction SilentlyContinue
+                if ($null -ne $citool) {
+                    Start-Process -FilePath $citool.Source -ArgumentList "-r" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+                }
+            }
+        } else {
+            if ($NoElevation -or -not [Environment]::UserInteractive) {
+                if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+                    Write-Log -Message "Smart App Control is active but administrator elevation is unavailable." -Level "WARN" -Scope "sac" -LogFile $LogFile -OnlyFile
+                }
+                return [pscustomobject]@{
+                    Status        = "NeedsAdmin"
+                    PreviousState = $state
+                    CurrentState  = $state
+                    Message       = "Administrator privileges required."
+                }
+            }
+
+            $escapedPath = $PolicyPath.Replace("'", "''")
+            $escapedName = $ValueName.Replace("'", "''")
+            $ciSnippet = if ($SkipCiTool) {
+                ""
+            } else {
+                "; `$ci = Get-Command -Name 'citool.exe' -ErrorAction SilentlyContinue; if (`$null -ne `$ci) { Start-Process -FilePath `$ci.Source -ArgumentList '-r' -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue }"
+            }
+            $elevatedCmd = "`$p = '$escapedPath'; if (-not (Test-Path -LiteralPath `$p)) { New-Item -Path `$p -Force | Out-Null }; Set-ItemProperty -LiteralPath `$p -Name '$escapedName' -Value 0 -Type DWord -Force$ciSnippet"
+            $proc = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $elevatedCmd) -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+            if ($null -ne $proc -and $proc.ExitCode -ne 0) {
+                throw ("Elevated Smart App Control command exited with code {0}." -f $proc.ExitCode)
+            }
+        }
+
+        $newState = Get-SmartAppControlState -PolicyPath $PolicyPath -ValueName $ValueName -SkipDefenderQuery:$SkipDefenderQuery
+        if ($newState -eq "Off") {
+            if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+                Write-Log -Message ("Disabled Windows Smart App Control (previous state: {0})." -f $state) -Scope "sac" -LogFile $LogFile -OnlyFile
+            }
+            return [pscustomobject]@{
+                Status        = "Disabled"
+                PreviousState = $state
+                CurrentState  = $newState
+                Message       = ""
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+            Write-Log -Message ("Smart App Control state did not switch to Off (current: {0})." -f $newState) -Level "WARN" -Scope "sac" -LogFile $LogFile -OnlyFile
+        }
+        return [pscustomobject]@{
+            Status        = "Failed"
+            PreviousState = $state
+            CurrentState  = $newState
+            Message       = ("Smart App Control state remained: {0}" -f $newState)
+        }
+    } catch {
+        if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+            Write-Log -Message ("Failed to disable Smart App Control: {0}" -f $_.Exception.Message) -Level "WARN" -Scope "sac" -LogFile $LogFile -OnlyFile
+        }
+        return [pscustomobject]@{
+            Status        = "Failed"
+            PreviousState = $state
+            CurrentState  = $state
+            Message       = $_.Exception.Message
+        }
+    }
+}
+
+function Test-DefenderExclusionPresent {
+    param(
+        [string]$TargetPath,
+        [string[]]$ExistingPaths = @()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TargetPath) -or $null -eq $ExistingPaths -or $ExistingPaths.Count -eq 0) {
+        return $false
+    }
+
+    $normTarget = $TargetPath.Trim().TrimEnd('\')
+    if ($normTarget -match '^[A-Za-z]:$') { $normTarget = $normTarget + '\' }
+
+    foreach ($entry in $ExistingPaths) {
+        if ([string]::IsNullOrWhiteSpace([string]$entry)) { continue }
+        $normEntry = ([string]$entry).Trim().TrimEnd('\')
+        if ($normEntry -match '^[A-Za-z]:$') { $normEntry = $normEntry + '\' }
+        if ($normEntry -ieq $normTarget) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Invoke-DeployWindowsSecuritySetup {
+    # Runs both Windows security adjustments needed for OST DLLs during deploy/redeploy:
+    #   1. Disable Windows 11 Smart App Control (if active / evaluation)
+    #   2. Add the Steam directory to Windows Defender exclusions (trusted folders)
+    # When not elevated, batches both into a single UAC prompt via -EncodedCommand
+    # (UTF-16LE Base64) so Chinese / spaced Steam paths survive intact.
+    param(
+        [string]$SteamPath = "",
+        [string]$LogFile = "",
+        [string]$PolicyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy",
+        [string]$ValueName = "VerifiedAndReputablePolicyState",
+        [switch]$SkipDefenderQuery,
+        [switch]$SkipCiTool,
+        [switch]$NoElevation
+    )
+
+    $sacState = Get-SmartAppControlState -PolicyPath $PolicyPath -ValueName $ValueName -SkipDefenderQuery:$SkipDefenderQuery
+    $needSac = ($sacState -ne "Off" -and $sacState -ne "NotApplicable")
+
+    $sacStatus = "Skipped"
+    $sacMessage = ""
+    $defenderStatus = "Skipped"
+    $defenderMessage = ""
+
+    $hasDefenderCmd = ($null -ne (Get-Command -Name "Add-MpPreference" -ErrorAction SilentlyContinue))
+    $needDefender = $false
+    if (-not [string]::IsNullOrWhiteSpace($SteamPath) -and $hasDefenderCmd) {
+        $alreadyExcluded = $false
+        try {
+            $mpPref = Get-MpPreference -ErrorAction Stop
+            if ($null -ne $mpPref -and $null -ne $mpPref.ExclusionPath) {
+                $alreadyExcluded = Test-DefenderExclusionPresent -TargetPath $SteamPath -ExistingPaths @($mpPref.ExclusionPath)
+            }
+        } catch {
+            # Non-admin callers may be blocked from reading ExclusionPath; let elevated step check and add.
+        }
+        if ($alreadyExcluded) {
+            $defenderStatus = "AlreadyExcluded"
+        } else {
+            $needDefender = $true
+        }
+    }
+
+    if (-not $needSac -and -not $needDefender) {
+        return [pscustomobject]@{
+            SacStatus       = $sacStatus
+            SacMessage      = $sacMessage
+            DefenderStatus  = $defenderStatus
+            DefenderMessage = $defenderMessage
+        }
+    }
+
+    $needsAdmin = ($needSac -and ($PolicyPath -match '^HKLM:')) -or $needDefender
+    $canWriteDirectly = (-not $needsAdmin) -or (Test-IsAdministrator)
+
+    if ($canWriteDirectly) {
+        if ($needSac) {
+            $sacRes = Disable-SmartAppControl -LogFile $LogFile -PolicyPath $PolicyPath -ValueName $ValueName -SkipDefenderQuery:$SkipDefenderQuery -SkipCiTool:$SkipCiTool -NoElevation:$NoElevation
+            $sacStatus = $sacRes.Status
+            $sacMessage = $sacRes.Message
+        }
+        if ($needDefender) {
+            try {
+                $mpPref = Get-MpPreference -ErrorAction SilentlyContinue
+                if ($null -ne $mpPref -and $null -ne $mpPref.ExclusionPath -and (Test-DefenderExclusionPresent -TargetPath $SteamPath -ExistingPaths @($mpPref.ExclusionPath))) {
+                    $defenderStatus = "AlreadyExcluded"
+                } else {
+                    Add-MpPreference -ExclusionPath $SteamPath -ErrorAction Stop
+                    $defenderStatus = "Added"
+                }
+                if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+                    Write-Log -Message ("Defender exclusion for Steam path ({0}): {1}" -f $SteamPath, $defenderStatus) -Scope "defender" -LogFile $LogFile -OnlyFile
+                }
+            } catch {
+                $defenderStatus = "Failed"
+                $defenderMessage = $_.Exception.Message
+                if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+                    Write-Log -Message ("Failed to add Defender exclusion for '{0}': {1}" -f $SteamPath, $_.Exception.Message) -Level "WARN" -Scope "defender" -LogFile $LogFile -OnlyFile
+                }
+            }
+        }
+        return [pscustomobject]@{
+            SacStatus       = $sacStatus
+            SacMessage      = $sacMessage
+            DefenderStatus  = $defenderStatus
+            DefenderMessage = $defenderMessage
+        }
+    }
+
+    if ($NoElevation -or -not [Environment]::UserInteractive) {
+        if ($needSac) { $sacStatus = "NeedsAdmin"; $sacMessage = "Administrator privileges required." }
+        if ($needDefender) { $defenderStatus = "NeedsAdmin"; $defenderMessage = "Administrator privileges required." }
+        return [pscustomobject]@{
+            SacStatus       = $sacStatus
+            SacMessage      = $sacMessage
+            DefenderStatus  = $defenderStatus
+            DefenderMessage = $defenderMessage
+        }
+    }
+
+    $resultFile = Join-Path ([System.IO.Path]::GetTempPath()) ("steamx-sec-" + [Guid]::NewGuid().ToString("N") + ".json")
+    try {
+        $escPolicyPath = $PolicyPath.Replace("'", "''")
+        $escValueName = $ValueName.Replace("'", "''")
+        $escSteamPath = $SteamPath.Replace("'", "''")
+        $escResultFile = $resultFile.Replace("'", "''")
+        $doSacLit = if ($needSac) { '$true' } else { '$false' }
+        $doDefLit = if ($needDefender) { '$true' } else { '$false' }
+        $skipCiLit = if ($SkipCiTool) { '$true' } else { '$false' }
+
+        $childScript = @(
+            "`$ErrorActionPreference = 'Stop'"
+            "`$res = @{ sacStatus = 'Skipped'; sacMessage = ''; defenderStatus = 'Skipped'; defenderMessage = '' }"
+            "if ($doSacLit) {"
+            "    try {"
+            "        `$p = '$escPolicyPath'"
+            "        if (-not (Test-Path -LiteralPath `$p)) { New-Item -Path `$p -Force | Out-Null }"
+            "        Set-ItemProperty -LiteralPath `$p -Name '$escValueName' -Value 0 -Type DWord -Force"
+            "        if (-not $skipCiLit) {"
+            "            `$ci = Get-Command -Name 'citool.exe' -ErrorAction SilentlyContinue"
+            "            if (`$null -ne `$ci) { Start-Process -FilePath `$ci.Source -ArgumentList '-r' -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue }"
+            "        }"
+            "        `$res.sacStatus = 'Disabled'"
+            "    } catch {"
+            "        `$res.sacStatus = 'Failed'"
+            "        `$res.sacMessage = `$_.Exception.Message"
+            "    }"
+            "}"
+            "if ($doDefLit) {"
+            "    try {"
+            "        `$sp = '$escSteamPath'"
+            "        `$normSp = `$sp.Trim().TrimEnd('\')"
+            "        if (`$normSp -match '^[A-Za-z]:`$') { `$normSp = `$normSp + '\' }"
+            "        `$already = `$false"
+            "        `$mp = Get-MpPreference -ErrorAction SilentlyContinue"
+            "        if (`$null -ne `$mp -and `$null -ne `$mp.ExclusionPath) {"
+            "            foreach (`$e in @(`$mp.ExclusionPath)) {"
+            "                if ([string]::IsNullOrWhiteSpace([string]`$e)) { continue }"
+            "                `$ne = ([string]`$e).Trim().TrimEnd('\')"
+            "                if (`$ne -match '^[A-Za-z]:`$') { `$ne = `$ne + '\' }"
+            "                if (`$ne -ieq `$normSp) { `$already = `$true; break }"
+            "            }"
+            "        }"
+            "        if (`$already) {"
+            "            `$res.defenderStatus = 'AlreadyExcluded'"
+            "        } else {"
+            "            Add-MpPreference -ExclusionPath `$sp -ErrorAction Stop"
+            "            `$res.defenderStatus = 'Added'"
+            "        }"
+            "    } catch {"
+            "        `$res.defenderStatus = 'Failed'"
+            "        `$res.defenderMessage = `$_.Exception.Message"
+            "    }"
+            "}"
+            "`$json = (`$res | ConvertTo-Json -Compress)"
+            "[System.IO.File]::WriteAllText('$escResultFile', `$json, (New-Object System.Text.UTF8Encoding(`$false)))"
+        ) -join "`n"
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
+        $proc = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded) -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+        if ($null -ne $proc -and $proc.ExitCode -ne 0 -and -not (Test-Path -LiteralPath $resultFile -PathType Leaf)) {
+            throw ("Elevated security setup exited with code {0}." -f $proc.ExitCode)
+        }
+        if (Test-Path -LiteralPath $resultFile -PathType Leaf) {
+            $parsed = [System.IO.File]::ReadAllText($resultFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($needSac) {
+                $sacStatus = [string]$parsed.sacStatus
+                $sacMessage = [string]$parsed.sacMessage
+                if ($sacStatus -eq "Disabled") {
+                    $verifySac = Get-SmartAppControlState -PolicyPath $PolicyPath -ValueName $ValueName -SkipDefenderQuery:$SkipDefenderQuery
+                    if ($verifySac -ne "Off") {
+                        $sacStatus = "Failed"
+                        $sacMessage = ("Smart App Control state remained: {0}" -f $verifySac)
+                    }
+                }
+            }
+            if ($needDefender) {
+                $defenderStatus = [string]$parsed.defenderStatus
+                $defenderMessage = [string]$parsed.defenderMessage
+            }
+        }
+    } catch {
+        if ($needSac) { $sacStatus = "Failed"; $sacMessage = $_.Exception.Message }
+        if ($needDefender) { $defenderStatus = "Failed"; $defenderMessage = $_.Exception.Message }
+        if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+            Write-Log -Message ("Elevated Windows security setup failed: {0}" -f $_.Exception.Message) -Level "WARN" -Scope "security" -LogFile $LogFile -OnlyFile
+        }
+    } finally {
+        if (Test-Path -LiteralPath $resultFile -PathType Leaf) {
+            Remove-Item -LiteralPath $resultFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+        if ($needSac) {
+            Write-Log -Message ("Smart App Control setup result: {0} {1}" -f $sacStatus, $sacMessage).Trim() -Scope "sac" -LogFile $LogFile -OnlyFile
+        }
+        if ($needDefender) {
+            Write-Log -Message ("Defender exclusion setup result ({0}): {1} {2}" -f $SteamPath, $defenderStatus, $defenderMessage).Trim() -Scope "defender" -LogFile $LogFile -OnlyFile
+        }
+    }
+
+    return [pscustomobject]@{
+        SacStatus       = $sacStatus
+        SacMessage      = $sacMessage
+        DefenderStatus  = $defenderStatus
+        DefenderMessage = $defenderMessage
+    }
+}
+
 function Invoke-DeployOst {
     param(
         [pscustomobject]$Config,
@@ -4302,6 +4695,10 @@ function Invoke-DeployOst {
     $restartSteamAfterDeploy = [bool](Get-ConfigValue -Object $ostConfig -Name "restartSteamAfterDeploy" -DefaultValue $true)
     # Flipped only after every file has landed; the finally block logs success from it.
     $deploySucceeded = $false
+    Ensure-Directory -PathValue $RunContext.TransactionDir
+    # Configure Windows Defender exclusion (Steam directory) and Smart App Control
+    # BEFORE copying unsigned DLLs into Steam, so Defender does not quarantine them mid-deploy.
+    $securityResult = Invoke-DeployWindowsSecuritySetup -SteamPath $steamPath -LogFile $RunContext.LogFile
     Write-UiProgress -Percent 0 -Status "准备中"
     $package = Get-OstSourceDirectory -Config $Config -RunContext $RunContext
     $sourcePath = $package.SourcePath
@@ -4572,6 +4969,11 @@ function Invoke-DeployOst {
         }
         if (-not $cloudInstalled) {
             Write-UiStatus -Kind warn -Text "云存档组件下载失败，本次未启用云存档；下次部署会再试。"
+        }
+    }
+    if ($null -ne $securityResult) {
+        if ($securityResult.SacStatus -in @("Failed", "NeedsAdmin") -or $securityResult.DefenderStatus -in @("Failed", "NeedsAdmin")) {
+            Write-UiStatus -Kind warn -Text "智能应用控制可能导致部署失效，建议以管理员身份重试。"
         }
     }
     $restartSteam =[bool](Get-ConfigValue -Object $ostConfig -Name "restartSteamAfterDeploy" -DefaultValue $true)
