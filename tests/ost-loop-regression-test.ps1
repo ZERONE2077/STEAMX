@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
   死循环回归测试：模拟"zip 对了但内容不符预期"的完整启动流程
 

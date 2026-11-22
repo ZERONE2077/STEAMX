@@ -32,6 +32,8 @@ $script:SteamPathCache = ""
 $script:SteamDenuvoCache = @{}
 $script:NetworkRegionCache = ""
 $script:UiProgressActive = $false
+$script:UiNotices = New-Object System.Collections.Generic.List[object]
+$script:UiRemoteInfo = $null
 # Screen log gate. By default the console shows ONLY the progress bar during a
 # deploy; all log lines still go to the run.log file. Pass -ShowLog (or set
 # STEAMX_SHOW_LOG=1) to also print the timestamped log lines on screen.
@@ -55,7 +57,7 @@ function Enable-ModernTls {
     # whether the machine can actually negotiate TLS 1.3 (older Windows 10, older
     # .NET, or a group policy that disables it). On those machines the handshake was
     # attempted at a version Schannel refuses and the whole connection died with
-    # "鍩虹杩炴帴宸插叧闂? / "The underlying connection was closed" - which is why the
+    # "基础连接已关闭" / "The underlying connection was closed" - which is why the
     # failure only appeared on some users' PCs and never on a machine new enough to
     # support TLS 1.3. Nothing here needs 1.3, so ask for 1.2 and stay uniform.
     try {
@@ -87,12 +89,6 @@ function Wait-BeforeExit {
 }
 
 Enable-ModernTls
-
-function ConvertFrom-Utf8Base64 {
-    param([Parameter(Mandatory = $true)][string]$Value)
-
-    return [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Value))
-}
 
 function Write-UiLine {
     param(
@@ -778,7 +774,29 @@ function Get-Timestamp {
     return Get-Date -Format "yyyyMMdd-HHmmss"
 }
 
+function Get-DefaultGitHubMirrorTemplates {
+    # Single source of truth for GitHub download/API/raw mirrors (ordered by measured CN latency).
+    return @(
+        "{official}",
+        "https://gh-proxy.com/{official}",
+        "https://gh.monlor.com/{official}",
+        "https://hk.gh-proxy.com/{official}",
+        "https://gh.nxnow.top/{official}",
+        "https://ghproxy.net/{official}",
+        "https://ghfast.top/{official}"
+    )
+}
+
 function New-DefaultConfig {
+    $mirrorTemplates = Get-DefaultGitHubMirrorTemplates
+    $rawTomlBase = "https://raw.githubusercontent.com/{repo}/{branch}/{file}"
+    $tomlTemplates = @(
+        $rawTomlBase,
+        "https://cdn.jsdelivr.net/gh/{repo}@{branch}/{file}"
+    ) + @(
+        $mirrorTemplates | Where-Object { $_ -ne "{official}" } | ForEach-Object { $_.Replace("{official}", $rawTomlBase) }
+    )
+
     return [pscustomobject]@{
         steamPath  = ""
         network    = [pscustomobject]@{
@@ -804,20 +822,12 @@ function New-DefaultConfig {
             # user's toml on a 936 machine), and keeping it a real file means one
             # source of truth instead of an escaped copy that drifts.
             #
-            # {repo} and {branch} are substituted below; the mirror list is the same
-            # shape as downloadUrlTemplates for the OST asset.
+            # {repo} and {branch} are substituted below; the mirror list is derived from
+            # Get-DefaultGitHubMirrorTemplates so all GitHub pools stay in sync.
             tomlRepo                    = "ZERONE2077/STEAMX"
             tomlBranch                  = "main"
             tomlFileName                = "opensteamtool.toml"
-            tomlUrlTemplates            = @(
-                "https://raw.githubusercontent.com/{repo}/{branch}/{file}",
-                "https://cdn.jsdelivr.net/gh/{repo}@{branch}/{file}",
-                "https://gh-proxy.com/https://raw.githubusercontent.com/{repo}/{branch}/{file}",
-                "https://gh.monlor.com/https://raw.githubusercontent.com/{repo}/{branch}/{file}",
-                "https://hk.gh-proxy.com/https://raw.githubusercontent.com/{repo}/{branch}/{file}",
-                "https://ghproxy.net/https://raw.githubusercontent.com/{repo}/{branch}/{file}",
-                "https://ghfast.top/https://raw.githubusercontent.com/{repo}/{branch}/{file}"
-            )
+            tomlUrlTemplates            = $tomlTemplates
         }
         ost        = [pscustomobject]@{
             sourceType                  = "github-release"
@@ -826,25 +836,9 @@ function New-DefaultConfig {
             assetPattern                = "*Release.zip"
             assetNameTemplate           = "OpenSteamTool-{tag}-Release.zip"
             # Every mirror has bad days: an upstream outage, a rotated certificate,
-            # a proxy that dropped the route. This list used to hold a single mirror,
-            # so one certificate trust failure on ghfast.top threw the run onto the
-            # raw GitHub URL - the one host that is normally unreachable from CN -
-            # and the run then sat there until the timeout expired.
-            #
-            # Order is measured, not guessed: a 2026-10-08 scan confirmed every entry
-            # below returned the whole 1.4.8 asset with the exact release SHA-256, and
-            # the list is sorted by latency. The official URL stays in the pool as the
-            # last resort, and it is the asset download that carries the payload, so
-            # a bad mirror can never win: Assert-OstDownloadSha256 rejects it.
-            downloadUrlTemplates        = @(
-                "{official}",
-                "https://gh-proxy.com/{official}",
-                "https://gh.monlor.com/{official}",
-                "https://hk.gh-proxy.com/{official}",
-                "https://gh.nxnow.top/{official}",
-                "https://ghproxy.net/{official}",
-                "https://ghfast.top/{official}"
-            )
+            # a proxy that dropped the route. Order is measured and shared with
+            # Get-GitHubMirrorUrls via Get-DefaultGitHubMirrorTemplates.
+            downloadUrlTemplates        = $mirrorTemplates
             targetPath                  = ""
             configPath                  = "opensteamtool.toml"
             # Files this tool owns in the Steam directory, used to recognise an
@@ -926,7 +920,7 @@ function New-RunContext {
     # LogFile/BackupDir/TransactionDir long before they reach their own
     # Ensure-Directory calls (uninstall logs at 2511 before ensuring at 2516, and
     # Stop-SteamProcesses logs via LogFile), so a missing directory surfaced as a raw
-    # DirectoryNotFoundException ("鏈兘鎵惧埌璺緞...鐨勪竴閮ㄥ垎") instead of the intended
+    # DirectoryNotFoundException ("未能找到路径...的一部分") instead of the intended
     # message. Add-Content does not create parent directories, so ensure up front.
     Ensure-Directory -PathValue $transactionDir
 
@@ -1144,39 +1138,13 @@ function Test-CertificateTrustFailure {
     return $false
 }
 
-function Get-LatestOstRelease {
-    param([Parameter(Mandatory = $true)][pscustomobject]$Config)
-
-    $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
-    $networkConfig = Get-ConfigValue -Object $Config -Name "network" -DefaultValue $null
-    $repo = [string](Get-ConfigValue -Object $ostConfig -Name "githubRepo" -DefaultValue "huanyuejue/OpenSteamTool")
-    $timeoutSeconds = [int](Get-ConfigValue -Object $networkConfig -Name "timeoutSeconds" -DefaultValue 30)
-    if ($script:OstReleaseCache.ContainsKey($repo)) {
-        return $script:OstReleaseCache[$repo]
-    }
-
-    # Get-LatestOstReleaseOnce already sweeps all configured mirrors plus the
-    # official host across both the API and web-redirect tiers, so a single pass
-    # is already multi-source; repeating the whole sweep on an offline machine
-    # would multiply timeouts unnecessarily.
-    return Get-LatestOstReleaseOnce -Config $Config -OstConfig $ostConfig -Repo $repo -TimeoutSeconds $timeoutSeconds
-}
-
 function Get-GitHubMirrorUrls {
     param(
         [AllowNull()]$OstConfig,
         [Parameter(Mandatory = $true)][string]$OfficialUrl
     )
 
-    $defaultTemplates = @(
-        "{official}",
-        "https://gh-proxy.com/{official}",
-        "https://gh.monlor.com/{official}",
-        "https://hk.gh-proxy.com/{official}",
-        "https://gh.nxnow.top/{official}",
-        "https://ghproxy.net/{official}",
-        "https://ghfast.top/{official}"
-    )
+    $defaultTemplates = Get-DefaultGitHubMirrorTemplates
     $templates = @(Get-ConfigValue -Object $OstConfig -Name "downloadUrlTemplates" -DefaultValue $defaultTemplates)
     $urls = @()
     foreach ($template in $templates) {
@@ -1202,30 +1170,37 @@ function Get-GitHubMirrorUrls {
     )
 }
 
-function Get-LatestOstReleaseOnce {
+function Get-GitHubLatestRelease {
+    # Shared two-tier GitHub release lookup used by OST and CloudRedirect:
+    #   Tier 1: GitHub API across mirrors (returns full asset list + SHA-256 digest)
+    #   Tier 2: /releases/latest HTTP redirect across mirrors (yields tag + synthetic asset)
     param(
-        [Parameter(Mandatory = $true)][pscustomobject]$Config,
-        [Parameter(Mandatory = $true)]$OstConfig,
         [Parameter(Mandatory = $true)][string]$Repo,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+        [AllowNull()]$OstConfig = $null,
+        [int]$TimeoutSeconds = 6,
+        [string]$AssetNameTemplate = "",
+        [string]$RequiredAssetName = ""
     )
 
-    $repo = $Repo
-    $ostConfig = $OstConfig
-    $timeoutSeconds = [Math]::Min($TimeoutSeconds, 6)
-    if ($timeoutSeconds -lt 1) { $timeoutSeconds = 6 }
+    if ($TimeoutSeconds -lt 1) { $TimeoutSeconds = 6 }
 
-    $apiUrl = "https://api.github.com/repos/{0}/releases/latest" -f $repo
-    $apiUrls = @(Get-GitHubMirrorUrls -OstConfig $ostConfig -OfficialUrl $apiUrl)
+    $apiUrl = "https://api.github.com/repos/{0}/releases/latest" -f $Repo
+    $apiUrls = @(Get-GitHubMirrorUrls -OstConfig $OstConfig -OfficialUrl $apiUrl)
     $apiErrors = @()
     foreach ($candidateApiUrl in $apiUrls) {
         try {
-            $release = Invoke-RestMethod -Uri $candidateApiUrl -Headers (Get-GitHubHeaders) -TimeoutSec $timeoutSeconds
+            $release = Invoke-RestMethod -Uri $candidateApiUrl -Headers (Get-GitHubHeaders) -TimeoutSec $TimeoutSeconds
             if ($null -ne $release -and
                 $null -ne $release.PSObject.Properties["tag_name"] -and
                 -not [string]::IsNullOrWhiteSpace([string]$release.tag_name) -and
                 $null -ne $release.PSObject.Properties["assets"]) {
-                $script:OstReleaseCache[$repo] = $release
+                if (-not [string]::IsNullOrWhiteSpace($RequiredAssetName)) {
+                    $matched = @($release.assets) | Where-Object { $_.name -eq $RequiredAssetName } | Select-Object -First 1
+                    if ($null -eq $matched) {
+                        $apiErrors += ("{0}: Asset '{1}' missing" -f $candidateApiUrl, $RequiredAssetName)
+                        continue
+                    }
+                }
                 return $release
             }
             $apiErrors += ("{0}: Invalid release payload" -f $candidateApiUrl)
@@ -1241,15 +1216,15 @@ function Get-LatestOstReleaseOnce {
         "Unknown error"
     }
 
-    $latestUrl = "https://github.com/{0}/releases/latest" -f $repo
-    $webUrls = @(Get-GitHubMirrorUrls -OstConfig $ostConfig -OfficialUrl $latestUrl)
+    $latestUrl = "https://github.com/{0}/releases/latest" -f $Repo
+    $webUrls = @(Get-GitHubMirrorUrls -OstConfig $OstConfig -OfficialUrl $latestUrl)
     $fallbackErrors = @()
     foreach ($candidateWebUrl in $webUrls) {
         $request = [System.Net.HttpWebRequest]::Create($candidateWebUrl)
         $request.UserAgent = "STEAMX"
         $request.AllowAutoRedirect = $true
-        $request.Timeout = $timeoutSeconds * 1000
-        $request.ReadWriteTimeout = $timeoutSeconds * 1000
+        $request.Timeout = $TimeoutSeconds * 1000
+        $request.ReadWriteTimeout = $TimeoutSeconds * 1000
         $response = $null
         try {
             $response = $request.GetResponse()
@@ -1259,21 +1234,28 @@ function Get-LatestOstReleaseOnce {
                 continue
             }
             $tagName = [Uri]::UnescapeDataString($Matches[1])
-            $assetNameTemplate = [string](Get-ConfigValue -Object $ostConfig -Name "assetNameTemplate" -DefaultValue "OpenSteamTool-{tag}-Release.zip")
-            $assetName = $assetNameTemplate.Replace("{tag}", $tagName)
-            $assetUrl = "https://github.com/{0}/releases/download/{1}/{2}" -f $repo, ([Uri]::EscapeDataString($tagName)), ([Uri]::EscapeDataString($assetName))
-            $release = [pscustomobject]@{
-                tag_name     = $tagName
-                published_at = ""
-                assets       = @(
+            $assetName = if (-not [string]::IsNullOrWhiteSpace($RequiredAssetName)) {
+                $RequiredAssetName
+            } elseif (-not [string]::IsNullOrWhiteSpace($AssetNameTemplate)) {
+                $AssetNameTemplate.Replace("{tag}", $tagName)
+            } else {
+                ""
+            }
+            $assets = @()
+            if (-not [string]::IsNullOrWhiteSpace($assetName)) {
+                $assetUrl = "https://github.com/{0}/releases/download/{1}/{2}" -f $Repo, ([Uri]::EscapeDataString($tagName)), ([Uri]::EscapeDataString($assetName))
+                $assets = @(
                     [pscustomobject]@{
                         name                 = $assetName
                         browser_download_url = $assetUrl
                     }
                 )
             }
-            $script:OstReleaseCache[$repo] = $release
-            return $release
+            return [pscustomobject]@{
+                tag_name     = $tagName
+                published_at = ""
+                assets       = $assets
+            }
         } catch {
             $fallbackErrors += $_.Exception.Message
         } finally {
@@ -1287,7 +1269,25 @@ function Get-LatestOstReleaseOnce {
     } else {
         "Unknown error"
     }
-    throw ("Unable to fetch the latest OST release. GitHub API: {0}. GitHub web fallback: {1}" -f $apiError, $fallbackError)
+    throw ("Unable to fetch the latest release for {0}. GitHub API: {1}. GitHub web fallback: {2}" -f $Repo, $apiError, $fallbackError)
+}
+
+function Get-LatestOstRelease {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Config)
+
+    $ostConfig = Get-ConfigValue -Object $Config -Name "ost" -DefaultValue $null
+    $networkConfig = Get-ConfigValue -Object $Config -Name "network" -DefaultValue $null
+    $repo = [string](Get-ConfigValue -Object $ostConfig -Name "githubRepo" -DefaultValue "huanyuejue/OpenSteamTool")
+    $timeoutSeconds = [Math]::Min([int](Get-ConfigValue -Object $networkConfig -Name "timeoutSeconds" -DefaultValue 30), 6)
+    if ($timeoutSeconds -lt 1) { $timeoutSeconds = 6 }
+    if ($script:OstReleaseCache.ContainsKey($repo)) {
+        return $script:OstReleaseCache[$repo]
+    }
+
+    $assetNameTemplate = [string](Get-ConfigValue -Object $ostConfig -Name "assetNameTemplate" -DefaultValue "OpenSteamTool-{tag}-Release.zip")
+    $release = Get-GitHubLatestRelease -Repo $repo -OstConfig $ostConfig -TimeoutSeconds $timeoutSeconds -AssetNameTemplate $assetNameTemplate
+    $script:OstReleaseCache[$repo] = $release
+    return $release
 }
 
 function Test-SteamInstallPath {
@@ -1449,71 +1449,22 @@ function Get-SteamPath {
         return $script:SteamPathCache
     }
 
-    $candidates = @(
+    foreach ($configured in @(
         [string](Get-ConfigValue -Object $Config -Name "steamPath" -DefaultValue ""),
         [string]$env:STEAM_PATH
-    )
-
-    foreach ($process in @(Get-Process -Name "steam" -ErrorAction SilentlyContinue)) {
-        try {
-            if (-not [string]::IsNullOrWhiteSpace([string]$process.Path)) {
-                $candidates += Split-Path -Parent ([string]$process.Path)
-            }
-        } catch {
-            continue
-        }
-    }
-
-    foreach ($registryPath in @(
-        "HKCU:\Software\Valve\Steam",
-        "HKLM:\Software\WOW6432Node\Valve\Steam",
-        "HKLM:\Software\Valve\Steam"
     )) {
-        if (Test-Path $registryPath -ErrorAction SilentlyContinue) {
-            $item = Get-ItemProperty -Path $registryPath -ErrorAction SilentlyContinue
-            $steamPathValue = Get-ObjectPropertyValue -Object $item -Name "SteamPath"
-            $installPathValue = Get-ObjectPropertyValue -Object $item -Name "InstallPath"
-            $steamExeValue = Get-ObjectPropertyValue -Object $item -Name "SteamExe"
-            if (-not [string]::IsNullOrWhiteSpace($steamPathValue)) { $candidates += $steamPathValue }
-            if (-not [string]::IsNullOrWhiteSpace($installPathValue)) { $candidates += $installPathValue }
-            if (-not [string]::IsNullOrWhiteSpace($steamExeValue)) {
-                $candidates += Split-Path -Parent ([string]$steamExeValue)
-            }
-        }
-    }
-
-    foreach ($registryPath in @(
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\steam.exe",
-        "HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\steam.exe",
-        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\steam.exe"
-    )) {
-        if (-not (Test-Path $registryPath -ErrorAction SilentlyContinue)) { continue }
-        try {
-            $steamExe = [string](Get-Item -Path $registryPath -ErrorAction Stop).GetValue("")
-            if (-not [string]::IsNullOrWhiteSpace($steamExe)) {
-                $candidates += Split-Path -Parent $steamExe.Trim('"')
-            }
-        } catch {
-            continue
-        }
-    }
-
-    foreach ($drive in @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
-        $root = [string]$drive.Root
-        if ([string]::IsNullOrWhiteSpace($root)) { continue }
-        $candidates += @(
-            [System.IO.Path]::Combine($root, "Steam"),
-            [System.IO.Path]::Combine($root, "Program Files (x86)", "Steam"),
-            [System.IO.Path]::Combine($root, "Program Files", "Steam")
-        )
-    }
-
-    foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
-        $candidatePath = ([string]$candidate).Trim().Trim('"')
+        if ([string]::IsNullOrWhiteSpace($configured)) { continue }
+        $candidatePath = $configured.Trim().Trim('"')
         if (Test-SteamInstallPath -PathValue $candidatePath) {
             $script:SteamPathCache = [System.IO.Path]::GetFullPath($candidatePath)
             return $script:SteamPathCache
         }
+    }
+
+    $detected = Find-InstalledSteamPath
+    if (-not [string]::IsNullOrWhiteSpace($detected)) {
+        $script:SteamPathCache = $detected
+        return $script:SteamPathCache
     }
 
     Write-UiStatus -Kind warn -Text "没有自动找到 Steam。"
@@ -2069,9 +2020,9 @@ function Invoke-AddGame {
     }
     if ($ostInstalled) {
         $manifestConfig = Get-ConfigValue -Object $Config -Name "manifest" -DefaultValue $null
-        $manifestSource = [string](Get-ConfigValue -Object $manifestConfig -Name "source" -DefaultValue "wudrm")
+        $manifestSource = [string](Get-ConfigValue -Object $manifestConfig -Name "source" -DefaultValue "manifestdex")
         $tomlPath = Get-OstConfigPath -Config $Config -SteamPath $steamPath
-        if (Set-OstManifestSourceInToml -TomlPath $tomlPath -Source $manifestSource) {
+        if (Set-OstManifestSourceInToml -TomlPath $tomlPath -Source $manifestSource -Config $Config) {
             Write-UiLog -Scope "addgame" -Level SUCCESS -Message ("manifest source -> {0} in {1}" -f $manifestSource, (Get-DisplayPath -PathValue $tomlPath))
         }
     }
@@ -2365,7 +2316,7 @@ function Get-SteamVersionInfo {
 
     $webHelperLog = Join-Path $SteamPath "logs\webhelper_js.txt"
     if (Test-Path -LiteralPath $webHelperLog -PathType Leaf) {
-        $lines = @(Get-Content -LiteralPath $webHelperLog -Tail 4000 -ErrorAction SilentlyContinue)
+        $lines = @(Get-Content -LiteralPath $webHelperLog -Encoding UTF8 -Tail 4000 -ErrorAction SilentlyContinue)
         [array]::Reverse($lines)
         foreach ($line in $lines) {
             if ($line -notmatch "Updated Steam Version Info:\s*(\{.*\})") { continue }
@@ -2385,7 +2336,7 @@ function Get-SteamVersionInfo {
 
     $bootstrapLog = Join-Path $SteamPath "logs\bootstrap_log.txt"
     if (Test-Path -LiteralPath $bootstrapLog -PathType Leaf) {
-        $lines = @(Get-Content -LiteralPath $bootstrapLog -Tail 4000 -ErrorAction SilentlyContinue)
+        $lines = @(Get-Content -LiteralPath $bootstrapLog -Encoding UTF8 -Tail 4000 -ErrorAction SilentlyContinue)
         [array]::Reverse($lines)
         foreach ($line in $lines) {
             if ($line -match "steam_client_win64 version (\d+)") {
@@ -3551,39 +3502,6 @@ function Get-OstSourceDirectoryFromGitHub {
     }
 }
 
-function Get-CachedOstSourceDirectory {
-    param(
-        [Parameter(Mandatory = $true)][pscustomobject]$Config,
-        [Parameter(Mandatory = $true)][string]$CacheRoot
-    )
-
-    if (-not (Test-Path -LiteralPath $CacheRoot)) { return $null }
-    $candidates = Get-ChildItem -LiteralPath $CacheRoot -Directory -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending
-    foreach ($candidate in $candidates) {
-        $extractRoot = Join-Path $candidate.FullName "extracted"
-        if (-not (Test-Path -LiteralPath $extractRoot -PathType Container)) { continue }
-        try {
-            Assert-OstSourceFiles -Config $Config -SourcePath $extractRoot
-            $metadataPath = Join-Path $candidate.FullName "metadata.json"
-            $metadata = $null
-            if (Test-Path -LiteralPath $metadataPath -PathType Leaf) {
-                $metadata = Get-Content -LiteralPath $metadataPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            }
-            return [pscustomobject]@{
-                SourcePath    = $extractRoot
-                Version       = if ($null -ne $metadata) { [string]$metadata.version } else { $candidate.Name }
-                PublishedDate = if ($null -ne $metadata) { [string]$metadata.publishedDate } else { "" }
-                AssetName     = if ($null -ne $metadata) { [string]$metadata.assetName } else { "" }
-                Source        = "validated-cache"
-            }
-        } catch {
-            continue
-        }
-    }
-    return $null
-}
-
 function Backup-ExistingFile {
     param(
         [Parameter(Mandatory = $true)][string]$SourceFile,
@@ -3606,55 +3524,45 @@ function Backup-ExistingFile {
 function Get-OstConfigTemplate {
     param([Parameter(Mandatory = $true)][string]$Source)
 
-    # Written only when the user has no opensteamtool.toml yet, so this is the
-    # copy a mainland user ends up with. wudrm is the default because it is the
-    # only upstream on plain HTTP: no TLS handshake and no proxy needed, which is
-    # what actually decides whether a download starts. The timeouts are wide on
-    # purpose - a manifest request is under a kilobyte, so a dead request means
-    # the upstream refused it, never that the transfer was slow, and cutting a
-    # healthy request short on a bad line is the failure mode worth avoiding.
+    # Offline fallback written only when opensteamtool.toml cannot be fetched from
+    # the repo. Kept aligned with the repository's opensteamtool.toml.
     $line = 'url = "{0}"' -f $Source
     return @(
-        "# opensteamtool.toml - OpenSteamTool configuration",
-        "# Place at: <Steam>/opensteamtool.toml",
-        "# Loaded at startup and hot-reloaded after changes.",
-        "",
         "[log]",
-        "# Log verbosity for all log files (Debug build only).",
-        "# Valid: trace, debug, info, warn, error",
         'level = "info"',
         "",
         "[manifest]",
-        "# Which upstream API to query for depot manifest request codes.",
-        '#   "wudrm"         -> http://gmrc.wudrm.com/manifest/{gid}',
-        "#                      plain HTTP, the only one reachable from CN",
-        '#   "steamrun"      -> https://manifest.steam.run/api/manifest/{gid}',
-        '#   "opensteamtool" -> https://manifest.opensteamtool.com/{gid}.wudrm',
-        "#",
-        "# Every one of them is flaky. Measured 2026-09-23 from a CN line: wudrm",
-        "# answers about half of all requests with a 503, steamrun with a 502, and",
-        "# the opensteamtool host refuses non-browser clients outright. The tool",
-        "# does not retry, and this key takes a single value, so the only way to",
-        "# make downloads survive is a manifest.lua in <Steam>/config/lua: Lua wins",
-        "# over this setting and can retry every upstream in turn.",
         $line,
-        "",
-        "# HTTP timeouts for manifest requests (milliseconds).",
-        "# 1.5.3.5 shares one 15000 ms budget across all failover attempts, so a wide",
-        "# recv value can eat the whole budget and leave failover unable to retry.",
-        "# These stay several times larger than a healthy request (measured 0.27-1.2 s).",
+        "failover = true",
         "timeout_resolve_ms = 2000",
         "timeout_connect_ms = 3000",
-        "timeout_send_ms    = 3000",
-        "timeout_recv_ms    = 5000"
+        "timeout_send_ms = 3000",
+        "timeout_recv_ms = 5000",
+        "",
+        "[stats]",
+        "enable_api = true",
+        "",
+        "[donate]",
+        "enabled = false",
+        "",
+        "[lua]",
+        "paths = []",
+        "",
+        "[inject]",
+        "enabled = false",
+        "",
+        "[cloud]",
+        "enabled = true",
+        "",
+        "[remote]",
+        'url_template = "https://gh-proxy.com/https://raw.githubusercontent.com/mmxlyo/steam-monitor/{channel}/{component}/{sha256}.toml"'
     )
 }
 
 function Get-OstTomlUrls {
     param([Parameter(Mandatory = $true)]$ManifestConfig)
 
-    # Builds the mirror list for our own opensteamtool.toml. Same substitution shape as
-    # Get-OstDownloadUrls so both pools are configured the same way.
+    # Builds the mirror list for our own opensteamtool.toml.
     $repo = [string](Get-ConfigValue -Object $ManifestConfig -Name "tomlRepo" -DefaultValue "")
     $branch = [string](Get-ConfigValue -Object $ManifestConfig -Name "tomlBranch" -DefaultValue "main")
     $file = [string](Get-ConfigValue -Object $ManifestConfig -Name "tomlFileName" -DefaultValue "opensteamtool.toml")
@@ -3669,10 +3577,14 @@ function Get-OstTomlUrls {
         if ($url -notin $urls) { $urls += $url }
     }
 
-    # From CN the mirrors are the ones that answer, so put them first; elsewhere the
-    # raw.githubusercontent host is direct and usually fastest.
-    if ((Get-NetworkRegion) -eq "CN") { return @($urls) }
-    return @($urls)
+    # From CN the mirrors are the ones that answer, so put them ahead of raw.githubusercontent.com;
+    # elsewhere keep raw.githubusercontent.com direct first.
+    $directUrls = @($urls | Where-Object { $_ -match '^https?://raw\.githubusercontent\.com/' })
+    $mirrorUrls = @($urls | Where-Object { $_ -notmatch '^https?://raw\.githubusercontent\.com/' })
+    if ((Get-NetworkRegion) -eq "CN") {
+        return @($mirrorUrls + $directUrls)
+    }
+    return @($directUrls + $mirrorUrls)
 }
 
 function Get-OstTomlContent {
@@ -3719,11 +3631,12 @@ function Get-OstTomlContent {
 function Set-OstManifestSourceInToml {
     param(
         [Parameter(Mandatory = $true)][string]$TomlPath,
-        [Parameter(Mandatory = $true)][string]$Source
+        [Parameter(Mandatory = $true)][string]$Source,
+        [AllowNull()][pscustomobject]$Config = $null
     )
 
     # Sources understood by the OST builds in the wild: the 1.5.x line knows the first three,
-    # the 1.4.8.x line adds "manifestdex". "wudrm" is the one that keeps working from CN.
+    # the 1.4.8.x line adds "manifestdex".
     $validSources = @("opensteamtool", "wudrm", "steamrun", "manifestdex")
     if ($Source -notin $validSources) {
         throw ("Invalid manifest source: {0}. Valid: {1}" -f $Source, ($validSources -join ", "))
@@ -3736,8 +3649,9 @@ function Set-OstManifestSourceInToml {
         # Prefer the project's own toml, fetched from the repo, over the template
         # embedded below. The embedded copy exists only so an offline or fully
         # mirror-blocked first run still produces a working file.
-        $manifestConfig = Get-ConfigValue -Object $Config -Name "manifest" -DefaultValue $null
-        $fetched = Get-OstTomlContent -ManifestConfig $manifestConfig
+        $effectiveConfig = if ($null -ne $Config) { $Config } else { New-DefaultConfig }
+        $manifestConfig = Get-ConfigValue -Object $effectiveConfig -Name "manifest" -DefaultValue $null
+        $fetched = if ($null -ne $manifestConfig) { Get-OstTomlContent -ManifestConfig $manifestConfig } else { $null }
         if (-not [string]::IsNullOrWhiteSpace($fetched)) {
             # Normalise to LF->CRLF the same way the template path does, and never
             # write a BOM: strict TOML readers reject a leading BOM as an invalid
@@ -3747,7 +3661,7 @@ function Set-OstManifestSourceInToml {
             [System.IO.File]::WriteAllText($TomlPath, $norm, (New-Object System.Text.UTF8Encoding $false))
             # The downloaded file carries our url already, but keep the configured
             # source authoritative so manifest.source still means something.
-            Set-OstManifestSourceInToml -TomlPath $TomlPath -Source $Source | Out-Null
+            Set-OstManifestSourceInToml -TomlPath $TomlPath -Source $Source -Config $effectiveConfig | Out-Null
             Write-UiLog -Scope "ost" -Level SUCCESS -Message ("toml -> {0}" -f (Get-DisplayPath -PathValue $TomlPath))
             return $true
         }
@@ -3849,55 +3763,16 @@ function Get-CloudRedirectRelease {
     $timeoutSec = [Math]::Min($TimeoutSeconds, 10)
     if ($timeoutSec -lt 1) { $timeoutSec = 10 }
 
-    # Same two tiers as the OST lookup: the API carries the SHA-256 digest; the
-    # web redirect only yields the tag, and Assert-OstDownloadSha256 then falls
-    # back to comparing a mirror download against the official asset.
-    $apiUrl = "https://api.github.com/repos/{0}/releases/latest" -f $Repo
-    $apiUrls = @(Get-GitHubMirrorUrls -OstConfig $OstConfig -OfficialUrl $apiUrl)
-    foreach ($candidateApiUrl in $apiUrls) {
-        try {
-            $release = Invoke-RestMethod -Uri $candidateApiUrl -Headers (Get-GitHubHeaders) -TimeoutSec $timeoutSec
-            if ($null -ne $release -and
-                $null -ne $release.PSObject.Properties["tag_name"] -and
-                -not [string]::IsNullOrWhiteSpace([string]$release.tag_name)) {
-                $asset = @($release.assets) | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
-                if ($null -ne $asset) {
-                    return [pscustomobject]@{
-                        Tag         = [string]$release.tag_name
-                        OfficialUrl = [string]$asset.browser_download_url
-                        Sha256      = Get-Sha256FromAssetDigest -Asset $asset
-                    }
-                }
-            }
-        } catch {
-        }
+    $release = Get-GitHubLatestRelease -Repo $Repo -OstConfig $OstConfig -TimeoutSeconds $timeoutSec -RequiredAssetName $AssetName
+    $asset = @($release.assets) | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+    if ($null -eq $asset) {
+        throw ("CloudRedirect release {0} did not contain {1}." -f [string]$release.tag_name, $AssetName)
     }
-
-    $latestUrl = "https://github.com/{0}/releases/latest" -f $Repo
-    $webUrls = @(Get-GitHubMirrorUrls -OstConfig $OstConfig -OfficialUrl $latestUrl)
-    foreach ($candidateWebUrl in $webUrls) {
-        $request = [System.Net.HttpWebRequest]::Create($candidateWebUrl)
-        $request.UserAgent = "STEAMX"
-        $request.AllowAutoRedirect = $true
-        $request.Timeout = $timeoutSec * 1000
-        $request.ReadWriteTimeout = $timeoutSec * 1000
-        $response = $null
-        try {
-            $response = $request.GetResponse()
-            if ([string]$response.ResponseUri.AbsoluteUri -match '/releases/tag/([^/?#]+)') {
-                $tag = [Uri]::UnescapeDataString($Matches[1])
-                return [pscustomobject]@{
-                    Tag         = $tag
-                    OfficialUrl = "https://github.com/{0}/releases/download/{1}/{2}" -f $Repo, ([Uri]::EscapeDataString($tag)), $AssetName
-                    Sha256      = ""
-                }
-            }
-        } catch {
-        } finally {
-            if ($null -ne $response) { $response.Dispose() }
-        }
+    return [pscustomobject]@{
+        Tag         = [string]$release.tag_name
+        OfficialUrl = [string]$asset.browser_download_url
+        Sha256      = Get-Sha256FromAssetDigest -Asset $asset
     }
-    throw "GitHub latest release redirect did not contain a tag."
 }
 
 function Get-CloudRedirectDll {
@@ -4346,109 +4221,6 @@ function Get-SmartAppControlState {
     return "NotApplicable"
 }
 
-function Disable-SmartAppControl {
-    # Windows 11 Smart App Control blocks unsigned DLLs (including OST shims).
-    # Run during every deploy/redeploy so a first install or repair turns it off
-    # when active, while staying a no-op when already Off or on Windows 10.
-    param(
-        [string]$LogFile = "",
-        [string]$PolicyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy",
-        [string]$ValueName = "VerifiedAndReputablePolicyState",
-        [switch]$SkipDefenderQuery,
-        [switch]$SkipCiTool,
-        [switch]$NoElevation
-    )
-
-    $state = Get-SmartAppControlState -PolicyPath $PolicyPath -ValueName $ValueName -SkipDefenderQuery:$SkipDefenderQuery
-    if ($state -eq "Off" -or $state -eq "NotApplicable") {
-        if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
-            Write-Log -Message ("Smart App Control does not need changes (state: {0})." -f $state) -Scope "sac" -LogFile $LogFile -OnlyFile
-        }
-        return [pscustomobject]@{
-            Status        = "Skipped"
-            PreviousState = $state
-            CurrentState  = $state
-            Message       = ""
-        }
-    }
-
-    try {
-        $needsAdmin = ($PolicyPath -match '^HKLM:')
-        $canWriteDirectly = (-not $needsAdmin) -or (Test-IsAdministrator)
-
-        if ($canWriteDirectly) {
-            if (-not (Test-Path -LiteralPath $PolicyPath)) {
-                New-Item -Path $PolicyPath -Force -ErrorAction Stop | Out-Null
-            }
-            Set-ItemProperty -LiteralPath $PolicyPath -Name $ValueName -Value 0 -Type DWord -Force -ErrorAction Stop
-            if (-not $SkipCiTool) {
-                $citool = Get-Command -Name "citool.exe" -ErrorAction SilentlyContinue
-                if ($null -ne $citool) {
-                    Start-Process -FilePath $citool.Source -ArgumentList "-r" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
-                }
-            }
-        } else {
-            if ($NoElevation -or -not [Environment]::UserInteractive) {
-                if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
-                    Write-Log -Message "Smart App Control is active but administrator elevation is unavailable." -Level "WARN" -Scope "sac" -LogFile $LogFile -OnlyFile
-                }
-                return [pscustomobject]@{
-                    Status        = "NeedsAdmin"
-                    PreviousState = $state
-                    CurrentState  = $state
-                    Message       = "Administrator privileges required."
-                }
-            }
-
-            $escapedPath = $PolicyPath.Replace("'", "''")
-            $escapedName = $ValueName.Replace("'", "''")
-            $ciSnippet = if ($SkipCiTool) {
-                ""
-            } else {
-                "; `$ci = Get-Command -Name 'citool.exe' -ErrorAction SilentlyContinue; if (`$null -ne `$ci) { Start-Process -FilePath `$ci.Source -ArgumentList '-r' -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue }"
-            }
-            $elevatedCmd = "`$p = '$escapedPath'; if (-not (Test-Path -LiteralPath `$p)) { New-Item -Path `$p -Force | Out-Null }; Set-ItemProperty -LiteralPath `$p -Name '$escapedName' -Value 0 -Type DWord -Force$ciSnippet"
-            $proc = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $elevatedCmd) -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
-            if ($null -ne $proc -and $proc.ExitCode -ne 0) {
-                throw ("Elevated Smart App Control command exited with code {0}." -f $proc.ExitCode)
-            }
-        }
-
-        $newState = Get-SmartAppControlState -PolicyPath $PolicyPath -ValueName $ValueName -SkipDefenderQuery:$SkipDefenderQuery
-        if ($newState -eq "Off") {
-            if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
-                Write-Log -Message ("Disabled Windows Smart App Control (previous state: {0})." -f $state) -Scope "sac" -LogFile $LogFile -OnlyFile
-            }
-            return [pscustomobject]@{
-                Status        = "Disabled"
-                PreviousState = $state
-                CurrentState  = $newState
-                Message       = ""
-            }
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
-            Write-Log -Message ("Smart App Control state did not switch to Off (current: {0})." -f $newState) -Level "WARN" -Scope "sac" -LogFile $LogFile -OnlyFile
-        }
-        return [pscustomobject]@{
-            Status        = "Failed"
-            PreviousState = $state
-            CurrentState  = $newState
-            Message       = ("Smart App Control state remained: {0}" -f $newState)
-        }
-    } catch {
-        if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
-            Write-Log -Message ("Failed to disable Smart App Control: {0}" -f $_.Exception.Message) -Level "WARN" -Scope "sac" -LogFile $LogFile -OnlyFile
-        }
-        return [pscustomobject]@{
-            Status        = "Failed"
-            PreviousState = $state
-            CurrentState  = $state
-            Message       = $_.Exception.Message
-        }
-    }
-}
-
 function Test-DefenderExclusionPresent {
     param(
         [string]$TargetPath,
@@ -4466,9 +4238,7 @@ function Test-DefenderExclusionPresent {
         if ([string]::IsNullOrWhiteSpace([string]$entry)) { continue }
         $normEntry = ([string]$entry).Trim().TrimEnd('\')
         if ($normEntry -match '^[A-Za-z]:$') { $normEntry = $normEntry + '\' }
-        if ($normEntry -ieq $normTarget) {
-            return $true
-        }
+        if ($normEntry -ieq $normTarget) { return $true }
     }
     return $false
 }
@@ -4530,9 +4300,28 @@ function Invoke-DeployWindowsSecuritySetup {
 
     if ($canWriteDirectly) {
         if ($needSac) {
-            $sacRes = Disable-SmartAppControl -LogFile $LogFile -PolicyPath $PolicyPath -ValueName $ValueName -SkipDefenderQuery:$SkipDefenderQuery -SkipCiTool:$SkipCiTool -NoElevation:$NoElevation
-            $sacStatus = $sacRes.Status
-            $sacMessage = $sacRes.Message
+            try {
+                if (-not (Test-Path -LiteralPath $PolicyPath)) {
+                    New-Item -Path $PolicyPath -Force -ErrorAction Stop | Out-Null
+                }
+                Set-ItemProperty -LiteralPath $PolicyPath -Name $ValueName -Value 0 -Type DWord -Force -ErrorAction Stop
+                if (-not $SkipCiTool) {
+                    $citool = Get-Command -Name "citool.exe" -ErrorAction SilentlyContinue
+                    if ($null -ne $citool) {
+                        Start-Process -FilePath $citool.Source -ArgumentList "-r" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+                    }
+                }
+                $verifySac = Get-SmartAppControlState -PolicyPath $PolicyPath -ValueName $ValueName -SkipDefenderQuery:$SkipDefenderQuery
+                if ($verifySac -eq "Off") {
+                    $sacStatus = "Disabled"
+                } else {
+                    $sacStatus = "Failed"
+                    $sacMessage = ("Smart App Control state remained: {0}" -f $verifySac)
+                }
+            } catch {
+                $sacStatus = "Failed"
+                $sacMessage = $_.Exception.Message
+            }
         }
         if ($needDefender) {
             try {
@@ -4543,134 +4332,108 @@ function Invoke-DeployWindowsSecuritySetup {
                     Add-MpPreference -ExclusionPath $SteamPath -ErrorAction Stop
                     $defenderStatus = "Added"
                 }
-                if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
-                    Write-Log -Message ("Defender exclusion for Steam path ({0}): {1}" -f $SteamPath, $defenderStatus) -Scope "defender" -LogFile $LogFile -OnlyFile
-                }
             } catch {
                 $defenderStatus = "Failed"
                 $defenderMessage = $_.Exception.Message
-                if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
-                    Write-Log -Message ("Failed to add Defender exclusion for '{0}': {1}" -f $SteamPath, $_.Exception.Message) -Level "WARN" -Scope "defender" -LogFile $LogFile -OnlyFile
-                }
             }
         }
-        return [pscustomobject]@{
-            SacStatus       = $sacStatus
-            SacMessage      = $sacMessage
-            DefenderStatus  = $defenderStatus
-            DefenderMessage = $defenderMessage
-        }
-    }
-
-    if ($NoElevation -or -not [Environment]::UserInteractive) {
+    } elseif ($NoElevation -or -not [Environment]::UserInteractive) {
         if ($needSac) { $sacStatus = "NeedsAdmin"; $sacMessage = "Administrator privileges required." }
         if ($needDefender) { $defenderStatus = "NeedsAdmin"; $defenderMessage = "Administrator privileges required." }
-        return [pscustomobject]@{
-            SacStatus       = $sacStatus
-            SacMessage      = $sacMessage
-            DefenderStatus  = $defenderStatus
-            DefenderMessage = $defenderMessage
-        }
-    }
+    } else {
+        $resultFile = Join-Path ([System.IO.Path]::GetTempPath()) ("steamx-sec-" + [Guid]::NewGuid().ToString("N") + ".json")
+        try {
+            $escPolicyPath = $PolicyPath.Replace("'", "''")
+            $escValueName = $ValueName.Replace("'", "''")
+            $escSteamPath = $SteamPath.Replace("'", "''")
+            $escResultFile = $resultFile.Replace("'", "''")
+            $doSacLit = if ($needSac) { '$true' } else { '$false' }
+            $doDefLit = if ($needDefender) { '$true' } else { '$false' }
+            $skipCiLit = if ($SkipCiTool) { '$true' } else { '$false' }
 
-    $resultFile = Join-Path ([System.IO.Path]::GetTempPath()) ("steamx-sec-" + [Guid]::NewGuid().ToString("N") + ".json")
-    try {
-        $escPolicyPath = $PolicyPath.Replace("'", "''")
-        $escValueName = $ValueName.Replace("'", "''")
-        $escSteamPath = $SteamPath.Replace("'", "''")
-        $escResultFile = $resultFile.Replace("'", "''")
-        $doSacLit = if ($needSac) { '$true' } else { '$false' }
-        $doDefLit = if ($needDefender) { '$true' } else { '$false' }
-        $skipCiLit = if ($SkipCiTool) { '$true' } else { '$false' }
-
-        $childScript = @(
-            "`$ErrorActionPreference = 'Stop'"
-            "`$res = @{ sacStatus = 'Skipped'; sacMessage = ''; defenderStatus = 'Skipped'; defenderMessage = '' }"
-            "if ($doSacLit) {"
-            "    try {"
-            "        `$p = '$escPolicyPath'"
-            "        if (-not (Test-Path -LiteralPath `$p)) { New-Item -Path `$p -Force | Out-Null }"
-            "        Set-ItemProperty -LiteralPath `$p -Name '$escValueName' -Value 0 -Type DWord -Force"
-            "        if (-not $skipCiLit) {"
-            "            `$ci = Get-Command -Name 'citool.exe' -ErrorAction SilentlyContinue"
-            "            if (`$null -ne `$ci) { Start-Process -FilePath `$ci.Source -ArgumentList '-r' -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue }"
-            "        }"
-            "        `$res.sacStatus = 'Disabled'"
-            "    } catch {"
-            "        `$res.sacStatus = 'Failed'"
-            "        `$res.sacMessage = `$_.Exception.Message"
-            "    }"
-            "}"
-            "if ($doDefLit) {"
-            "    try {"
-            "        `$sp = '$escSteamPath'"
-            "        `$normSp = `$sp.Trim().TrimEnd('\')"
-            "        if (`$normSp -match '^[A-Za-z]:`$') { `$normSp = `$normSp + '\' }"
-            "        `$already = `$false"
-            "        `$mp = Get-MpPreference -ErrorAction SilentlyContinue"
-            "        if (`$null -ne `$mp -and `$null -ne `$mp.ExclusionPath) {"
-            "            foreach (`$e in @(`$mp.ExclusionPath)) {"
-            "                if ([string]::IsNullOrWhiteSpace([string]`$e)) { continue }"
-            "                `$ne = ([string]`$e).Trim().TrimEnd('\')"
-            "                if (`$ne -match '^[A-Za-z]:`$') { `$ne = `$ne + '\' }"
-            "                if (`$ne -ieq `$normSp) { `$already = `$true; break }"
-            "            }"
-            "        }"
-            "        if (`$already) {"
-            "            `$res.defenderStatus = 'AlreadyExcluded'"
-            "        } else {"
-            "            Add-MpPreference -ExclusionPath `$sp -ErrorAction Stop"
-            "            `$res.defenderStatus = 'Added'"
-            "        }"
-            "    } catch {"
-            "        `$res.defenderStatus = 'Failed'"
-            "        `$res.defenderMessage = `$_.Exception.Message"
-            "    }"
-            "}"
-            "`$json = (`$res | ConvertTo-Json -Compress)"
-            "[System.IO.File]::WriteAllText('$escResultFile', `$json, (New-Object System.Text.UTF8Encoding(`$false)))"
-        ) -join "`n"
-        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
-        $proc = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded) -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
-        if ($null -ne $proc -and $proc.ExitCode -ne 0 -and -not (Test-Path -LiteralPath $resultFile -PathType Leaf)) {
-            throw ("Elevated security setup exited with code {0}." -f $proc.ExitCode)
-        }
-        if (Test-Path -LiteralPath $resultFile -PathType Leaf) {
-            $parsed = [System.IO.File]::ReadAllText($resultFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-            if ($needSac) {
-                $sacStatus = [string]$parsed.sacStatus
-                $sacMessage = [string]$parsed.sacMessage
-                if ($sacStatus -eq "Disabled") {
-                    $verifySac = Get-SmartAppControlState -PolicyPath $PolicyPath -ValueName $ValueName -SkipDefenderQuery:$SkipDefenderQuery
-                    if ($verifySac -ne "Off") {
-                        $sacStatus = "Failed"
-                        $sacMessage = ("Smart App Control state remained: {0}" -f $verifySac)
+            $childScript = @(
+                "`$ErrorActionPreference = 'Stop'"
+                "`$res = @{ sacStatus = 'Skipped'; sacMessage = ''; defenderStatus = 'Skipped'; defenderMessage = '' }"
+                "if ($doSacLit) {"
+                "    try {"
+                "        `$p = '$escPolicyPath'"
+                "        if (-not (Test-Path -LiteralPath `$p)) { New-Item -Path `$p -Force | Out-Null }"
+                "        Set-ItemProperty -LiteralPath `$p -Name '$escValueName' -Value 0 -Type DWord -Force"
+                "        if (-not $skipCiLit) {"
+                "            `$ci = Get-Command -Name 'citool.exe' -ErrorAction SilentlyContinue"
+                "            if (`$null -ne `$ci) { Start-Process -FilePath `$ci.Source -ArgumentList '-r' -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue }"
+                "        }"
+                "        `$res.sacStatus = 'Disabled'"
+                "    } catch {"
+                "        `$res.sacStatus = 'Failed'"
+                "        `$res.sacMessage = `$_.Exception.Message"
+                "    }"
+                "}"
+                "if ($doDefLit) {"
+                "    try {"
+                "        `$sp = '$escSteamPath'"
+                "        `$normSp = `$sp.Trim().TrimEnd('\')"
+                "        if (`$normSp -match '^[A-Za-z]:`$') { `$normSp = `$normSp + '\' }"
+                "        `$already = `$false"
+                "        `$mp = Get-MpPreference -ErrorAction SilentlyContinue"
+                "        if (`$null -ne `$mp -and `$null -ne `$mp.ExclusionPath) {"
+                "            foreach (`$e in @(`$mp.ExclusionPath)) {"
+                "                if ([string]::IsNullOrWhiteSpace([string]`$e)) { continue }"
+                "                `$ne = ([string]`$e).Trim().TrimEnd('\')"
+                "                if (`$ne -match '^[A-Za-z]:`$') { `$ne = `$ne + '\' }"
+                "                if (`$ne -ieq `$normSp) { `$already = `$true; break }"
+                "            }"
+                "        }"
+                "        if (`$already) { `$res.defenderStatus = 'AlreadyExcluded' } else { Add-MpPreference -ExclusionPath `$sp -ErrorAction Stop; `$res.defenderStatus = 'Added' }"
+                "    } catch {"
+                "        `$res.defenderStatus = 'Failed'"
+                "        `$res.defenderMessage = `$_.Exception.Message"
+                "    }"
+                "}"
+                "`$json = (`$res | ConvertTo-Json -Compress)"
+                "[System.IO.File]::WriteAllText('$escResultFile', `$json, (New-Object System.Text.UTF8Encoding(`$false)))"
+            ) -join "`n"
+            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
+            $proc = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded) -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+            if ($null -ne $proc -and $proc.ExitCode -ne 0 -and -not (Test-Path -LiteralPath $resultFile -PathType Leaf)) {
+                throw ("Elevated security setup exited with code {0}." -f $proc.ExitCode)
+            }
+            if (Test-Path -LiteralPath $resultFile -PathType Leaf) {
+                $parsed = [System.IO.File]::ReadAllText($resultFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+                if ($needSac) {
+                    $sacStatus = [string]$parsed.sacStatus
+                    $sacMessage = [string]$parsed.sacMessage
+                    if ($sacStatus -eq "Disabled") {
+                        $verifySac = Get-SmartAppControlState -PolicyPath $PolicyPath -ValueName $ValueName -SkipDefenderQuery:$SkipDefenderQuery
+                        if ($verifySac -ne "Off") {
+                            $sacStatus = "Failed"
+                            $sacMessage = ("Smart App Control state remained: {0}" -f $verifySac)
+                        }
                     }
                 }
+                if ($needDefender) {
+                    $defenderStatus = [string]$parsed.defenderStatus
+                    $defenderMessage = [string]$parsed.defenderMessage
+                }
             }
-            if ($needDefender) {
-                $defenderStatus = [string]$parsed.defenderStatus
-                $defenderMessage = [string]$parsed.defenderMessage
+        } catch {
+            if ($needSac) { $sacStatus = "Failed"; $sacMessage = $_.Exception.Message }
+            if ($needDefender) { $defenderStatus = "Failed"; $defenderMessage = $_.Exception.Message }
+        } finally {
+            if (Test-Path -LiteralPath $resultFile -PathType Leaf) {
+                Remove-Item -LiteralPath $resultFile -Force -ErrorAction SilentlyContinue
             }
-        }
-    } catch {
-        if ($needSac) { $sacStatus = "Failed"; $sacMessage = $_.Exception.Message }
-        if ($needDefender) { $defenderStatus = "Failed"; $defenderMessage = $_.Exception.Message }
-        if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
-            Write-Log -Message ("Elevated Windows security setup failed: {0}" -f $_.Exception.Message) -Level "WARN" -Scope "security" -LogFile $LogFile -OnlyFile
-        }
-    } finally {
-        if (Test-Path -LiteralPath $resultFile -PathType Leaf) {
-            Remove-Item -LiteralPath $resultFile -Force -ErrorAction SilentlyContinue
         }
     }
 
     if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
         if ($needSac) {
-            Write-Log -Message ("Smart App Control setup result: {0} {1}" -f $sacStatus, $sacMessage).Trim() -Scope "sac" -LogFile $LogFile -OnlyFile
+            $lvl = if ($sacStatus -in @("Failed", "NeedsAdmin")) { "WARN" } else { "INFO" }
+            Write-Log -Message ("Smart App Control setup ({0}): {1} {2}" -f $sacState, $sacStatus, $sacMessage).Trim() -Level $lvl -Scope "sac" -LogFile $LogFile -OnlyFile
         }
         if ($needDefender) {
-            Write-Log -Message ("Defender exclusion setup result ({0}): {1} {2}" -f $SteamPath, $defenderStatus, $defenderMessage).Trim() -Scope "defender" -LogFile $LogFile -OnlyFile
+            $lvl = if ($defenderStatus -in @("Failed", "NeedsAdmin")) { "WARN" } else { "INFO" }
+            Write-Log -Message ("Defender exclusion setup ({0}): {1} {2}" -f $SteamPath, $defenderStatus, $defenderMessage).Trim() -Level $lvl -Scope "defender" -LogFile $LogFile -OnlyFile
         }
     }
 
@@ -4850,7 +4613,7 @@ function Invoke-DeployOst {
         $configRollbackBackup = if ($configExisted) { Backup-ExistingFile -SourceFile $tomlPath -BackupDir $RunContext.BackupDir } else { "" }
         # Out-Null: the function returns a bool and PowerShell would otherwise echo it
         # to the console as a stray "True" between the Deployed lines.
-        Set-OstManifestSourceInToml -TomlPath $tomlPath -Source ([string](Get-ConfigValue -Object (Get-ConfigValue -Object $Config -Name "manifest" -DefaultValue $null) -Name "source" -DefaultValue "wudrm")) | Out-Null
+        Set-OstManifestSourceInToml -TomlPath $tomlPath -Source ([string](Get-ConfigValue -Object (Get-ConfigValue -Object $Config -Name "manifest" -DefaultValue $null) -Name "source" -DefaultValue "manifestdex")) -Config $Config | Out-Null
         # Follows the setting even when the DLL failed to download: OST just logs
         # a warning and skips cloud saves if the DLL is missing, and the switch is
         # already on once a later run (or the user) puts the DLL in place.
@@ -4892,24 +4655,6 @@ function Invoke-DeployOst {
         # report success before it deletes the transaction dir.
         $deploySucceeded = $true
         Write-UiProgress -Percent 90 -Status "写入配置"
-        # Persist the verified package into ./cache/opensteamtools/<version>/extracted so
-        # Invoke-UninstallOst can later identify and hash-check the files this run
-        # installed. Without this the deploy cache lives only in the transient
-        # TransactionDir and is deleted on completion, so uninstall reported
-        # 'No validated OST cache was found'.
-        try {
-            $persistRoot = Resolve-LocalPath -PathValue './cache/opensteamtools' -BasePath $RunContext.ScriptRoot
-            $pkgDir = Join-Path $persistRoot ([string]$package.Version)
-            $pkgExtract = Join-Path $pkgDir 'extracted'
-            if (Test-Path -LiteralPath $pkgExtract) { Remove-Item -LiteralPath $pkgExtract -Recurse -Force -ErrorAction SilentlyContinue }
-            Ensure-Directory -PathValue $pkgExtract
-            Copy-Item -Path (Join-Path $package.SourcePath '*') -Destination $pkgExtract -Recurse -Force -ErrorAction Stop
-            $meta = [pscustomobject]@{ version = [string]$package.Version; publishedDate = [string]$package.PublishedDate; assetName = [string]$package.AssetName }
-            ($meta | ConvertTo-Json) | Set-Content -LiteralPath (Join-Path $pkgDir 'metadata.json') -Encoding UTF8
-            Get-ChildItem -LiteralPath $persistRoot -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 1 | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-        } catch {
-            Write-Log -Message ('Could not persist OST cache for uninstall: {0}' -f $_.Exception.Message) -Level 'WARN' -Scope 'ost' -LogFile $RunContext.LogFile -OnlyFile
-        }
         Set-OstStartupCleanupCompleted
         Write-UiProgress -Complete -Status "完成"
 
@@ -4976,8 +4721,7 @@ function Invoke-DeployOst {
             Write-UiStatus -Kind warn -Text "智能应用控制可能导致部署失效，建议以管理员身份重试。"
         }
     }
-    $restartSteam =[bool](Get-ConfigValue -Object $ostConfig -Name "restartSteamAfterDeploy" -DefaultValue $true)
-    if ($restartSteam) {
+    if ($restartSteamAfterDeploy) {
         Start-Steam -RunContext $RunContext -SteamPath $steamPath
         Write-UiStatus -Kind dim -Text "Steam 已重新启动。"
     }
@@ -4992,7 +4736,7 @@ function Invoke-SetManifestSource {
 
     if ([string]::IsNullOrWhiteSpace($Source)) {
         $manifestConfig = Get-ConfigValue -Object $Config -Name "manifest" -DefaultValue $null
-        $Source = [string](Get-ConfigValue -Object $manifestConfig -Name "source" -DefaultValue "wudrm")
+        $Source = [string](Get-ConfigValue -Object $manifestConfig -Name "source" -DefaultValue "manifestdex")
     }
 
     $steamPath = Get-SteamPath -Config $Config
@@ -5003,7 +4747,7 @@ function Invoke-SetManifestSource {
         $backupPath = Backup-ExistingFile -SourceFile $tomlPath -BackupDir $RunContext.BackupDir
     }
     try {
-        Set-OstManifestSourceInToml -TomlPath $tomlPath -Source $Source | Out-Null
+        Set-OstManifestSourceInToml -TomlPath $tomlPath -Source $Source -Config $Config | Out-Null
         Write-Log -Message ("Manifest source set to: {0}" -f $Source) -Scope "ost" -LogFile $RunContext.LogFile -OnlyFile
     } catch {
         if (-not [string]::IsNullOrWhiteSpace($backupPath) -and (Test-Path -LiteralPath $backupPath)) {
@@ -5028,15 +4772,6 @@ function Invoke-EnableUnlockMode {
         $manifestConfig.source = $ManifestSource
     }
     Invoke-DeployOst -Config $Config -RunContext $RunContext
-}
-
-function Confirm-DestructiveAction {
-    param(
-        [Parameter(Mandatory = $true)][string]$Message,
-        [string[]]$Details = @()
-    )
-
-    return (Confirm-UiAction -Question $Message -Details $Details)
 }
 
 function Invoke-UninstallOst {
@@ -5069,7 +4804,7 @@ function Invoke-UninstallOst {
     }
 
     # Never touch Steam's own core files even if a name somehow collides.
-    $protected = @("steam.exe","steamclient.dll","steamclient64.dll","steamui.dll","steamwebhelper.exe","gameoverlayrenderer.dll","gameoverlayrenderer64.dll","steamservice.exe","steamerrorreporter.exe","bin","config","steamapps","userdata","logs","package","appcache","depotcache","music","steamapps")
+    $protected = @("steam.exe","steamclient.dll","steamclient64.dll","steamui.dll","steamwebhelper.exe","gameoverlayrenderer.dll","gameoverlayrenderer64.dll","steamservice.exe","steamerrorreporter.exe","bin","config","steamapps","userdata","logs","package","appcache","depotcache","music")
     $legacyFileRecords = @()
     foreach ($rel in $removeTargets) {
         if ($protected -contains $rel) { continue }
@@ -5078,17 +4813,12 @@ function Invoke-UninstallOst {
         $legacyFileRecords += [pscustomobject]@{
             relativePath = $rel
             targetPath   = $fullPath
-            sha256       = ""
-            existed      = $false
         }
     }
     $luaCount = if ($RemoveLua) { Get-UiLuaCount -SteamPath $steamPath } else { 0 }
     if ($legacyFileRecords.Count -eq 0 -and $luaCount -eq 0) {
         Write-UiStatus -Kind ok -Text "Steam 目录里没有需要清理的文件，已经是官方原版。"
         return
-    }
-    $uninstallPlan = [pscustomobject]@{
-        files = @($legacyFileRecords)
     }
 
     $details = @()
@@ -5103,7 +4833,7 @@ function Invoke-UninstallOst {
     }
     $details += "删除前会先备份；Steam 会被关闭。"
     $question = if ($RemoveLua) { "确认卸载内核并清空游戏清单？" } else { "确认卸载内核？已入库的游戏清单会保留。" }
-    if (-not (Confirm-DestructiveAction -Message $question -Details $details)) {
+    if (-not (Confirm-UiAction -Question $question -Details $details)) {
         Write-Log -Message "Uninstall cancelled by user." -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
         Write-UiStatus -Kind info -Text "已取消，未做任何改动。"
         return
@@ -5111,9 +4841,8 @@ function Invoke-UninstallOst {
 
     Stop-SteamProcesses -Config $Config -RunContext $RunContext
     Ensure-Directory -PathValue $RunContext.BackupDir
-    $warnings = @()
 
-    foreach ($fileRecord in @($uninstallPlan.files)) {
+    foreach ($fileRecord in $legacyFileRecords) {
         $target = [string]$fileRecord.targetPath
         if (-not (Test-Path -LiteralPath $target)) { continue }
         $item = Get-Item -LiteralPath $target -Force
@@ -5132,12 +4861,6 @@ function Invoke-UninstallOst {
 
     if ($RemoveLua) {
         $luaPath = Join-Path $steamPath "config\lua"
-        $expectedLuaPath = [System.IO.Path]::GetFullPath((Join-Path $steamPath "config\lua"))
-        $actualLuaPath = [System.IO.Path]::GetFullPath($luaPath)
-        if ($actualLuaPath -ne $expectedLuaPath) {
-            throw "拒绝清空清单目录：$luaPath 不是 Steam 默认的 config\lua。"
-        }
-
         if (Test-Path -LiteralPath $luaPath -PathType Container) {
             $luaItem = Get-Item -LiteralPath $luaPath -Force
             if (($luaItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -5155,19 +4878,14 @@ function Invoke-UninstallOst {
         }
     }
 
-    if ($warnings.Count -eq 0) {
-        if ($RemoveLua) {
-            Write-Log -Message ("Lua backup retained at: {0}" -f (Join-Path $RunContext.BackupDir "lua")) -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
-        } elseif (Test-Path -LiteralPath $RunContext.TransactionDir) {
-            Remove-Item -LiteralPath $RunContext.TransactionDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        Write-Log -Message "Uninstall completed." -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
-        Write-UiStatus -Kind ok -Text $(if ($RemoveLua) { "卸载完成，内核和游戏清单已清除，Steam 已还原为官方版本。" } else { "卸载完成，Steam 已还原为官方版本。" })
-        Write-UiStatus -Kind dim -Text ("备份位置：" + (Get-DisplayPath -PathValue $RunContext.BackupDir))
-    } else {
-        Write-Log -Message ("Uninstall completed with warnings. {0}" -f ($warnings -join " | ")) -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
-        Write-UiStatus -Kind warn -Text ("卸载完成，但有警告：" + ($warnings -join "；"))
+    if ($RemoveLua) {
+        Write-Log -Message ("Lua backup retained at: {0}" -f (Join-Path $RunContext.BackupDir "lua")) -Level "WARN" -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
+    } elseif (Test-Path -LiteralPath $RunContext.TransactionDir) {
+        Remove-Item -LiteralPath $RunContext.TransactionDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+    Write-Log -Message "Uninstall completed." -Scope "uninstall" -LogFile $RunContext.LogFile -OnlyFile
+    Write-UiStatus -Kind ok -Text $(if ($RemoveLua) { "卸载完成，内核和游戏清单已清除，Steam 已还原为官方版本。" } else { "卸载完成，Steam 已还原为官方版本。" })
+    Write-UiStatus -Kind dim -Text ("备份位置：" + (Get-DisplayPath -PathValue $RunContext.BackupDir))
 }
 
 # ---------------------------------------------------------------------------
@@ -5176,9 +4894,6 @@ function Invoke-UninstallOst {
 # the result. Startup results (auto deploy / update) are carried onto the home
 # screen as notices, because the home screen clears whatever came before it.
 # ---------------------------------------------------------------------------
-
-$script:UiNotices = New-Object System.Collections.Generic.List[object]
-$script:UiRemoteInfo = $null
 
 function Add-UiNotice {
     param(

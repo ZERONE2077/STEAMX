@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
   解压策略测试：zip 对了就解压，不管里面装什么
 
@@ -173,6 +173,7 @@ Write-Host ""
 
 # ---------------------------------------------------------------------------
 Write-Host "C  zip 路径安全检查（防穿越）" -ForegroundColor Yellow
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 function New-TestZip([string]$Name, [hashtable]$Entries) {

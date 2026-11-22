@@ -20,81 +20,95 @@
 # path is the one that mangles non-ASCII. Keep it pure ASCII.
 # ---------------------------------------------------------------------------
 
-$repo = 'ZERONE2077/STEAMX'
-$rel  = 'main.ps1'
-$jsd  = 'https://cdn.jsdelivr.net/gh/' + $repo + '@'
-$raw  = 'https://raw.githubusercontent.com/' + $repo + '/main/' + $rel
+& {
+    param([object[]]$PassArgs = @())
 
-$urls = New-Object System.Collections.ArrayList
-$errs = New-Object System.Collections.ArrayList
-
-# 1) domestic mirrors first; jsDelivr stays a last-resort fallback
-[void]$urls.Add('https://gh-proxy.com/' + $raw)
-[void]$urls.Add('https://hk.gh-proxy.com/' + $raw)
-[void]$urls.Add('https://ghfast.top/' + $raw)
-[void]$urls.Add('https://ghproxy.net/' + $raw)
-[void]$urls.Add($raw)
-
-# 2) keep a jsDelivr path for networks where GitHub and those mirrors are blocked
-[void]$urls.Add($jsd + 'latest/' + $rel)
-
-# Download to a temp file, byte-for-byte. Validate by size and by reading its
-# first bytes back as UTF-8 (BOM or the known header comment).
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('STEAMX-main-' + [Guid]::NewGuid().ToString('N') + '.ps1')
-$got = $false
-foreach ($u in $urls) {
     try {
-        # Cache-bust: gh-proxy/CDN caches the raw file for ~60s, so a fresh push
-        # would otherwise be invisible until the TTL expires. Send no-cache and a
-        # unique query token so the mirror revalidates against GitHub every run.
-        $bustUrl = $u + $(if ($u.Contains('?')) { '&' } else { '?' }) + 't=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        Invoke-WebRequest -Uri $bustUrl -UseBasicParsing -TimeoutSec 20 -OutFile $tmp -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' }
-        if (-not (Test-Path -LiteralPath $tmp)) { continue }
-        $bytes = [System.IO.File]::ReadAllBytes($tmp)
-        if ($bytes.Length -lt 50000) {
-            [void]$errs.Add('incomplete body from ' + $u.Substring(0, [Math]::Min(40, $u.Length)))
-            continue
-        }
-        $head = [Text.Encoding]::UTF8.GetString($bytes)
-        if ($head.Contains('main.ps1') -and ($head.Contains('STEAMX') -or $head.Contains('STEAMX  main.ps1'))) {
-            $got = $true
-            break
-        }
-        [void]$errs.Add('unexpected body from ' + $u.Substring(0, [Math]::Min(40, $u.Length)))
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
     } catch {
-        [void]$errs.Add($_.Exception.Message)
     }
-}
+    $ProgressPreference = 'SilentlyContinue'
 
-if (-not $got) {
-    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-    Write-Host ''
-    Write-Host ('  STEAMX start failed: ' + ($errs -join ' / ')) -ForegroundColor Red
-    Write-Host '  source order: gh-proxy -> hk.gh-proxy -> ghfast -> ghproxy -> raw -> jsDelivr' -ForegroundColor DarkGray
-    Write-Host '  usual causes: offline / CDN blocked / security software' -ForegroundColor DarkGray
-    if ([Environment]::UserInteractive -and -not $env:STEAMX_NO_PAUSE) {
-        Write-Host '  press Enter to close ...' -ForegroundColor DarkGray
-        [void][Console]::ReadLine()
+    $repo = 'ZERONE2077/STEAMX'
+    $rel  = 'main.ps1'
+    $jsd  = 'https://cdn.jsdelivr.net/gh/' + $repo + '@'
+    $raw  = 'https://raw.githubusercontent.com/' + $repo + '/main/' + $rel
+
+    $urls = New-Object System.Collections.ArrayList
+    $errs = New-Object System.Collections.ArrayList
+
+    # 1) domestic mirrors first (aligned with main.ps1); jsDelivr stays a last-resort fallback
+    [void]$urls.Add('https://gh-proxy.com/' + $raw)
+    [void]$urls.Add('https://gh.monlor.com/' + $raw)
+    [void]$urls.Add('https://hk.gh-proxy.com/' + $raw)
+    [void]$urls.Add('https://gh.nxnow.top/' + $raw)
+    [void]$urls.Add('https://ghproxy.net/' + $raw)
+    [void]$urls.Add('https://ghfast.top/' + $raw)
+    [void]$urls.Add($raw)
+
+    # 2) keep a jsDelivr path for networks where GitHub and those mirrors are blocked
+    [void]$urls.Add($jsd + 'latest/' + $rel)
+
+    # Download to a temp file, byte-for-byte. Validate by size and by reading its
+    # first bytes back as UTF-8 (BOM or the known header comment).
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('STEAMX-main-' + [Guid]::NewGuid().ToString('N') + '.ps1')
+    $got = $false
+    foreach ($u in $urls) {
+        try {
+            # Cache-bust: gh-proxy/CDN caches the raw file for ~60s, so a fresh push
+            # would otherwise be invisible until the TTL expires. Send no-cache and a
+            # unique query token so the mirror revalidates against GitHub every run.
+            $bustUrl = $u + $(if ($u.Contains('?')) { '&' } else { '?' }) + 't=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            Invoke-WebRequest -Uri $bustUrl -UseBasicParsing -TimeoutSec 20 -OutFile $tmp -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' }
+            if (-not (Test-Path -LiteralPath $tmp)) { continue }
+            $bytes = [System.IO.File]::ReadAllBytes($tmp)
+            if ($bytes.Length -lt 50000) {
+                [void]$errs.Add('incomplete body from ' + $u.Substring(0, [Math]::Min(40, $u.Length)))
+                continue
+            }
+            $head = [Text.Encoding]::UTF8.GetString($bytes)
+            if ($head.Contains('main.ps1') -and ($head.Contains('STEAMX') -or $head.Contains('STEAMX  main.ps1'))) {
+                $got = $true
+                break
+            }
+            [void]$errs.Add('unexpected body from ' + $u.Substring(0, [Math]::Min(40, $u.Length)))
+        } catch {
+            [void]$errs.Add($_.Exception.Message)
+        }
     }
-    exit 7
-}
 
-# Run the downloaded file with -File and forward our arguments, so a caller can do
-#   powershell -NoProfile -ExecutionPolicy Bypass -File boot-main.ps1 -Command Check
-try {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmp @args
-    $code = $LASTEXITCODE
-} catch {
-    Write-Host ''
-    Write-Host ('  STEAMX failed: ' + $_.Exception.Message) -ForegroundColor Red
-    if ($_.ScriptStackTrace) { Write-Host ('  ' + $_.ScriptStackTrace.Split([char]10)[0]) -ForegroundColor DarkGray }
-    if ([Environment]::UserInteractive -and -not $env:STEAMX_NO_PAUSE) {
-        Write-Host '  press Enter to close ...' -ForegroundColor DarkGray
-        [void][Console]::ReadLine()
+    if (-not $got) {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        Write-Host ''
+        Write-Host ('  STEAMX start failed: ' + ($errs -join ' / ')) -ForegroundColor Red
+        Write-Host '  source order: gh-proxy -> gh.monlor -> hk.gh-proxy -> gh.nxnow -> ghproxy -> ghfast -> raw -> jsDelivr' -ForegroundColor DarkGray
+        Write-Host '  usual causes: offline / CDN blocked / security software' -ForegroundColor DarkGray
+        if ([Environment]::UserInteractive -and -not $env:STEAMX_NO_PAUSE) {
+            Write-Host '  press Enter to close ...' -ForegroundColor DarkGray
+            [void][Console]::ReadLine()
+        }
+        $global:LASTEXITCODE = 7
+        return
     }
-    $code = 1
-} finally {
-    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-}
 
-exit $code
+    # Run the downloaded file with -File and forward our arguments, so a caller can do
+    #   powershell -NoProfile -ExecutionPolicy Bypass -File boot-main.ps1 -Command Check
+    $code = 0
+    try {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmp @PassArgs
+        $code = $LASTEXITCODE
+    } catch {
+        Write-Host ''
+        Write-Host ('  STEAMX failed: ' + $_.Exception.Message) -ForegroundColor Red
+        if ($_.ScriptStackTrace) { Write-Host ('  ' + $_.ScriptStackTrace.Split([char]10)[0]) -ForegroundColor DarkGray }
+        if ([Environment]::UserInteractive -and -not $env:STEAMX_NO_PAUSE) {
+            Write-Host '  press Enter to close ...' -ForegroundColor DarkGray
+            [void][Console]::ReadLine()
+        }
+        $code = 1
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+
+    $global:LASTEXITCODE = $code
+} -PassArgs $args

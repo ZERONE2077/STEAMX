@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
   STEAMX / OST 自动更新 latch 行为测试
 
@@ -250,7 +250,7 @@ Add-OstFailedTag -Tag '1.5.3.6' -Reason 'OST package is incomplete. Missing: dwm
 $size = (Get-Item (Get-OstUpdateStatePath)).Length
 Write-Host ("  当前状态文件: {0} 字节" -f $size) -ForegroundColor DarkGray
 Write-Host "  内容:" -ForegroundColor DarkGray
-Get-Content (Get-OstUpdateStatePath) -Raw | ForEach-Object { Write-Host ("    " + ($_ -replace "`r?`n", " ")) -ForegroundColor DarkGray }
+Get-Content -LiteralPath (Get-OstUpdateStatePath) -Encoding UTF8 -Raw | ForEach-Object { Write-Host ("    " + ($_ -replace "`r?`n", " ")) -ForegroundColor DarkGray }
 Assert-Equal ($size -lt 4096) 'True' "状态文件体积可控"
 Write-Host ""
 
