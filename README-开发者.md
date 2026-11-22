@@ -36,7 +36,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\ost-residue-cleanu
 ## 设计约束（改代码前先看）
 
 - 网络、下载或校验失败时，不能改动 Steam 目录。部署要么全部成功，要么用备份全部回滚。
-- 已有的 `opensteamtool.toml` 只改 manifest `url` 这一个键，其他内容不动。
+- 已有的 `opensteamtool.toml` 只改 `[manifest] url` 和 `[cloud] enabled` 两个键，其他内容不动。
+- `%APPDATA%\CloudRedirect\config.json` 只在不存在时写入（默认同步到「文档」），用户自己配过的云盘设置不动。
 - 日志、备份、密钥都不能写进 Steam 目录，统一放在 `%TEMP%\STEAMX` 和 `%LOCALAPPDATA%\STEAMX` 下。日志里不能出现密钥。
 - 更新判断以发布时间为准，不看版本号（上游的 DLL 不带版本号）。部署成功后会给这个版本打标记，避免每次启动都重复下载。
 - 远端查询失败也必须能进主菜单，不能显示成「已是最新」。
