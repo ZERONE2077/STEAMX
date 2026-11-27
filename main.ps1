@@ -3555,7 +3555,7 @@ function Get-OstConfigTemplate {
         "enabled = true",
         "",
         "[remote]",
-        'url_template = "https://gh-proxy.com/https://raw.githubusercontent.com/mmxlyo/steam-monitor/{channel}/{component}/{sha256}.toml"'
+        'order = "gh-proxy-first"'
     )
 }
 
@@ -3868,6 +3868,52 @@ function Set-OstCloudEnabledInToml {
         }
         if (-not $handled) { $result.Insert($sectionIndex + 1, $line + $eol) }
     }
+
+    [System.IO.File]::WriteAllText($TomlPath, ($result -join "`n"), $encoding)
+    return $true
+}
+
+function Repair-OstLegacyRemoteInToml {
+    param(
+        [Parameter(Mandatory = $true)][string]$TomlPath
+    )
+
+    # Previous STEAMX templates pinned [remote] url_template to mmxlyo/steam-monitor
+    # when upstream defaulted to the abandoned OpenSteam001 repo. OST 1.5.7+ now
+    # defaults to huanyuejue/steam-monitor (gh-proxy-first with GitHub fallback)
+    # and ships new hooks (e.g. DepotLicenseGate) that mmxlyo lacks. Strip only
+    # that legacy override while leaving any user-chosen url_template untouched.
+    if (-not (Test-Path -LiteralPath $TomlPath -PathType Leaf)) { return $false }
+
+    $bytes = [System.IO.File]::ReadAllBytes($TomlPath)
+    $hasBom = ($bytes.Length -ge 3) -and ($bytes[0] -eq 0xEF) -and ($bytes[1] -eq 0xBB) -and ($bytes[2] -eq 0xBF)
+    $encoding = New-Object System.Text.UTF8Encoding $hasBom
+    $text = $encoding.GetString($bytes)
+    $lines = @($text -split "`n")
+
+    $inRemote = $false
+    $changed = $false
+    $result = New-Object System.Collections.Generic.List[string]
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $current = [string]$lines[$i]
+        $trimmed = $current.Trim()
+
+        if ($trimmed -match '^\[.+\]$') {
+            $inRemote = ($trimmed -eq "[remote]")
+            $result.Add($current)
+            continue
+        }
+
+        if ($inRemote -and $trimmed -match '^url_template[ \t]*=.*mmxlyo/steam-monitor') {
+            $changed = $true
+            continue
+        }
+
+        $result.Add($current)
+    }
+
+    if (-not $changed) { return $false }
 
     [System.IO.File]::WriteAllText($TomlPath, ($result -join "`n"), $encoding)
     return $true
@@ -4618,6 +4664,7 @@ function Invoke-DeployOst {
         # a warning and skips cloud saves if the DLL is missing, and the switch is
         # already on once a later run (or the user) puts the DLL in place.
         Set-OstCloudEnabledInToml -TomlPath $tomlPath -Enabled $cloudWanted | Out-Null
+        Repair-OstLegacyRemoteInToml -TomlPath $tomlPath | Out-Null
         $configRecord = [pscustomobject]@{
             path       = $tomlPath
             rollbackBackupPath = $configRollbackBackup

@@ -25,4 +25,4 @@ enabled = false
 enabled = true
 
 [remote]
-url_template = "https://gh-proxy.com/https://raw.githubusercontent.com/mmxlyo/steam-monitor/{channel}/{component}/{sha256}.toml"
+order = "gh-proxy-first"
